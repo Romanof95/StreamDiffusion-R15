@@ -1,0 +1,114 @@
+"""Canny edge detection preprocessor for ControlNet."""
+import logging
+from typing import Optional
+
+import cv2
+import numpy as np
+import torch
+
+from ..base import BasePreprocessor
+
+
+class CannyProcessor(BasePreprocessor):
+    """Canny edge detection preprocessor.
+
+    Processes at configurable resolution for speed, then upscales with
+    NEAREST to preserve sharp binary edges. Uses OpenCV — no ML model.
+    """
+
+    def __init__(self, device: torch.device, torch_dtype: torch.dtype, max_buffer_size: int = 1024):
+        super().__init__(device, torch_dtype, max_buffer_size)
+        self._input_buffer_max: Optional[np.ndarray] = None
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._output_buffer_shape: Optional[tuple] = None
+
+    @property
+    def name(self) -> str:
+        return "canny"
+
+    def load_model(self, config) -> None:
+        """Canny uses OpenCV — no model to load."""
+        self._loaded = True
+        logging.info("[CannyProcessor] Ready (OpenCV Canny, no model required)")
+
+    def unload_model(self) -> None:
+        self._input_buffer_max = None
+        self._output_buffer = None
+        self._output_buffer_shape = None
+        self._loaded = False
+        logging.info("[CannyProcessor] Unloaded")
+
+    def process(self, image_tensor: torch.Tensor, config) -> Optional[torch.Tensor]:
+        """Run Canny edge detection. Input/output: CHW [0,1] on GPU."""
+        if hasattr(config, 'low_threshold'):
+            low_threshold = config.low_threshold
+            high_threshold = config.high_threshold
+            aperture_size = config.aperture_size
+            l2_gradient = config.l2_gradient
+            canny_resolution = config.resolution
+        else:
+            low_threshold = config.get('canny_low_threshold', 100)
+            high_threshold = config.get('canny_high_threshold', 200)
+            aperture_size = config.get('canny_aperture_size', 3)
+            l2_gradient = config.get('canny_l2_gradient', False)
+            canny_resolution = config.get('canny_resolution', 384)
+
+        original_h, original_w = image_tensor.shape[1], image_tensor.shape[2]
+
+        if canny_resolution < original_h:
+            downscaled = torch.nn.functional.interpolate(
+                image_tensor.unsqueeze(0),
+                size=(canny_resolution, canny_resolution),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
+            process_h, process_w = canny_resolution, canny_resolution
+        else:
+            downscaled = image_tensor
+            process_h, process_w = original_h, original_w
+
+        if self._input_buffer_max is None:
+            self._input_buffer_max = np.empty(
+                (self.max_buffer_size, self.max_buffer_size, 3), dtype=np.uint8
+            )
+
+        input_buffer = self._input_buffer_max[:process_h, :process_w, :]
+
+        image_cpu = downscaled.permute(1, 2, 0).contiguous()
+        np.copyto(input_buffer, (image_cpu.cpu().numpy() * 255).astype(np.uint8))
+        del image_cpu
+
+        edges = cv2.Canny(
+            input_buffer, low_threshold, high_threshold,
+            apertureSize=aperture_size, L2gradient=l2_gradient
+        )
+
+        edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+        edges_temp = torch.from_numpy(edges_rgb).float() / 255.0
+        edges_temp_permuted = edges_temp.permute(2, 0, 1).to(
+            device=self.device, dtype=self.torch_dtype, non_blocking=True
+        )
+
+        # NEAREST upscale preserves sharp binary edges (critical for ControlNet).
+        if canny_resolution < original_h:
+            edges_upscaled = torch.nn.functional.interpolate(
+                edges_temp_permuted.unsqueeze(0),
+                size=(original_h, original_w),
+                mode='nearest'
+            ).squeeze(0)
+        else:
+            edges_upscaled = edges_temp_permuted
+
+        out_shape = (3, original_h, original_w)
+        if self._output_buffer is None or self._output_buffer_shape != out_shape:
+            self._output_buffer = torch.empty(
+                out_shape, device=self.device, dtype=self.torch_dtype
+            )
+            self._output_buffer_shape = out_shape
+
+        self._output_buffer.copy_(edges_upscaled, non_blocking=True)
+
+        del edges_temp, edges_temp_permuted, edges_upscaled
+
+        self._cached_result = self._output_buffer
+        return self._output_buffer

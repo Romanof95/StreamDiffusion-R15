@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+
+# Engine / model caches
+tensorrt_cache/
+torch_compile_cache/
+checkpoints/
+*.engine
+*.onnx
+*.opt.onnx
+
+# Editor / tooling
+.vscode/
+.claude/
+
+# Logs
+*.log

@@ -1,0 +1,1236 @@
+"""Smode <-> StreamDiffusion orchestrator (SD 1.5 / SDXL).
+
+Responsibilities:
+  - IPC server (CUDA shared memory + Win32 events + named pipes)
+  - Main real-time inference loop
+  - Config file hot-reload (ControlNet toggles, scales, FaceID, ...)
+  - StreamDiffusion engine lifecycle
+  - Preview modes (canny / depth / openpose / mask / masked_image)
+"""
+import os
+import sys
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+if sys.platform.startswith('win'):
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+
+# Fail fast when offline (models are normally cached locally).
+os.environ.setdefault('HF_HUB_ETAG_TIMEOUT', '3')
+os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '10')
+
+import socket
+import time
+import select
+import json
+from pathlib import Path
+from typing import Dict, Optional
+import torch
+import argparse
+import logging
+
+from engines import StreamDiffusionEngine
+
+from utils.low_latency import LowLatencyController
+
+from preprocessors.processors.ip_adapter_processor import IPAdapterFaceIDProcessor
+from preprocessors.processors.canny_processor import CannyProcessor
+from preprocessors.processors.depth_processor import DepthProcessor
+from preprocessors.processors.openpose_processor import OpenPoseProcessor
+from preprocessors.orchestrator import PreprocessorOrchestrator
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+from pipeline import StreamDiffusion
+from diffusers import ControlNetModel
+from controlnet import ControlNetManager
+import win32event
+
+from ipc import (
+    InterProcessEvent,
+    CommandType, Mode, Acceleration, ConfigType, config_type_to_str, Args,
+    Packet, FrameDataPacket, ConfigPacket, UuidPacket, StreamCreationPacket,
+    _parse_config_with_cache,
+    StreamDiffusionSmodeTexture,
+    recv_all, recv_message, send_message, read_string, is_socket_connected,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+class App:
+    def __init__(
+        self, config: Args, device: torch.device, torch_dtype: torch.dtype
+    ):
+        self.stream = None
+        self.cache_dir = None
+        self.socket = None
+        self.streamDiffusionToSmodeInterProcessEvent = None
+        self.smodeToStreamDiffusionInterProcessEvent = None
+
+        try:
+            self.config = config
+            self.device = device
+            self.torch_dtype = torch_dtype
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # 1MB socket buffers reduce syscall overhead for tensor transfers.
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+            self.model_name = config.model
+            self.current_prompt = ""
+            self.negative_prompt = ""
+            self.seed = 8
+            self.guidance_scale = 1.2
+            self.width = config.width
+            self.height = config.height
+            self.input_tensors = None
+            self.output_tensors = None
+            # Index 0 = last timestep with max noise (correct for 1-step distilled models).
+            self.t_index_list = [0]
+            self.mode = Mode.IMAGE_TO_IMAGE
+            self.acceleration = Acceleration.XFORMERS
+            self.cfg_type = "self" if self.mode == Mode.IMAGE_TO_IMAGE else "none"
+            self.lora_dict: Dict[str, float] = None
+            self.engine = None
+            self.is_sdxl = False
+
+            self.streamDiffusionToSmodeInterProcessEvent = InterProcessEvent()
+            self.streamDiffusionToSmodeInterProcessEvent.create(
+                "Global\\StreamDiffusionToSmode-" + config.uuid,
+                signal_awakes_all_clients=False,
+                initial_signaled_state=False,
+            )
+            self.smodeToStreamDiffusionInterProcessEvent = InterProcessEvent()
+            self.smodeToStreamDiffusionInterProcessEvent.open(
+                "Global\\SmodeToStreamDiffusion-" + config.uuid
+            )
+        except Exception as e:
+            logging.error(f"Failed to initialize App: {e}")
+            if self.socket:
+                try:
+                    self.socket.close()
+                except Exception as cleanup_error:
+                    logging.debug(f"Socket cleanup error (non-critical): {cleanup_error}")
+            if self.streamDiffusionToSmodeInterProcessEvent:
+                try:
+                    self.streamDiffusionToSmodeInterProcessEvent.close()
+                except Exception as cleanup_error:
+                    logging.debug(f"Event handle cleanup error (non-critical): {cleanup_error}")
+            if self.smodeToStreamDiffusionInterProcessEvent:
+                try:
+                    self.smodeToStreamDiffusionInterProcessEvent.close()
+                except Exception as cleanup_error:
+                    logging.debug(f"Event handle cleanup error (non-critical): {cleanup_error}")
+            raise
+
+        self.controlnet_manager = ControlNetManager(self)
+
+        self.faceid_processor: Optional[IPAdapterFaceIDProcessor] = None
+
+        self.preprocessor_orchestrator: Optional[PreprocessorOrchestrator] = None
+
+        self.low_latency = LowLatencyController()
+
+        self.config_file_path = Path(__file__).parent / "controlnet_config.json"
+        self.last_config_check = 0
+
+        # Config file can be written by a Smode controller script in parallel
+        # with the main loop reading it; serialize access.
+        import threading
+        self.config_lock = threading.Lock()
+
+        self.controlnet_config = self._load_controlnet_config()
+        self.controlnet_skip_frames = self.controlnet_config.get('controlnet_skip_frames', 1)
+        self.current_delta = self.controlnet_config.get('delta', 1.0)
+        self.config_check_interval = 2.0
+        self.frames_processed = 0
+        self.config_check_frame_interval = 60
+
+        # torch.compile warmup runs once at startup, not on every prepare() call.
+        self.warmup_completed = False
+        self.canny_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(0.95)
+            if hasattr(torch.backends.cuda, 'matmul'):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends.cudnn, 'allow_tf32'):
+                torch.backends.cudnn.allow_tf32 = True
+
+        self._init_connection()
+        self._create_tensors(3, self.width, self.height)
+
+    def _create_stream(self):
+        send_message(self.socket, StreamCreationPacket(False))
+
+        if self.stream is not None:
+            logging.info(f"[Engine] Freeing previous engine...")
+            if self.engine is not None:
+                try:
+                    self.engine.cleanup()
+                except Exception as e:
+                    logging.warning(f"[Engine] cleanup() raised: {e}")
+                self.engine = None
+            self.stream = None
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+
+        if self.acceleration == Acceleration.XFORMERS:
+            acceleration_str = "xformers"
+        elif self.acceleration == Acceleration.TENSORRT:
+            acceleration_str = "tensorrt"
+        else:
+            acceleration_str = "none"
+
+        self.engine = StreamDiffusionEngine()
+        self.engine.load(
+            self.controlnet_config,
+            model_name=self.model_name,
+            t_index_list=self.t_index_list,
+            lora_dict=self.lora_dict,
+            mode_is_img2img=(self.mode == Mode.IMAGE_TO_IMAGE),
+            width=self.width,
+            height=self.height,
+            seed=self.seed,
+            cfg_type=self.cfg_type,
+            torch_dtype=self.torch_dtype,
+            device=self.device,
+            cache_dir=self.cache_dir,
+            acceleration_str=acceleration_str,
+        )
+
+        self.stream = self.engine.wrapper
+
+        self.num_inference_steps = self.engine.num_inference_steps
+        self.is_sdxl = getattr(self.engine, "is_sdxl", False)
+        self.is_sd2 = getattr(self.engine, "is_sd2", False)
+
+        # pipeline.last_internal_timings only present when profiling instrumentation is on.
+        self._stream_has_internal_timings = (
+            hasattr(self.stream, "stream")
+            and hasattr(self.stream.stream, "last_internal_timings")
+        )
+
+        self._post_load_streamdiffusion()
+
+        if hasattr(self.stream, "stream"):
+            self.stream.stream._cached_controlnet_guidance_strength = self._cached_controlnet_guidance_strength
+
+        self._create_tensors(3, self.width, self.height)
+        send_message(self.socket, StreamCreationPacket(True))
+
+    def _post_load_streamdiffusion(self):
+        """Post-load setup: FaceID processor + modular preprocessor orchestrator."""
+        if self.faceid_processor is not None:
+            try:
+                self.faceid_processor.cleanup()
+            except Exception:
+                pass
+            self.faceid_processor = None
+
+        faceid_enabled = self.controlnet_config.get('faceid_enabled', False)
+        faceid_wrapper_loaded = getattr(self.stream, '_faceid_loaded', False)
+
+        if faceid_enabled and faceid_wrapper_loaded:
+            try:
+                self.faceid_processor = IPAdapterFaceIDProcessor(self.device, self.torch_dtype)
+                self.faceid_processor.load_model(self.controlnet_config)
+                plus_v2 = self.controlnet_config.get('faceid_plus_v2', False)
+                if hasattr(self.stream, '_faceid_pipe_ref'):
+                    self.faceid_processor.attach_pipe(self.stream._faceid_pipe_ref, plus_v2=plus_v2)
+                variant = "PlusV2" if plus_v2 else "Base"
+                logging.info(f"[FaceID] Processor initialized (variant={variant})")
+            except Exception as e:
+                logging.error(f"[FaceID] Failed to initialize processor: {e}")
+                import traceback
+                traceback.print_exc()
+                self.faceid_processor = None
+        elif faceid_enabled and not faceid_wrapper_loaded:
+            logging.warning("[FaceID] Enabled in config but IP-Adapter failed to load in wrapper")
+
+        logging.info("[Orchestrator] Initializing modular preprocessors...")
+        self.preprocessor_orchestrator = PreprocessorOrchestrator(self.device, self.torch_dtype)
+
+        self.preprocessor_orchestrator.register('canny', CannyProcessor(self.device, self.torch_dtype))
+        self.preprocessor_orchestrator.register('depth', DepthProcessor(self.device, self.torch_dtype))
+        self.preprocessor_orchestrator.register('openpose', OpenPoseProcessor(self.device, self.torch_dtype))
+
+        depth_proc = self.preprocessor_orchestrator._processors.get('depth')
+        if depth_proc:
+            depth_proc.set_compile_fn(self.controlnet_manager.compile)
+            # Skip the ~1.5 GB HF model load when a Depth-Anything TRT engine is already cached.
+            depth_proc.set_try_cache_fn(
+                self.controlnet_manager.try_load_depth_anything_cache
+            )
+
+        self.preprocessor_orchestrator.update_models(self.controlnet_config)
+
+        logging.info("[Orchestrator] Modular preprocessors ready")
+
+    def _create_tensors(self, channels, w, h):
+        self.input_tensors = StreamDiffusionSmodeTexture(
+            self.device, w, h, channels, self.torch_dtype
+        )
+        self.output_tensors = StreamDiffusionSmodeTexture(
+            self.device, w, h, channels, self.torch_dtype
+        )
+
+        def send_frame_data_packet(stream_diffusion_smode_texture: StreamDiffusionSmodeTexture, command_type: CommandType):
+            (
+                tensor_type,
+                tensor_size,
+                tensor_stride,
+                tensor_offset,
+                storage_type,
+                tensor_dtype,
+                device,
+                handle,
+                storage_size_bytes,
+                storage_offset_bytes,
+                tensor_requires_grad,
+                ref_counter_handle,
+                ref_counter_offset,
+                event_handle,
+                event_sync_required,
+            ) = stream_diffusion_smode_texture.smode_tensor_ipc_info
+            packet = FrameDataPacket(
+                command_type,
+                device,
+                handle[2:],
+                event_handle,
+                storage_size_bytes,
+                storage_offset_bytes,
+                3,
+                self.width,
+                self.height,
+            )
+            send_message(self.socket, packet)
+
+        send_frame_data_packet(self.input_tensors, CommandType.INPUT)
+        send_frame_data_packet(self.output_tensors, CommandType.OUTPUT)
+
+    def _init_connection(self):
+        try:
+            self.socket.setblocking(True)
+            server_address = ("127.0.0.1", self.config.port)
+            logging.info(f"Connecting to server at {server_address}")
+            self.socket.connect(server_address)
+            self._send_uuid()
+            self.socket.setblocking(False)
+        except socket.error as e:
+            logging.error(f"Socket error during connection: {e}")
+            self.socket.close()
+            raise
+
+    def _send_uuid(self):
+        packet = UuidPacket(self.config.uuid)
+        send_message(self.socket, packet)
+
+    def accelerate(self, previous_acceleration: Acceleration = Acceleration.NONE):
+        if self.acceleration == Acceleration.XFORMERS:
+            self.stream.stream.pipe.enable_xformers_memory_efficient_attention()
+            self.stream.recreate_pipe()
+        elif self.acceleration == Acceleration.TENSORRT:
+            try:
+                if previous_acceleration == Acceleration.XFORMERS:
+                    self._create_stream()
+                else:
+                    self.stream.enable_tensorrt_acceleration(self.stream.stream, self.model_name, True, True)
+
+                self._warmup_tensorrt()
+            except ModuleNotFoundError:
+                logging.warning("TensorRT module not found; please install it")
+                raise
+            except Exception as e:
+                logging.warning(f"TensorRT acceleration not available; {e}")
+        else:
+            self.stream.recreate_pipe()
+
+    def _warmup_tensorrt(self):
+        """Warm up TensorRT engine with dummy inferences."""
+        dummy_input = None
+        try:
+            logging.info("Warming up TensorRT engine...")
+            warmup_iterations = max(len(self.t_index_list) * self.stream.stream.frame_bff_size, 10)
+
+            dummy_input = torch.randn(
+                (1, 3, self.height, self.width),
+                dtype=self.torch_dtype,
+                device=self.device
+            )
+
+            for _ in range(warmup_iterations):
+                _ = self.stream.stream(image=dummy_input)
+
+            logging.info(f"TensorRT warmup complete ({warmup_iterations} iterations)")
+        except Exception as e:
+            logging.warning(f"TensorRT warmup failed (non-critical): {e}")
+        finally:
+            if dummy_input is not None:
+                del dummy_input
+                torch.cuda.empty_cache()
+
+    def _load_controlnet_config(self):
+        """Thread-safe load of the ControlNet config JSON."""
+        with self.config_lock:
+            try:
+                if self.config_file_path.exists():
+                    with open(self.config_file_path, 'r') as f:
+                        config = json.load(f)
+                else:
+                    config = {
+                        'controlnet_enabled': False,
+                        'canny_enabled': False,
+                        'canny_scale': 0.5,
+                        'canny_low_threshold': 100,
+                        'canny_high_threshold': 200,
+                        'depth_enabled': False,
+                        'depth_scale': 0.5,
+                        'profiling_enabled': False
+                    }
+
+                self._cache_config_values(config)
+
+                return config
+            except Exception as e:
+                logging.warning(f"Failed to load ControlNet config: {e}")
+                return self.controlnet_config
+
+    def _cache_config_values(self, config):
+        """Cache frequently accessed config values to avoid dict lookups in the hot path."""
+        self._cached_canny_scale = config.get('canny_scale', 0.5)
+        self._cached_depth_scale = config.get('depth_scale', 0.5)
+        self._cached_openpose_scale = config.get('openpose_scale', 0.8)
+
+        self._cached_profiling_enabled = config.get('profiling_enabled', False)
+
+        self._cached_preview_mode = config.get('preview_mode', 'normal')
+
+        self._cached_controlnet_enabled = config.get('controlnet_enabled', False)
+        self._cached_canny_enabled = config.get('canny_enabled', False)
+        self._cached_depth_enabled = config.get('depth_enabled', False)
+        self._cached_openpose_enabled = config.get('openpose_enabled', False)
+
+        self._cached_controlnet_skip_frames = config.get('controlnet_skip_frames', 1)
+
+        self._cached_controlnet_guidance_strength = config.get('controlnet_guidance_strength', 1.0)
+
+        self._cached_openpose_detect_resolution = config.get('openpose_detect_resolution', 512)
+
+        # Pre-build ControlNet active list (avoid list construction in hot path).
+        self.controlnet_manager.update_active_list()
+
+    def _receive_pending_messages(self) -> dict:
+        """Drain any pending control messages from the Smode socket (non-blocking)."""
+        messages = {}
+        ready_to_read, _, in_error = select.select(
+            [self.socket], [], [], 0
+        )
+        if ready_to_read:
+            while True:
+                try:
+                    cmd, payload = recv_message(self.socket)
+                    if cmd is None:
+                        break
+                    messages[cmd] = payload
+                except socket.error as e:
+                    # WinError 10035 = non-blocking socket has no data (normal).
+                    if e.errno != 10035:
+                        logging.warning(f"Socket receive error: {e}")
+                    break
+        if in_error:
+            logging.error("Socket error detected; cleaning up and exiting")
+            exit(0)
+        return messages
+
+    def _handle_pending_commands(self, messages: dict) -> bool:
+        """Process incoming CONFIG / STOP messages. Returns True on STOP."""
+        for cmd, payload in messages.items():
+            if cmd == CommandType.CONFIG:
+                config_packet = _parse_config_with_cache(payload)
+                logging.info(f"Received CONFIG command: {vars(config_packet)}")
+
+                def update_parameters(app: App, config_packet: ConfigPacket):
+                    app.model_name = config_packet.model_name
+                    app.current_prompt = config_packet.prompt
+                    app.negative_prompt = config_packet.negative_prompt
+                    app.seed = config_packet.seed
+                    app.width = config_packet.width
+                    app.height = config_packet.height
+                    app.t_index_list = config_packet.t_index_list
+                    app.guidance_scale = config_packet.guidance_scale
+                    app.mode = config_packet.mode
+                    app.cfg_type = config_packet.cfg_type
+                    app.lora_dict = config_packet.lora_dict
+                    app.acceleration = config_packet.acceleration
+                    app.cache_dir = config_packet.cache_dir
+
+                if not self.stream:
+                    update_parameters(self, config_packet)
+                    self._create_stream()
+                else:
+                    model_has_changed = self.model_name != config_packet.model_name
+                    lora_dict_has_changed = self.lora_dict != config_packet.lora_dict
+                    update_stream = (
+                        self.width != config_packet.width
+                        or self.height != config_packet.height
+                        or self.mode != config_packet.mode
+                        or self.stream.stream.cfg_type != config_packet.cfg_type
+                        or self.acceleration != config_packet.acceleration
+                        or self.lora_dict != config_packet.lora_dict
+                    )
+                    update_t_index_list = self.t_index_list != config_packet.t_index_list
+                    previous_acceleration = self.acceleration
+                    update_parameters(self, config_packet)
+
+                    if model_has_changed or lora_dict_has_changed:
+                        self._create_stream()
+                        self.accelerate(previous_acceleration)
+                    elif update_stream:
+                        # Inline recreation for width/height/mode/cfg changes.
+                        self.stream.stream = StreamDiffusion(
+                            pipe=self.stream.stream.pipe,
+                            t_index_list=self.t_index_list,
+                            torch_dtype=self.stream.stream.dtype,
+                            width=self.width,
+                            height=self.height,
+                            do_add_noise=self.stream.stream.do_add_noise,
+                            frame_buffer_size=self.stream.frame_buffer_size,
+                            use_denoising_batch=self.stream.stream.use_denoising_batch,
+                            cfg_type=config_packet.cfg_type,
+                        )
+                        self.stream.stream._cached_controlnet_guidance_strength = self._cached_controlnet_guidance_strength
+                        self.accelerate(previous_acceleration)
+                    elif update_t_index_list:
+                        new_len = len(self.t_index_list)
+                        old_len = self.stream.stream.denoising_steps_num
+                        # TRT bakes batch = denoising_steps x frame_buffer statically;
+                        # rebuild when step count changes. PyTorch handles dynamic batch.
+                        if (new_len != old_len
+                                and self.acceleration == Acceleration.TENSORRT):
+                            logging.info(
+                                f"[Engine] Denoising steps {old_len}->{new_len} "
+                                f"changes TRT batch; recreating stream."
+                            )
+                            self._create_stream()
+                        else:
+                            self.stream.stream.t_list = self.t_index_list
+                            self.stream.stream.denoising_steps_num = new_len
+
+                if self.stream and hasattr(self.stream, 'stream'):
+                    delta = self.controlnet_config.get('delta', 1.0)
+
+                    self.stream.stream.prepare(
+                        self.current_prompt,
+                        self.negative_prompt,
+                        num_inference_steps=self.num_inference_steps,
+                        guidance_scale=config_packet.guidance_scale,
+                        delta=delta,
+                        seed=self.seed,
+                    )
+
+                    # StreamV2V: reset attention cache only on prompt change.
+                    if getattr(self, '_streamv2v_active', False):
+                        prev_prompt = getattr(self, '_streamv2v_last_prompt', None)
+                        if prev_prompt != self.current_prompt:
+                            from pipeline.attention_processors import reset_attention_cache
+                            reset_attention_cache(self.stream.stream.unet)
+                            self._streamv2v_last_prompt = self.current_prompt
+                            logging.info("[StreamV2V] Attention cache reset (prompt changed)")
+
+                    # Warmup: trigger torch.compile compilation before first user frame.
+                    # Only runs on the very first prepare() call.
+                    if not self.warmup_completed:
+                        # StreamV2V install: only on PyTorch UNets. TRT v2v engines
+                        # carry the kvo cache as engine I/O internally; non-v2v TRT
+                        # engines (e.g. SDXL) can't host StreamV2V and would crash
+                        # the named_modules() walk in enable_cached_attention.
+                        if self.controlnet_config.get('streamv2v_enabled', False):
+                            unet_obj = self.stream.stream.unet
+                            trt_v2v_engine = getattr(unet_obj, '_is_v2v', False)
+                            is_pytorch_unet = hasattr(unet_obj, 'named_modules')
+                            if trt_v2v_engine:
+                                self._streamv2v_active = True
+                                logging.info(
+                                    "[StreamV2V] TRT engine has kvo cache as engine I/O; "
+                                    "skipping PyTorch attention processor install."
+                                )
+                            elif not is_pytorch_unet:
+                                self._streamv2v_active = False
+                                logging.warning(
+                                    "[StreamV2V] Active TRT engine does not support v2v. "
+                                    "Set streamv2v_enabled=false or switch to SD 1.5."
+                                )
+                            else:
+                                from pipeline.attention_processors import enable_cached_attention
+                                maxframes = self.controlnet_config.get('streamv2v_cache_maxframes', 1)
+                                interval = self.controlnet_config.get('streamv2v_cache_interval', 1)
+                                count = enable_cached_attention(
+                                    self.stream.stream.unet,
+                                    cache_maxframes=maxframes,
+                                    cache_interval=interval,
+                                    height=self.height,
+                                    width=self.width,
+                                    batch_size=self.stream.stream.batch_size,
+                                    device=self.device,
+                                    dtype=self.torch_dtype,
+                                )
+                                self._streamv2v_active = True
+                                logging.info(f"[StreamV2V] Pre-installed on {count} layers before warmup")
+
+                        logging.info("Warming up torch.compile cache (U-Net + VAE)...")
+                        warmup_start = time.time()
+                        try:
+                            dummy_input = torch.randn(
+                                (1, 3, self.height, self.width),
+                                dtype=self.torch_dtype,
+                                device=self.device
+                            )
+
+                            # When IP-Adapter is loaded the UNet requires image_embeds.
+                            dummy_faceid_embeds = None
+                            faceid_wrapper_loaded = getattr(self.stream, '_faceid_loaded', False)
+                            if faceid_wrapper_loaded:
+                                dummy_faceid_embeds = [torch.zeros(
+                                    1, 1, 512, dtype=self.torch_dtype, device=self.device
+                                )]
+
+                            for i in range(2):
+                                _ = self.stream(
+                                    image=dummy_input,
+                                    controlnet_image=None,
+                                    controlnet_model=None,
+                                    controlnet_conditioning_scale=1.0,
+                                    ip_adapter_image_embeds=dummy_faceid_embeds,
+                                )
+
+                            torch.cuda.synchronize()
+                            warmup_time = time.time() - warmup_start
+                            logging.info(f"Warmup complete ({warmup_time:.1f}s)")
+
+                            try:
+                                _alloc = torch.cuda.memory_allocated() / 1e9
+                                _reserv = torch.cuda.memory_reserved() / 1e9
+                                logging.info(
+                                    f"[VRAM] after warmup: allocated={_alloc:.2f} GB, "
+                                    f"reserved={_reserv:.2f} GB (gap={_reserv - _alloc:.2f} GB)"
+                                )
+                            except Exception:
+                                pass
+
+                            # Warm up U-Net+ControlNet combination separately.
+                            cn_models_dict = self.controlnet_manager.models
+                            if cn_models_dict:
+                                logging.info(f"Warming up U-Net+ControlNet ({len(cn_models_dict)} active)...")
+                                cn_warmup_start = time.time()
+
+                                cn_images = []
+                                cn_models = []
+                                cn_scales = []
+
+                                for cn_name in ['canny', 'depth', 'openpose']:
+                                    if cn_name in cn_models_dict:
+                                        cn_images.append(dummy_input)
+                                        cn_models.append(cn_models_dict[cn_name])
+                                        cn_scales.append(1.0)
+
+                                for i in range(2):
+                                    _ = self.stream(
+                                        image=dummy_input,
+                                        controlnet_image=cn_images if cn_images else None,
+                                        controlnet_model=cn_models if cn_models else None,
+                                        controlnet_conditioning_scale=cn_scales if cn_scales else 1.0,
+                                        ip_adapter_image_embeds=dummy_faceid_embeds,
+                                    )
+
+                                torch.cuda.synchronize()
+                                cn_warmup_time = time.time() - cn_warmup_start
+                                logging.info(f"ControlNet warmup complete ({cn_warmup_time:.1f}s)")
+
+                            self.warmup_completed = True
+
+                        except Exception as e:
+                            logging.warning(f"Warmup failed (non-critical): {e}")
+                        finally:
+                            if 'dummy_input' in locals():
+                                del dummy_input
+                                torch.cuda.empty_cache()
+
+            elif cmd == CommandType.STOP:
+                logging.info("Received STOP command; exiting main loop")
+                if self.stream:
+                    del self.stream
+                    self.stream = None
+                return True
+            else:
+                logging.warning(f"Received unexpected command: {cmd}")
+        return False
+
+    def _maybe_reload_config(self, timings: dict) -> bool:
+        """Periodically reload controlnet_config.json and apply changes live.
+
+        Returns True if the stream was recreated and frame processing should be skipped.
+        """
+        self.frames_processed += 1
+        if not (self.frames_processed % self.config_check_frame_interval == 0 and
+                time.time() - self.last_config_check > self.config_check_interval):
+            return False
+
+        new_config = self._load_controlnet_config()
+        with self.config_lock:
+            if new_config != self.controlnet_config:
+                logging.info("ControlNet configuration updated")
+
+                old_skip = self.controlnet_skip_frames
+                self.controlnet_skip_frames = new_config.get('controlnet_skip_frames', 1)
+                if old_skip != self.controlnet_skip_frames:
+                    logging.info(f"ControlNet frame skipping updated: {old_skip} -> {self.controlnet_skip_frames}")
+
+                if hasattr(self.stream, 'stream'):
+                    ssf_enabled = new_config.get('similar_image_filter_enabled', True)
+                    ssf_threshold = new_config.get('similar_image_filter_threshold', 0.95)
+                    ssf_max_skip = new_config.get('similar_image_filter_max_skip', 10)
+
+                    if ssf_enabled:
+                        self.stream.stream.enable_similar_image_filter(ssf_threshold, ssf_max_skip)
+                        logging.info(f"Similar Image Filter updated: threshold={ssf_threshold}, max_skip={ssf_max_skip}")
+                    else:
+                        self.stream.stream.disable_similar_image_filter()
+                        logging.info("Similar Image Filter disabled")
+
+                old_delta = getattr(self, 'current_delta', 1.0)
+                new_delta = new_config.get('delta', 1.0)
+                if old_delta != new_delta and hasattr(self.stream, 'stream'):
+                    self.current_delta = new_delta
+                    logging.info(f"Delta updated: {old_delta:.2f} -> {new_delta:.2f}")
+
+                    try:
+                        self.stream.stream.prepare(
+                            self.current_prompt,
+                            self.negative_prompt,
+                            num_inference_steps=self.num_inference_steps,
+                            guidance_scale=self.guidance_scale,
+                            delta=new_delta,
+                            seed=self.seed,
+                        )
+                        logging.info("Delta applied immediately")
+                    except Exception as e:
+                        logging.warning(f"Could not apply delta immediately: {e}")
+
+                # Capture old FaceID values BEFORE overwriting controlnet_config
+                # so later blocks can detect changes correctly.
+                _old_faceid_scale = self.controlnet_config.get('faceid_scale', 0.6)
+                _old_faceid_enabled = self.controlnet_config.get('faceid_enabled', False)
+                _old_faceid_plus_v2 = self.controlnet_config.get('faceid_plus_v2', False)
+
+                self.controlnet_config = new_config
+                self.controlnet_manager.load_models()
+                # Re-sync after load_models so newly enabled CNs take effect this cycle.
+                self.controlnet_manager.update_active_list()
+
+                self.low_latency.apply(
+                    new_config.get("low_latency_mode", False)
+                )
+
+                if self.engine is not None:
+                    try:
+                        self.engine.update_params(new_config)
+                    except Exception as e:
+                        logging.warning(f"[Engine] update_params failed: {e}")
+
+                if self.preprocessor_orchestrator is not None:
+                    self.preprocessor_orchestrator.update_models(new_config)
+
+                if hasattr(self.stream, 'stream') and hasattr(self.stream.stream, 'enable_profiling'):
+                    profiling_enabled = new_config.get('profiling_enabled', False)
+                    self.stream.stream.enable_profiling = profiling_enabled
+                    logging.info(f"GPU profiling {'enabled' if profiling_enabled else 'disabled'}")
+
+                if hasattr(self.stream, 'stream'):
+                    old_strength = getattr(self.stream.stream, '_cached_controlnet_guidance_strength', 1.0)
+                    new_strength = new_config.get('controlnet_guidance_strength', 1.0)
+                    if abs(old_strength - new_strength) > 0.01:
+                        self.stream.stream._cached_controlnet_guidance_strength = new_strength
+                        self._cached_controlnet_guidance_strength = new_strength
+                        if hasattr(self.stream.stream, '_guidance_strength_logged'):
+                            delattr(self.stream.stream, '_guidance_strength_logged')
+                        logging.info(f"ControlNet guidance strength: {old_strength:.2f} -> {new_strength:.2f}")
+
+                if hasattr(self.stream, 'stream'):
+                    new_fb = new_config.get('latent_feedback_strength', 0.0)
+                    old_fb = getattr(self.stream.stream, 'latent_feedback_strength', 0.0)
+                    if abs(old_fb - new_fb) > 0.001:
+                        self.stream.stream.latent_feedback_strength = new_fb
+                        if new_fb == 0.0:
+                            self.stream.stream._prev_latent = None
+                        logging.info(f"Latent feedback strength: {old_fb:.3f} -> {new_fb:.3f}")
+
+                # FaceID live scale update.
+                if self.faceid_processor is not None:
+                    new_scale = new_config.get('faceid_scale', 0.6)
+                    if abs(new_scale - _old_faceid_scale) > 0.01:
+                        if self.stream is not None and hasattr(self.stream, 'set_faceid_scale'):
+                            success = self.stream.set_faceid_scale(new_scale)
+                            actual_scales = set()
+                            try:
+                                for proc in self.stream.stream.unet.attn_processors.values():
+                                    if hasattr(proc, 'scale'):
+                                        sc = proc.scale
+                                        if isinstance(sc, list):
+                                            sc = sc[0] if sc else None
+                                        if sc is not None:
+                                            actual_scales.add(round(float(sc), 3))
+                            except Exception:
+                                pass
+                            if success:
+                                logging.info(f"[FaceID] Scale: {_old_faceid_scale:.2f} -> "
+                                             f"{new_scale:.2f} (processors: {actual_scales})")
+                            else:
+                                logging.warning(f"[FaceID] Scale update failed (IP-Adapter not loaded)")
+
+                # FaceID plus_v2 toggle or enable change requires stream recreation.
+                new_v2 = new_config.get('faceid_plus_v2', False)
+                new_fid = new_config.get('faceid_enabled', False)
+                if (new_v2 != _old_faceid_plus_v2 and new_fid) or (new_fid != _old_faceid_enabled):
+                    logging.info(f"[FaceID] Config change requires stream reload "
+                                 f"(enabled: {_old_faceid_enabled}->{new_fid}, v2: {_old_faceid_plus_v2}->{new_v2})")
+                    self._cache_config_values(new_config)
+                    self._create_stream()
+                    return True
+
+                if hasattr(self.stream, 'stream'):
+                    new_man = new_config.get('motion_aware_noise', False)
+                    old_man = getattr(self.stream.stream, 'motion_aware_noise', False)
+                    if new_man != old_man:
+                        self.stream.stream.motion_aware_noise = new_man
+                        if not new_man:
+                            self.stream.stream._prev_input_latent = None
+                            self.stream.stream._motion_noise_scale = 1.0
+                        logging.info(f"Motion-aware noise {'enabled' if new_man else 'disabled'}")
+                    new_sens = new_config.get('motion_aware_noise_sensitivity', 0.5)
+                    old_sens = getattr(self.stream.stream, 'motion_aware_noise_sensitivity', 0.5)
+                    if abs(old_sens - new_sens) > 0.01:
+                        self.stream.stream.motion_aware_noise_sensitivity = new_sens
+                        logging.info(f"Motion-aware noise sensitivity: {old_sens:.2f} -> {new_sens:.2f}")
+
+                # StreamV2V toggle (PyTorch UNet only; TRT engine kvo cache is baked-in).
+                if hasattr(self.stream, 'stream'):
+                    new_v2v = new_config.get('streamv2v_enabled', False)
+                    old_v2v = getattr(self, '_streamv2v_active', False)
+                    if new_v2v != old_v2v:
+                        if getattr(self.stream.stream.unet, '_is_v2v', False) or \
+                           not hasattr(self.stream.stream.unet, 'attn_processors'):
+                            logging.warning(
+                                "[StreamV2V] TRT engine: runtime toggle not supported "
+                                "(kvo cache is engine I/O). Change config and restart."
+                            )
+                        else:
+                            from pipeline.attention_processors import StreamV2VAttnProcessor2_0
+                            for proc in self.stream.stream.unet.attn_processors.values():
+                                if isinstance(proc, StreamV2VAttnProcessor2_0):
+                                    proc._cache_enabled = new_v2v
+                            if not new_v2v:
+                                from pipeline.attention_processors import reset_attention_cache
+                                reset_attention_cache(self.stream.stream.unet)
+                            logging.info(f"[StreamV2V] {'Enabled' if new_v2v else 'Disabled'}")
+                            self._streamv2v_active = new_v2v
+
+        self.last_config_check = time.time()
+        return False
+
+    def _process_frame(self, timings: dict) -> None:
+        """Per-frame compute: input -> preprocess -> inference -> output -> signal."""
+        profiling_enabled = self._cached_profiling_enabled
+
+        if profiling_enabled:
+            input_copy_start = time.time()
+            self.input_tensors.copy_smode_to_stream_diffusion()
+            torch.cuda.synchronize()
+            timings['input_copy'] = (time.time() - input_copy_start) * 1000
+        else:
+            self.input_tensors.copy_smode_to_stream_diffusion()
+
+        x_output = None
+        permuted_input_texture = None
+
+        if self.mode == Mode.IMAGE_TO_IMAGE:
+            if profiling_enabled:
+                preprocess_start = time.time()
+
+            if self.input_tensors.stream_diffusion_tensor is not None:
+                permuted_input_texture = self.input_tensors.get_permuted_input_tensor()
+
+            if profiling_enabled:
+                torch.cuda.synchronize()
+                timings['image_preprocess'] = (time.time() - preprocess_start) * 1000
+
+            preview_mode = self._cached_preview_mode
+
+            # SSF upfront gate: skip the whole pipeline (including expensive ControlNet
+            # preprocessors) when the Similar-Image Filter has decided to skip.
+            inner_stream = getattr(self.stream, 'stream', None)
+            if (preview_mode == 'normal'
+                    and inner_stream is not None
+                    and getattr(inner_stream, 'similar_image_filter', False)
+                    and getattr(inner_stream, 'similar_filter', None) is not None):
+                # Match the pipeline's normalization: (C,H,W)[0,1] -> (1,C,H,W)[-1,1].
+                ssf_input = permuted_input_texture.unsqueeze(0) * 2.0 - 1.0
+                if inner_stream.similar_filter.decide_skip(ssf_input):
+                    self.streamDiffusionToSmodeInterProcessEvent.signal()
+                    return
+
+            if profiling_enabled:
+                controlnet_start = time.time()
+
+            controlnet_processed_dict = None
+
+            if (self._cached_controlnet_enabled and preview_mode == 'normal'
+                    and self.preprocessor_orchestrator is not None):
+                controlnet_processed_dict = self.preprocessor_orchestrator.preprocess(
+                    permuted_input_texture,
+                    self.controlnet_config,
+                    skip_frames=self._cached_controlnet_skip_frames,
+                )
+
+                if controlnet_processed_dict and logging.getLogger().isEnabledFor(logging.DEBUG):
+                    active_nets = []
+                    if 'canny' in controlnet_processed_dict:
+                        active_nets.append(f"Canny (scale: {self._cached_canny_scale})")
+                    if 'depth' in controlnet_processed_dict:
+                        active_nets.append(f"Depth (scale: {self._cached_depth_scale})")
+                    if 'openpose' in controlnet_processed_dict:
+                        active_nets.append(f"OpenPose (scale: {self._cached_openpose_scale})")
+                    logging.debug(f"ControlNets prepared: {', '.join(active_nets)}")
+
+            if profiling_enabled:
+                torch.cuda.synchronize()
+                timings['controlnet_preprocess'] = (time.time() - controlnet_start) * 1000
+            else:
+                timings['controlnet_preprocess'] = 0.0
+
+            # Preview modes: delegate to the matching orchestrator processor.
+            if preview_mode == "canny_preview" and self._cached_canny_enabled:
+                x_output = self.preprocessor_orchestrator._processors['canny'].process(
+                    permuted_input_texture, self.controlnet_config)
+            elif preview_mode == "depth_preview" and self._cached_depth_enabled:
+                x_output = self.preprocessor_orchestrator._processors['depth'].process(
+                    permuted_input_texture, self.controlnet_config)
+            elif preview_mode == "openpose_preview" and self._cached_openpose_enabled:
+                x_output = self.preprocessor_orchestrator._processors['openpose'].process(
+                    permuted_input_texture, self.controlnet_config)
+            else:
+                # Normal generation path with optional ControlNet conditioning.
+                cn_mgr = self.controlnet_manager
+                if controlnet_processed_dict is not None and preview_mode == "normal" and cn_mgr.active_keys:
+                    controlnet_images = [controlnet_processed_dict[k] for k in cn_mgr.active_keys
+                                        if k in controlnet_processed_dict]
+
+                    if cn_mgr.is_union_mode():
+                        # SDXL Union: one wrapper consumes the full list of conditioning
+                        # images in a single forward pass.
+                        controlnet_images = [controlnet_images]
+                        controlnet_models = cn_mgr.models_cache
+                        controlnet_scales = cn_mgr.scales_cache
+                    else:
+                        num_images = len(controlnet_images)
+                        controlnet_models = cn_mgr.models_cache[:num_images]
+                        controlnet_scales = cn_mgr.scales_cache[:num_images]
+                else:
+                    controlnet_models = []
+                    controlnet_images = []
+                    controlnet_scales = []
+
+                # Marks a new CUDA Graphs iteration: prevents "overwritten by subsequent run"
+                # errors when per-frame tensors (e.g. ControlNet conditioning_scale) change.
+                torch.compiler.cudagraph_mark_step_begin()
+
+                ip_adapter_embeds = None
+                if self.faceid_processor is not None and self.faceid_processor.is_loaded:
+                    ip_adapter_embeds = self.faceid_processor.process(
+                        permuted_input_texture, self.controlnet_config
+                    )
+
+                x_output = self.stream(
+                    image=permuted_input_texture,
+                    controlnet_image=controlnet_images if controlnet_images else None,
+                    controlnet_model=controlnet_models if controlnet_models else None,
+                    controlnet_conditioning_scale=controlnet_scales if controlnet_scales else 1.0,
+                    ip_adapter_image_embeds=ip_adapter_embeds,
+                )
+
+                if profiling_enabled and self._stream_has_internal_timings:
+                    internal = self.stream.stream.last_internal_timings
+                    timings['gen_vae_encode'] = internal.get('vae_encode', 0.0)
+                    timings['gen_unet_controlnet'] = internal.get('unet_controlnet', 0.0)
+                    timings['gen_vae_decode'] = internal.get('vae_decode', 0.0)
+                    timings['generation'] = timings['gen_vae_encode'] + timings['gen_unet_controlnet'] + timings['gen_vae_decode']
+                else:
+                    timings['generation'] = 0.0
+        elif self.mode == Mode.TEXT_TO_IMAGE:
+            x_output = self.stream.txt2img()
+
+            if profiling_enabled and self._stream_has_internal_timings:
+                internal = self.stream.stream.last_internal_timings
+                timings['gen_vae_encode'] = internal.get('vae_encode', 0.0)
+                timings['gen_unet_controlnet'] = internal.get('unet_controlnet', 0.0)
+                timings['gen_vae_decode'] = internal.get('vae_decode', 0.0)
+                timings['generation'] = timings['gen_vae_encode'] + timings['gen_unet_controlnet'] + timings['gen_vae_decode']
+            else:
+                timings['generation'] = 0.0
+        else:
+            logging.error(f"Unknown mode: {self.mode}")
+            return
+
+        if x_output is not None:
+            x_output = x_output.squeeze(0) if x_output.shape[0] == 1 else x_output
+
+        if profiling_enabled:
+            output_copy_start = time.time()
+            if x_output is not None:
+                self.output_tensors.write_chw_to_smode(x_output)
+            torch.cuda.synchronize()
+            timings['output_copy'] = (time.time() - output_copy_start) * 1000
+        elif x_output is not None:
+            self.output_tensors.write_chw_to_smode(x_output)
+
+        if profiling_enabled:
+            signal_start = time.time()
+            self.streamDiffusionToSmodeInterProcessEvent.signal()
+            timings['signal_smode'] = (time.time() - signal_start) * 1000
+        else:
+            self.streamDiffusionToSmodeInterProcessEvent.signal()
+
+    def run(self):
+        logging.info("Entering main command loop")
+
+        self.low_latency.apply(
+            self.controlnet_config.get("low_latency_mode", False)
+        )
+
+        last_frame_wall_time = 0.0
+
+        frames_received = 0
+        frames_processed = 0
+        last_diagnostic_time = time.time()
+
+        # The frame trigger is the Win32 event; the socket carries rare control
+        # messages. is_socket_connected does a MSG_PEEK syscall - throttle it.
+        EVENT_WAIT_MS = 2
+        SOCKET_HEALTH_CHECK_EVERY = 32
+        loop_iter = 0
+
+        try:
+            while True:
+                loop_iter += 1
+                if loop_iter % SOCKET_HEALTH_CHECK_EVERY == 0 and not is_socket_connected(self.socket):
+                    return
+                messages = self._receive_pending_messages()
+
+                wait_result = self.smodeToStreamDiffusionInterProcessEvent.wait(EVENT_WAIT_MS)
+                if wait_result == win32event.WAIT_OBJECT_0 and self.stream:
+                    frames_received += 1
+
+                    frame_start = time.time()
+                    timings = {}
+
+                    if last_frame_wall_time > 0:
+                        wall_time_ms = (frame_start - last_frame_wall_time) * 1000
+                        timings['wall_clock'] = wall_time_ms
+                    last_frame_wall_time = frame_start
+
+                    if self.output_tensors is None:
+                        self._create_tensors(3, self.width, self.height)
+
+                    if self._maybe_reload_config(timings):
+                        continue
+
+                    profiling_enabled = self._cached_profiling_enabled
+
+                    self._process_frame(timings)
+
+                    frames_processed += 1
+                    self.low_latency.tick()
+
+                    current_time = time.time()
+                    if current_time - last_diagnostic_time >= 1.0:
+                        elapsed_time = current_time - last_diagnostic_time
+                        receive_rate = frames_received / elapsed_time
+                        process_rate = frames_processed / elapsed_time
+                        skip_rate = ((frames_received - frames_processed) / frames_received * 100) if frames_received > 0 else 0
+
+                        if profiling_enabled:
+                            logging.info(f"THROUGHPUT: Received={receive_rate:.1f} fps | Processed={process_rate:.1f} fps | Skipped={skip_rate:.1f}%")
+
+                        frames_received = 0
+                        frames_processed = 0
+                        last_diagnostic_time = current_time
+
+                    if profiling_enabled:
+                        timings['total_frame'] = (
+                            timings.get('config_check', 0.0) +
+                            timings.get('input_copy', 0.0) +
+                            timings.get('image_preprocess', 0.0) +
+                            timings.get('controlnet_preprocess', 0.0) +
+                            timings.get('generation', 0.0) +
+                            timings.get('output_copy', 0.0) +
+                            timings.get('signal_smode', 0.0)
+                        )
+                        smode_feedback_time = abs(timings.get('wall_clock', 1.0) - timings.get('total_frame', 1.0))
+                        smode_fps = 1000.0 / smode_feedback_time if smode_feedback_time > 0 else 0
+
+                        if not hasattr(self, '_frame_count'):
+                            self._frame_count = 0
+                        self._frame_count += 1
+
+                        if self._frame_count % 60 == 0:
+                            logging.info(f"PROFILING (Smode Feedback FPS: {smode_fps:.1f}):")
+
+                            has_breakdown = 'gen_vae_encode' in timings
+                            exclude_keys = ['total_frame', 'cycle_complete', 'wall_clock', 'gen_vae_encode', 'gen_unet_controlnet', 'gen_vae_decode']
+                            if has_breakdown:
+                                exclude_keys.append('generation')
+
+                            for key, value in sorted(timings.items()):
+                                if key not in exclude_keys:
+                                    percentage = (value / timings['total_frame'] * 100) if timings['total_frame'] > 0 else 0
+                                    logging.info(f"  {key:25s}: {value:6.2f}ms ({percentage:5.1f}%)")
+
+                            if has_breakdown:
+                                percentage = (timings['generation'] / timings['total_frame'] * 100) if timings['total_frame'] > 0 else 0
+                                logging.info(f"  {'generation':25s}: {timings['generation']:6.2f}ms ({percentage:5.1f}%) BREAKDOWN:")
+                                gen_total = timings['generation']
+                                for subkey in ['gen_vae_encode', 'gen_unet_controlnet', 'gen_vae_decode']:
+                                    if subkey in timings:
+                                        sub_value = timings[subkey]
+                                        sub_percentage = (sub_value / gen_total * 100) if gen_total > 0 else 0
+                                        label = subkey.replace('gen_', '    +- ')
+                                        logging.info(f"  {label:25s}: {sub_value:6.2f}ms ({sub_percentage:5.1f}% of gen)")
+
+                            logging.info(f"  {'total_frame':25s}: {timings['total_frame']:6.2f}ms (REAL GPU processing time)")
+                            if 'wall_clock' in timings:
+                                smode_idle = timings['wall_clock'] - timings['total_frame']
+                                logging.info(f"  {'wall_clock':25s}: {timings['wall_clock']:6.2f}ms (frame-to-frame interval)")
+                                logging.info(f"  {'smode_idle':25s}: {smode_idle:6.2f}ms (Smode + idle time)")
+                if self._handle_pending_commands(messages):
+                    return
+        except socket.error as e:
+            logging.error(f"Socket error during processing: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error: {e}")
+            raise
+        finally:
+            self.socket.close()
+            logging.info("Socket connection closed")
+
+    def __del__(self):
+        try:
+            if hasattr(self, 'low_latency'):
+                try:
+                    self.low_latency.apply(False)
+                except Exception:
+                    pass
+
+            if hasattr(self, 'stream') and self.stream is not None:
+                try:
+                    del self.stream
+                    self.stream = None
+                except Exception as e:
+                    logging.warning(f"Error cleaning up stream: {e}")
+
+            if hasattr(self, 'controlnet_manager'):
+                self.controlnet_manager.cleanup()
+
+            if hasattr(self, 'faceid_processor') and self.faceid_processor is not None:
+                try:
+                    self.faceid_processor.cleanup()
+                    self.faceid_processor = None
+                except Exception as e:
+                    logging.debug(f"FaceID processor cleanup error (non-critical): {e}")
+
+            if hasattr(self, 'preprocessor_orchestrator') and self.preprocessor_orchestrator is not None:
+                try:
+                    self.preprocessor_orchestrator.cleanup()
+                    self.preprocessor_orchestrator = None
+                except Exception as e:
+                    logging.warning(f"Error cleaning up preprocessor orchestrator: {e}")
+
+            if hasattr(self, 'streamDiffusionToSmodeInterProcessEvent'):
+                try:
+                    self.streamDiffusionToSmodeInterProcessEvent.close()
+                except Exception as e:
+                    logging.debug(f"Event handle cleanup error (non-critical): {e}")
+
+            if hasattr(self, 'smodeToStreamDiffusionInterProcessEvent'):
+                try:
+                    self.smodeToStreamDiffusionInterProcessEvent.close()
+                except Exception as e:
+                    logging.debug(f"Event handle cleanup error (non-critical): {e}")
+
+            if hasattr(self, 'socket') and self.socket:
+                try:
+                    self.socket.close()
+                except Exception as e:
+                    logging.debug(f"Socket cleanup error (non-critical): {e}")
+
+            try:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                logging.debug(f"CUDA cache cleanup error (non-critical): {e}")
+
+        except Exception as e:
+            try:
+                logging.warning(f"Error in App.__del__: {e}")
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Smode Bridge Client Application"
+    )
+    parser.add_argument(
+        "--port", type=int, required=True, help="Port number"
+    )
+    parser.add_argument(
+        "--uuid", type=str, required=True, help="Smode modifier UUID"
+    )
+    parser.add_argument(
+        "--width", type=int, required=True, help="Width of the image"
+    )
+    parser.add_argument(
+        "--height", type=int, required=True, help="Height of the image"
+    )
+    parser.add_argument(
+        "--device", type=int, required=True, help="The cuda device index to use"
+    )
+    parser.add_argument(
+        "--model", type=str, required=True, help="Model name to use"
+    )
+
+    args = parser.parse_args()
+    config = Args(
+        port=args.port,
+        uuid=args.uuid,
+        width=args.width,
+        height=args.height,
+        device=args.device,
+        model=args.model,
+    )
+
+    if not torch.cuda.is_available():
+        logging.error("CUDA is not available")
+        exit("CUDA is not available")
+
+    if config.device < 0 or config.device >= torch.cuda.device_count():
+        logging.error("Invalid device index")
+        exit("Invalid device index")
+
+    logging.info(f"CUDA Device {config.device}: {torch.cuda.get_device_name(config.device)}")
+
+    torch.cuda.set_device(config.device)
+    torch_dtype = torch.float16
+
+    app = App(config, torch.device("cuda", config.device), torch_dtype)
+    app.run()

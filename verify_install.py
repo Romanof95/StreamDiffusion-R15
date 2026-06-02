@@ -1,0 +1,92 @@
+"""
+Post-installation verification for StreamDiffusion-R15.
+Called by install.bat to verify all dependencies are correctly installed.
+"""
+import sys
+import os
+
+
+def test_import(name, import_func):
+    """Test a single import and return success/failure"""
+    try:
+        import_func()
+        print(f"  [OK] {name}")
+        return True
+    except Exception as e:
+        print(f"  [ERREUR] {name}: {e}")
+        return False
+
+
+def main():
+    print("=" * 70)
+    print("Test de l'installation StreamDiffusion-R15")
+    print("=" * 70)
+    print()
+
+    all_ok = True
+
+    # Test 1: CUDA
+    print("[1/10] Test CUDA...")
+    try:
+        import torch
+        if torch.cuda.is_available():
+            print(f"  [OK] CUDA disponible: {torch.cuda.get_device_name(0)}")
+            print(f"  [OK] CUDA version: {torch.version.cuda}")
+            vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            print(f"  [OK] VRAM totale: {vram:.1f} GB")
+        else:
+            print("  [ERREUR] CUDA non disponible!")
+            all_ok = False
+    except ImportError:
+        print("  [ERREUR] PyTorch non installe!")
+        all_ok = False
+    print()
+
+    # Test 2: Diffusers
+    print("[2/10] Test diffusers...")
+    all_ok &= test_import("diffusers", lambda: __import__("diffusers"))
+    print()
+
+    # Test 3: StreamDiffusion (local pipeline/ folder, not pip package)
+    print("[3/10] Test streamdiffusion...")
+    all_ok &= test_import("pipeline",
+        lambda: __import__("pipeline", fromlist=["StreamDiffusion"]))
+    print()
+
+    # Test 4: ControlNet
+    print("[4/10] Test controlnet-aux...")
+    all_ok &= test_import("controlnet-aux", lambda: __import__("controlnet_aux"))
+    print()
+
+    # Test 5: easy-dwpose
+    print("[5/8] Test easy-dwpose...")
+    all_ok &= test_import("easy-dwpose", lambda: __import__("easy_dwpose"))
+    print()
+
+    # Test 6: pywin32
+    print("[6/8] Test pywin32 (Windows IPC)...")
+    all_ok &= test_import("pywin32", lambda: __import__("win32event"))
+    print()
+
+    # Test 7: tokenizers
+    print("[7/8] Test tokenizers...")
+    all_ok &= test_import("tokenizers", lambda: __import__("tokenizers"))
+    print()
+
+    # Test 8: InsightFace (IP-Adapter FaceID)
+    print("[8/8] Test insightface (FaceID)...")
+    all_ok &= test_import("insightface", lambda: __import__("insightface"))
+    print()
+
+    print("=" * 70)
+    if all_ok:
+        print("Installation completee avec succes!")
+    else:
+        print("Installation incomplete - verifiez les erreurs ci-dessus")
+    print("=" * 70)
+
+    return 0 if all_ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

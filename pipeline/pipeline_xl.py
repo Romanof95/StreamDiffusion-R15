@@ -350,6 +350,8 @@ class StreamDiffusionXL:
         else:
             self.x_t_latent_buffer = None
 
+        self._needs_buffer_refill = True
+
         # Hyper-SDXL U-Net checkpoint needs guidance_scale respected even with cfg_type='none'.
         if self.cfg_type == "none" and not self.use_hyper_unet_checkpoint:
             self.guidance_scale = 1.0
@@ -514,15 +516,7 @@ class StreamDiffusionXL:
                     "time_ids": add_time_ids,
                 }
 
-        # Reset rolling buffers: they hold intermediate latents derived under
-        # the previous prompt; re-denoising them with the new prompt for
-        # (denoising_steps_num - 1) frames causes a visible flash on swap.
-        # No-op in 1-step (x_t_latent_buffer is None); active only in multi-step.
-        if self.x_t_latent_buffer is not None:
-            self.x_t_latent_buffer.zero_()
-        if hasattr(self, 'stock_noise') and self.stock_noise is not None:
-            self.stock_noise.zero_()
-        # SSF returns prev_image_result on skip — would replay old-prompt output.
+        self._needs_buffer_refill = True
         if hasattr(self, 'prev_image_result'):
             self.prev_image_result = None
 
@@ -773,6 +767,22 @@ class StreamDiffusionXL:
         latents = x_0_pred_out / self.vae.config.scaling_factor
         return self.vae.decode(latents, return_dict=False)[0]
 
+    def _refill_buffer_from_current(self, x_t_latent: torch.Tensor) -> None:
+        if self.x_t_latent_buffer is None:
+            return
+        fb = self.frame_bff_size
+        a0 = self.alpha_prod_t_sqrt[0:fb]
+        b0 = self.beta_prod_t_sqrt[0:fb]
+        n0 = self.init_noise[0:fb]
+        x_0_estimate = (x_t_latent - b0 * n0) / a0
+        for k in range(self.denoising_steps_num - 1):
+            slot_t = k + 1
+            s = slice(slot_t * fb, (slot_t + 1) * fb)
+            self.x_t_latent_buffer[k * fb:(k + 1) * fb] = (
+                self.alpha_prod_t_sqrt[s] * x_0_estimate
+                + self.beta_prod_t_sqrt[s] * self.init_noise[s]
+            )
+
     def predict_x0_batch(
         self,
         x_t_latent: torch.Tensor,
@@ -781,11 +791,13 @@ class StreamDiffusionXL:
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        prev_latent_batch = self.x_t_latent_buffer
-
         if self.use_denoising_batch:
             t_list = self.sub_timesteps_tensor
             if self.denoising_steps_num > 1:
+                if getattr(self, '_needs_buffer_refill', False):
+                    self._refill_buffer_from_current(x_t_latent)
+                    self._needs_buffer_refill = False
+                prev_latent_batch = self.x_t_latent_buffer
                 old_x_t_latent = x_t_latent
                 x_t_latent = torch.cat((x_t_latent, prev_latent_batch), dim=0)
                 if old_x_t_latent is not x_t_latent:

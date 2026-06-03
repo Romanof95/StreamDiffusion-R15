@@ -335,6 +335,8 @@ class StreamDiffusion:
     ) -> None:
         self.generator = generator
         self.generator.manual_seed(seed)
+        self._needs_buffer_refill = True
+
         if self.denoising_steps_num > 1:
             self.x_t_latent_buffer = torch.zeros(
                 (
@@ -448,14 +450,7 @@ class StreamDiffusion:
         )
         self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
 
-        # Reset rolling buffers: they hold intermediate latents derived under
-        # the previous prompt; re-denoising them with the new prompt for
-        # (denoising_steps_num - 1) frames causes a visible flash on swap.
-        if self.x_t_latent_buffer is not None:
-            self.x_t_latent_buffer.zero_()
-        if self.stock_noise is not None:
-            self.stock_noise.zero_()
-        # SSF returns prev_image_result on skip — would replay old-prompt output.
+        self._needs_buffer_refill = True
         self.prev_image_result = None
 
     def add_noise(
@@ -692,6 +687,22 @@ class StreamDiffusion:
             x_0_pred_out / self.vae.config.scaling_factor, return_dict=False
         )[0]
 
+    def _refill_buffer_from_current(self, x_t_latent: torch.Tensor) -> None:
+        if self.x_t_latent_buffer is None:
+            return
+        fb = self.frame_bff_size
+        a0 = self.alpha_prod_t_sqrt[0:fb]
+        b0 = self.beta_prod_t_sqrt[0:fb]
+        n0 = self.init_noise[0:fb]
+        x_0_estimate = (x_t_latent - b0 * n0) / a0
+        for k in range(self.denoising_steps_num - 1):
+            slot_t = k + 1
+            s = slice(slot_t * fb, (slot_t + 1) * fb)
+            self.x_t_latent_buffer[k * fb:(k + 1) * fb] = (
+                self.alpha_prod_t_sqrt[s] * x_0_estimate
+                + self.beta_prod_t_sqrt[s] * self.init_noise[s]
+            )
+
     def predict_x0_batch(
         self,
         x_t_latent: torch.Tensor,
@@ -700,11 +711,13 @@ class StreamDiffusion:
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        prev_latent_batch = self.x_t_latent_buffer
-
         if self.use_denoising_batch:
             t_list = self.sub_timesteps_tensor
             if self.denoising_steps_num > 1:
+                if getattr(self, '_needs_buffer_refill', False):
+                    self._refill_buffer_from_current(x_t_latent)
+                    self._needs_buffer_refill = False
+                prev_latent_batch = self.x_t_latent_buffer
                 old_x_t_latent = x_t_latent
                 x_t_latent = torch.cat((x_t_latent, prev_latent_batch), dim=0)
                 if old_x_t_latent is not x_t_latent:

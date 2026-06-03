@@ -514,6 +514,18 @@ class StreamDiffusionXL:
                     "time_ids": add_time_ids,
                 }
 
+        # Reset rolling buffers: they hold intermediate latents derived under
+        # the previous prompt; re-denoising them with the new prompt for
+        # (denoising_steps_num - 1) frames causes a visible flash on swap.
+        # No-op in 1-step (x_t_latent_buffer is None); active only in multi-step.
+        if self.x_t_latent_buffer is not None:
+            self.x_t_latent_buffer.zero_()
+        if hasattr(self, 'stock_noise') and self.stock_noise is not None:
+            self.stock_noise.zero_()
+        # SSF returns prev_image_result on skip — would replay old-prompt output.
+        if hasattr(self, 'prev_image_result'):
+            self.prev_image_result = None
+
     def add_noise(
         self,
         original_samples: torch.Tensor,

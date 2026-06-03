@@ -448,6 +448,16 @@ class StreamDiffusion:
         )
         self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
 
+        # Reset rolling buffers: they hold intermediate latents derived under
+        # the previous prompt; re-denoising them with the new prompt for
+        # (denoising_steps_num - 1) frames causes a visible flash on swap.
+        if self.x_t_latent_buffer is not None:
+            self.x_t_latent_buffer.zero_()
+        if self.stock_noise is not None:
+            self.stock_noise.zero_()
+        # SSF returns prev_image_result on skip — would replay old-prompt output.
+        self.prev_image_result = None
+
     def add_noise(
         self,
         original_samples: torch.Tensor,

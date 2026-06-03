@@ -119,6 +119,12 @@ class UnionControlNetWrapper:
             c.unsqueeze(0).expand(batch_size, -1, -1, -1) if c.dim() == 3 else c
             for c in controlnet_cond
         ]
+        # Per-slot ring feeds 4D conds already at batch_size; if a 4D cond
+        # arrives at batch=1, expand to batch_size for shape consistency.
+        controlnet_cond = [
+            c.expand(batch_size, -1, -1, -1) if (c.dim() == 4 and c.shape[0] == 1) else c
+            for c in controlnet_cond
+        ]
 
         ct = self._ensure_control_type_tensor(sample)
 

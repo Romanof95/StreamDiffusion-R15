@@ -352,6 +352,9 @@ class StreamDiffusionXL:
 
         self._needs_buffer_refill = True
 
+        self._cn_cond_ring: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._cn_cond_ring_needs_init = True
+
         # Hyper-SDXL U-Net checkpoint needs guidance_scale respected even with cfg_type='none'.
         if self.cfg_type == "none" and not self.use_hyper_unet_checkpoint:
             self.guidance_scale = 1.0
@@ -519,6 +522,7 @@ class StreamDiffusionXL:
         self._needs_buffer_refill = True
         if hasattr(self, 'prev_image_result'):
             self.prev_image_result = None
+        self._cn_cond_ring_needs_init = True
 
     def add_noise(
         self,
@@ -593,18 +597,30 @@ class StreamDiffusionXL:
             for i, (cn_model, cn_image, cn_scale) in enumerate(zip(controlnet_model, controlnet_image, controlnet_conditioning_scale)):
                 residual_multiplier = getattr(self, '_cached_controlnet_guidance_strength', 1.0)
 
-                # cn_image may be a single tensor (standard path) or a List[Tensor]
-                # when using SDXL Union (one conditioning image per active control type).
-                cn_image_is_list = isinstance(cn_image, list)
+                # Per-slot cond: align ControlNet conditioning with each multi-step
+                # batch slot. cn_image may be a single tensor or List[Tensor] (Union).
+                per_slot_cond = self._build_per_slot_cond(i, cn_image)
+
+                cn_image_is_list = isinstance(per_slot_cond, list)
                 if cn_image_is_list:
                     if x_t_latent_plus_uc.shape[0] > x_t_latent.shape[0]:
-                        controlnet_cond_input = [torch.cat([img, img]) for img in cn_image]
+                        controlnet_cond_input = [torch.cat([img, img]) for img in per_slot_cond]
                     else:
-                        controlnet_cond_input = cn_image
+                        controlnet_cond_input = per_slot_cond
                 else:
-                    controlnet_cond_input = cn_image
-                    if x_t_latent_plus_uc.shape[0] > x_t_latent.shape[0]:
-                        controlnet_cond_input = torch.cat([cn_image, cn_image])
+                    controlnet_cond_input = per_slot_cond
+                    expected = x_t_latent_plus_uc.shape[0]
+                    if expected != per_slot_cond.shape[0]:
+                        if expected == 2 * per_slot_cond.shape[0]:
+                            controlnet_cond_input = torch.cat([per_slot_cond, per_slot_cond])
+                        elif expected == per_slot_cond.shape[0] + self.frame_bff_size:
+                            controlnet_cond_input = torch.cat(
+                                [per_slot_cond[0:self.frame_bff_size], per_slot_cond]
+                            )
+                        else:
+                            controlnet_cond_input = per_slot_cond[0:1].expand(
+                                expected, -1, -1, -1
+                            ).contiguous()
 
                 if isinstance(cn_scale, torch.Tensor):
                     cn_scale_tensor = cn_scale
@@ -639,6 +655,8 @@ class StreamDiffusionXL:
                 if x_t_latent_plus_uc.shape[0] > x_t_latent.shape[0]:
                     del controlnet_cond_input
 
+                self._rotate_cn_ring(i, cn_image)
+
                 if residual_multiplier != 1.0:
                     for r in down_samples:
                         r.mul_(residual_multiplier)
@@ -658,6 +676,9 @@ class StreamDiffusionXL:
                     ]
                     mid_block_res_sample = mid_block_res_sample + mid_sample
                     del down_samples, mid_sample
+
+            if getattr(self, '_cn_cond_ring_needs_init', False):
+                self._cn_cond_ring_needs_init = False
 
         try:
             unet_kwargs = {
@@ -766,6 +787,61 @@ class StreamDiffusionXL:
         x_0_pred_out = x_0_pred_out.contiguous()
         latents = x_0_pred_out / self.vae.config.scaling_factor
         return self.vae.decode(latents, return_dict=False)[0]
+
+    def _ensure_cn_ring(self, ring_key: Tuple[int, int], current_cond: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.denoising_steps_num <= 1:
+            return None
+        if current_cond.dim() == 3:
+            cur4d = current_cond.unsqueeze(0)
+        else:
+            cur4d = current_cond[0:1] if current_cond.shape[0] > 1 else current_cond
+        ring_batch = (self.denoising_steps_num - 1) * self.frame_bff_size
+        expected_shape = (ring_batch, cur4d.shape[1], cur4d.shape[2], cur4d.shape[3])
+        ring = self._cn_cond_ring.get(ring_key)
+        if ring is None or tuple(ring.shape) != expected_shape:
+            ring = torch.zeros(expected_shape, dtype=self.dtype, device=self.device)
+            self._cn_cond_ring[ring_key] = ring
+            self._cn_cond_ring_needs_init = True
+        if self._cn_cond_ring_needs_init:
+            ring.copy_(cur4d.expand(ring_batch, -1, -1, -1).to(self.dtype))
+        return ring
+
+    def _build_per_slot_cond_one(self, ring_key: Tuple[int, int], current_cond: torch.Tensor) -> torch.Tensor:
+        if self.denoising_steps_num <= 1:
+            return current_cond
+        ring = self._ensure_cn_ring(ring_key, current_cond)
+        if current_cond.dim() == 3:
+            cur4d = current_cond.unsqueeze(0)
+        else:
+            cur4d = current_cond
+        fb = self.frame_bff_size
+        if cur4d.shape[0] != fb:
+            cur4d = cur4d.expand(fb, -1, -1, -1)
+        return torch.cat([cur4d, ring], dim=0)
+
+    def _build_per_slot_cond(self, cn_index: int, cn_image):
+        if self.denoising_steps_num <= 1:
+            return cn_image
+        if isinstance(cn_image, list):
+            return [self._build_per_slot_cond_one((cn_index, j), c) for j, c in enumerate(cn_image)]
+        return self._build_per_slot_cond_one((cn_index, 0), cn_image)
+
+    def _rotate_cn_ring(self, cn_index: int, cn_image) -> None:
+        if self.denoising_steps_num <= 1:
+            return
+        items = cn_image if isinstance(cn_image, list) else [cn_image]
+        fb = self.frame_bff_size
+        for j, c in enumerate(items):
+            ring = self._cn_cond_ring.get((cn_index, j))
+            if ring is None:
+                continue
+            if c.dim() == 3:
+                cur4d = c.unsqueeze(0)
+            else:
+                cur4d = c[0:fb]
+            if ring.shape[0] > fb:
+                ring[fb:].copy_(ring[:-fb].clone())
+            ring[:fb].copy_(cur4d.to(self.dtype))
 
     def _refill_buffer_from_current(self, x_t_latent: torch.Tensor) -> None:
         if self.x_t_latent_buffer is None:

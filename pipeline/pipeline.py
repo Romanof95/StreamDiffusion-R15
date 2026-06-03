@@ -337,6 +337,9 @@ class StreamDiffusion:
         self.generator.manual_seed(seed)
         self._needs_buffer_refill = True
 
+        self._cn_cond_ring: Dict[int, torch.Tensor] = {}
+        self._cn_cond_ring_needs_init = True
+
         if self.denoising_steps_num > 1:
             self.x_t_latent_buffer = torch.zeros(
                 (
@@ -452,6 +455,7 @@ class StreamDiffusion:
 
         self._needs_buffer_refill = True
         self.prev_image_result = None
+        self._cn_cond_ring_needs_init = True
 
     def add_noise(
         self,
@@ -529,9 +533,21 @@ class StreamDiffusion:
                 # Granular guidance multiplier (0.0=prompt only, 1.0=balanced, 2.0=max structure).
                 residual_multiplier = getattr(self, '_cached_controlnet_guidance_strength', 1.0)
 
-                controlnet_cond_input = cn_image
-                if x_t_latent_plus_uc.shape[0] > x_t_latent.shape[0]:
-                    controlnet_cond_input = torch.cat([cn_image, cn_image])
+                per_slot_cond = self._build_per_slot_cond(i, cn_image)
+
+                controlnet_cond_input = per_slot_cond
+                expected = x_t_latent_plus_uc.shape[0]
+                if expected != per_slot_cond.shape[0]:
+                    if expected == 2 * per_slot_cond.shape[0]:
+                        controlnet_cond_input = torch.cat([per_slot_cond, per_slot_cond])
+                    elif expected == per_slot_cond.shape[0] + self.frame_bff_size:
+                        controlnet_cond_input = torch.cat(
+                            [per_slot_cond[0:self.frame_bff_size], per_slot_cond]
+                        )
+                    else:
+                        controlnet_cond_input = per_slot_cond[0:1].expand(
+                            expected, -1, -1, -1
+                        ).contiguous()
 
                 # Convert scale to tensor of same dtype as latents — prevents torch.compile
                 # recompiles on each new scalar and avoids precision mixing.
@@ -562,6 +578,8 @@ class StreamDiffusion:
                 if x_t_latent_plus_uc.shape[0] > x_t_latent.shape[0]:
                     del controlnet_cond_input
 
+                self._rotate_cn_ring(i, cn_image)
+
                 if residual_multiplier != 1.0:
                     for r in down_samples:
                         r.mul_(residual_multiplier)
@@ -582,6 +600,9 @@ class StreamDiffusion:
                     ]
                     mid_block_res_sample = mid_block_res_sample + mid_sample
                     del down_samples, mid_sample
+
+            if getattr(self, '_cn_cond_ring_needs_init', False):
+                self._cn_cond_ring_needs_init = False
 
         try:
             unet_kwargs = {
@@ -686,6 +707,52 @@ class StreamDiffusion:
         return self.vae.decode(
             x_0_pred_out / self.vae.config.scaling_factor, return_dict=False
         )[0]
+
+    def _ensure_cn_ring(self, cn_index: int, current_cond: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.denoising_steps_num <= 1:
+            return None
+        if current_cond.dim() == 3:
+            cur4d = current_cond.unsqueeze(0)
+        else:
+            cur4d = current_cond[0:1] if current_cond.shape[0] > 1 else current_cond
+        ring_batch = (self.denoising_steps_num - 1) * self.frame_bff_size
+        expected_shape = (ring_batch, cur4d.shape[1], cur4d.shape[2], cur4d.shape[3])
+        ring = self._cn_cond_ring.get(cn_index)
+        if ring is None or tuple(ring.shape) != expected_shape:
+            ring = torch.zeros(expected_shape, dtype=self.dtype, device=self.device)
+            self._cn_cond_ring[cn_index] = ring
+            self._cn_cond_ring_needs_init = True
+        if self._cn_cond_ring_needs_init:
+            ring.copy_(cur4d.expand(ring_batch, -1, -1, -1).to(self.dtype))
+        return ring
+
+    def _build_per_slot_cond(self, cn_index: int, current_cond: torch.Tensor) -> torch.Tensor:
+        if self.denoising_steps_num <= 1:
+            return current_cond
+        ring = self._ensure_cn_ring(cn_index, current_cond)
+        if current_cond.dim() == 3:
+            cur4d = current_cond.unsqueeze(0)
+        else:
+            cur4d = current_cond
+        fb = self.frame_bff_size
+        if cur4d.shape[0] != fb:
+            cur4d = cur4d.expand(fb, -1, -1, -1)
+        return torch.cat([cur4d, ring], dim=0)
+
+    def _rotate_cn_ring(self, cn_index: int, current_cond: torch.Tensor) -> None:
+        if self.denoising_steps_num <= 1:
+            return
+        ring = self._cn_cond_ring.get(cn_index)
+        if ring is None:
+            return
+        if current_cond.dim() == 3:
+            cur4d = current_cond.unsqueeze(0)
+        else:
+            cur4d = current_cond[0:self.frame_bff_size]
+        fb = self.frame_bff_size
+        if ring.shape[0] > fb:
+            ring[fb:].copy_(ring[:-fb].clone())
+        ring[:fb].copy_(cur4d.to(self.dtype))
 
     def _refill_buffer_from_current(self, x_t_latent: torch.Tensor) -> None:
         if self.x_t_latent_buffer is None:

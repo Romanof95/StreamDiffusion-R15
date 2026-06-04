@@ -127,6 +127,10 @@ class UnionControlNetWrapper:
         ]
 
         ct = self._ensure_control_type_tensor(sample)
+        # Union forward reshapes control_embeds by sample batch, so ct must
+        # match sample.shape[0] — required for multi-step (Hyper) batches.
+        if ct.shape[0] != sample.shape[0]:
+            ct = ct.expand(sample.shape[0], -1)
 
         # Keep conditioning_scale as a 1-D TENSOR (not Python float/list) so
         # torch.compile doesn't specialize on the scale value — a float

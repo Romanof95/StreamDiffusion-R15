@@ -687,9 +687,10 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         gc.collect()
         torch.cuda.empty_cache()
 
-        # CUDA Graph capture disabled for StreamV2V (per-frame kvo cache copy_
-        # not yet verified safe under graph capture).
-        unet_use_cuda_graph = not v2v_on
+        # CUDA Graph capture: stable kvo cache pointers (engine.py pre-alloc)
+        # make V2V graph-capturable. Engine.infer falls back gracefully on
+        # capture failure.
+        unet_use_cuda_graph = True
         stream.unet = UNet2DConditionModelEngine(
             unet_path, cuda_stream, use_cuda_graph=unet_use_cuda_graph,
             v2v_cache_maxframes=v2v_maxframes,

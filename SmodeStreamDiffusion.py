@@ -18,6 +18,14 @@ if sys.platform.startswith('win'):
 os.environ.setdefault('HF_HUB_ETAG_TIMEOUT', '3')
 os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '10')
 
+# PyTorch CUDA allocator: expandable segments + capped split size eliminate
+# the fragmentation that drifts VRAM peaks up over long sessions. Must be
+# set before any torch import. ~1-2 GB peak VRAM saved on heavy SDXL stacks.
+os.environ.setdefault(
+    'PYTORCH_CUDA_ALLOC_CONF',
+    'expandable_segments:True,max_split_size_mb:512',
+)
+
 import socket
 import time
 import select

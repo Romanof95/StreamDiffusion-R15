@@ -983,6 +983,8 @@ class StreamDiffusionXL:
                 x = self.similar_filter(x)
                 if x is None:
                     self._ssf_frames_skipped += 1
+                    self._needs_buffer_refill = False
+                    self._cn_cond_ring_needs_init = False
                     time.sleep(self.inference_time_ema)
                     return self.prev_image_result
                 else:

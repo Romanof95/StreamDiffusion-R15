@@ -217,6 +217,12 @@ class App:
             hasattr(self.stream, "stream")
             and hasattr(self.stream.stream, "last_internal_timings")
         )
+        _inner = getattr(self.stream, "stream", None)
+        self._ssf_enabled_cached = (
+            _inner is not None
+            and getattr(_inner, "similar_image_filter", False)
+            and getattr(_inner, "similar_filter", None) is not None
+        )
 
         self._post_load_streamdiffusion()
 
@@ -318,11 +324,12 @@ class App:
 
     def _init_connection(self):
         try:
-            self.socket.setblocking(True)
+            self.socket.settimeout(30)  # fail fast if host is slow to bind
             server_address = ("127.0.0.1", self.config.port)
             logging.info(f"Connecting to server at {server_address}")
             self.socket.connect(server_address)
             self._send_uuid()
+            self.socket.settimeout(None)
             self.socket.setblocking(False)
         except socket.error as e:
             logging.error(f"Socket error during connection: {e}")
@@ -478,11 +485,15 @@ class App:
                 else:
                     model_has_changed = self.model_name != config_packet.model_name
                     lora_dict_has_changed = self.lora_dict != config_packet.lora_dict
+                    inner_stream = getattr(self.stream, "stream", None)
+                    current_cfg_type = (
+                        inner_stream.cfg_type if inner_stream is not None else None
+                    )
                     update_stream = (
                         self.width != config_packet.width
                         or self.height != config_packet.height
                         or self.mode != config_packet.mode
-                        or self.stream.stream.cfg_type != config_packet.cfg_type
+                        or current_cfg_type != config_packet.cfg_type
                         or self.acceleration != config_packet.acceleration
                         or self.lora_dict != config_packet.lora_dict
                     )
@@ -704,6 +715,11 @@ class App:
                     else:
                         self.stream.stream.disable_similar_image_filter()
                         logging.info("Similar Image Filter disabled")
+                    _inner = self.stream.stream
+                    self._ssf_enabled_cached = (
+                        getattr(_inner, "similar_image_filter", False)
+                        and getattr(_inner, "similar_filter", None) is not None
+                    )
 
                 old_delta = getattr(self, 'current_delta', 1.0)
                 new_delta = new_config.get('delta', 1.0)
@@ -873,13 +889,9 @@ class App:
 
             preview_mode = self._cached_preview_mode
 
-            # SSF upfront gate: skip the whole pipeline (including expensive ControlNet
-            # preprocessors) when the Similar-Image Filter has decided to skip.
-            inner_stream = getattr(self.stream, 'stream', None)
-            if (preview_mode == 'normal'
-                    and inner_stream is not None
-                    and getattr(inner_stream, 'similar_image_filter', False)
-                    and getattr(inner_stream, 'similar_filter', None) is not None):
+            # SSF upfront gate: skip pipeline + preprocessors when the filter decides to.
+            if preview_mode == 'normal' and getattr(self, '_ssf_enabled_cached', False):
+                inner_stream = self.stream.stream
                 # Match the pipeline's normalization: (C,H,W)[0,1] -> (1,C,H,W)[-1,1].
                 ssf_input = permuted_input_texture.unsqueeze(0) * 2.0 - 1.0
                 if inner_stream.similar_filter.decide_skip(ssf_input):

@@ -13,19 +13,12 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 )
 
 from .image_filter import SimilarImageFilter
+from functools import lru_cache
 
 
-_SHAPE_CACHE = {}  # (height, width, scale_factor) -> (latent_h, latent_w)
-
-
+@lru_cache(maxsize=32)
 def _get_latent_dimensions(height: int, width: int, scale_factor: int) -> Tuple[int, int]:
-    cache_key = (height, width, scale_factor)
-    if cache_key not in _SHAPE_CACHE:
-        _SHAPE_CACHE[cache_key] = (
-            int(height // scale_factor),
-            int(width // scale_factor),
-        )
-    return _SHAPE_CACHE[cache_key]
+    return (int(height // scale_factor), int(width // scale_factor))
 
 
 class StreamDiffusion:
@@ -628,13 +621,14 @@ class StreamDiffusion:
                         proj_layer = proj_layers[0]
                         if hasattr(proj_layer, 'clip_embeds') and proj_layer.clip_embeds is not None:
                             ce = proj_layer.clip_embeds
-                            if ce.dim() == 3:
+                            needs_unsqueeze = (ce.dim() == 3)
+                            if needs_unsqueeze:
                                 ce = ce.unsqueeze(1)
                             if ce.shape[0] != expected_batch:
                                 proj_layer.clip_embeds = ce.expand(
                                     expected_batch, *ce.shape[1:]
                                 ).contiguous()
-                            elif ce is not proj_layer.clip_embeds:
+                            elif needs_unsqueeze:
                                 proj_layer.clip_embeds = ce
 
             model_pred = self.unet(
@@ -865,6 +859,8 @@ class StreamDiffusion:
                 x = self.similar_filter(x)
                 if x is None:
                     self._ssf_frames_skipped += 1
+                    self._needs_buffer_refill = False
+                    self._cn_cond_ring_needs_init = False
                     time.sleep(self.inference_time_ema)
                     return self.prev_image_result
                 else:

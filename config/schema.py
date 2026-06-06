@@ -29,6 +29,12 @@ class DepthConfig:
     far_threshold: int = 255
     invert: bool = False
 
+    def __post_init__(self):
+        if self.blur_kernel < 1:
+            self.blur_kernel = 1
+        elif self.blur_kernel % 2 == 0:
+            self.blur_kernel += 1
+
 
 @dataclass
 class OpenPoseConfig:
@@ -57,7 +63,7 @@ class StreamV2VConfig:
 @dataclass
 class SimilarImageFilterConfig:
     enabled: bool = True
-    threshold: float = 0.99
+    threshold: float = 0.95
     max_skip: int = 5
 
 

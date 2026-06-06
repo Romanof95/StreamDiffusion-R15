@@ -66,6 +66,12 @@ class UnionControlNetWrapper:
             PREPROCESSOR_TO_UNION_TYPE[name] for name in self.active_names
             if name in PREPROCESSOR_TO_UNION_TYPE
         ]
+        unknown = [n for n in active_names if n not in PREPROCESSOR_TO_UNION_TYPE]
+        if unknown:
+            logging.warning(
+                "[Union CN] Skipping unknown preprocessor types: %s (known: %s)",
+                unknown, list(PREPROCESSOR_TO_UNION_TYPE.keys()),
+            )
         self._control_type_tensor = None
         self._control_type_tensor_key = None
 

@@ -1,6 +1,6 @@
 # StreamDiffusion R15
 
-Real-time Stable Diffusion runtime used by SmodeTech's StreamDiffusion R15 engine.
+Real-time Stable Diffusion runtime used by Smode's StreamDiffusion R15 engine.
 
 [![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/release/python-3119/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
@@ -92,15 +92,6 @@ If you want to drive the runtime yourself, `StartStreamDiffusion.bat` shows the 
 - CUDA Graph capture on stable-shape engines
 - Per-frame VRAM optimisations: zero-CN residuals cache, `shape_dict` cheap-key, in-place residual scaling, hoisted `init_noise` roll, FP16 safety-checker load
 
-## Performance baseline
-
-Measured on an RTX 5080 Laptop (16 GB) at 512x512:
-
-- SD 1.5 + 1 ControlNet (canny): ~28 FPS
-- SDXL Turbo + Union ControlNet (canny): ~15 FPS
-
-Both numbers are substantially higher when running without a ControlNet branch.
-
 ## Caveats / known limitations
 
 - Tight coupling to Smode's IPC protocol — this is not a drop-in standalone library
@@ -113,4 +104,4 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the f
 
 ## Credits
 
-Built on the foundations of [cumulo-autumn/StreamDiffusion](https://github.com/cumulo-autumn/StreamDiffusion) (the original real-time SD pipeline paper by Akio Kodaira et al.), reworked extensively for SmodeTech's real-time production use case. StreamV2V temporal consistency adapted from the [StreamV2V](https://github.com/Jeff-LiangF/streamv2v) paper. SDXL Union ControlNet from [xinsir](https://huggingface.co/xinsir).
+Built on the foundations of [cumulo-autumn/StreamDiffusion](https://github.com/cumulo-autumn/StreamDiffusion) (the original real-time SD pipeline paper by Akio Kodaira et al.), reworked extensively for Smode's real-time production use case. StreamV2V temporal consistency adapted from the [StreamV2V](https://github.com/Jeff-LiangF/streamv2v) paper. SDXL Union ControlNet from [xinsir](https://huggingface.co/xinsir).

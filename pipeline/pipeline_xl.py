@@ -347,8 +347,19 @@ class StreamDiffusionXL:
                 dtype=self.dtype,
                 device=self.device,
             )
+            self._x_t_latent_concat_buf = torch.empty(
+                (
+                    self.denoising_steps_num * self.frame_bff_size,
+                    4,
+                    self.latent_height,
+                    self.latent_width,
+                ),
+                dtype=self.dtype,
+                device=self.device,
+            )
         else:
             self.x_t_latent_buffer = None
+            self._x_t_latent_concat_buf = None
 
         self._needs_buffer_refill = True
 
@@ -840,7 +851,11 @@ class StreamDiffusionXL:
             else:
                 cur4d = c[0:fb]
             if ring.shape[0] > fb:
-                ring[fb:].copy_(ring[:-fb].clone())
+                num_chunks = ring.shape[0] // fb
+                for _k in range(num_chunks - 1, 0, -1):
+                    ring[_k * fb:(_k + 1) * fb].copy_(
+                        ring[(_k - 1) * fb:_k * fb]
+                    )
             ring[:fb].copy_(cur4d.to(self.dtype))
 
     def _refill_buffer_from_current(self, x_t_latent: torch.Tensor) -> None:
@@ -874,16 +889,16 @@ class StreamDiffusionXL:
                     self._refill_buffer_from_current(x_t_latent)
                     self._needs_buffer_refill = False
                 prev_latent_batch = self.x_t_latent_buffer
-                old_x_t_latent = x_t_latent
-                x_t_latent = torch.cat((x_t_latent, prev_latent_batch), dim=0)
-                if old_x_t_latent is not x_t_latent:
-                    del old_x_t_latent
+                fb = self.frame_bff_size
+                self._x_t_latent_concat_buf[:fb].copy_(x_t_latent)
+                self._x_t_latent_concat_buf[fb:].copy_(prev_latent_batch)
+                x_t_latent = self._x_t_latent_concat_buf
 
-                old_stock_noise = self.stock_noise
-                self.stock_noise = torch.cat(
-                    (self.init_noise[0:1], self.stock_noise[:-1]), dim=0
-                )
-                del old_stock_noise
+                for _k in range(self.stock_noise.shape[0] // fb - 1, 0, -1):
+                    self.stock_noise[_k * fb:(_k + 1) * fb].copy_(
+                        self.stock_noise[(_k - 1) * fb:_k * fb]
+                    )
+                self.stock_noise[:fb].copy_(self.init_noise[:fb])
             x_0_pred_batch, model_pred = self.unet_step(
                 x_t_latent,
                 t_list,

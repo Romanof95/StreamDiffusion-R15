@@ -274,7 +274,5 @@ echo ===========================================================================
 
 color 0A
 echo.
-echo Appuyez sur une touche pour quitter...
-pause >nul
 
 endlocal

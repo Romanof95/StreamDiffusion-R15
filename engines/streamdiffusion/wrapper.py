@@ -125,7 +125,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         lora_dict: Optional[Dict[str, float]] = None,
         lcm_lora_id: Optional[str] = None,
         vae_id: Optional[str] = None,
-        acceleration: Literal["none", "xformers", "tensorrt"] = "tensorrt",
+        acceleration: Literal["none", "tensorrt"] = "none",
         warmup: int = 10,
         do_add_noise: bool = True,
         use_lcm_lora: bool = True,
@@ -141,7 +141,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         # ---- Pre-flight TRT engine cache check (fast path) ------------------
         # If every TRT engine is already on disk, skip the heavy PyTorch
         # pipeline load. Gated off when ANY heavy-path feature is active
-        # (xformers, FaceID, StreamV2V, custom LoRAs, non-tinyVAE,
+        # (FaceID, StreamV2V, custom LoRAs, non-tinyVAE,
         # single-file checkpoint).
         fast_path_taken = False
         if acceleration == "tensorrt":
@@ -367,8 +367,6 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             self.load_ip_adapter_faceid(pipe, self.faceid_config, is_sdxl=False)
 
         try:
-            if acceleration == "xformers":
-                stream.pipe.enable_xformers_memory_efficient_attention()
             if acceleration == "tensorrt":
                 self.enable_tensorrt_acceleration(
                     stream, model_id_or_path, use_lcm_lora, use_tiny_vae,
@@ -377,11 +375,11 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             if acceleration == "sfast":
                 from pipeline.acceleration.sfast import accelerate_with_stable_fast
                 stream = accelerate_with_stable_fast(stream)
+            if acceleration == "torchcompile":
+                self.setup_torch_compile(stream, acceleration, cache_subdir="sd")
         except Exception:
             traceback.print_exc()
             logging.warning("Acceleration failed. Falling back to normal mode.")
-
-        self.setup_torch_compile(stream, acceleration, cache_subdir="sd")
 
         if seed < 0:
             seed = np.random.randint(0, 1000000)

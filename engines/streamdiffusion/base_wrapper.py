@@ -56,7 +56,7 @@ class BaseStreamDiffusionWrapper(ABC):
         width: int = 512,
         height: int = 512,
         warmup: int = 10,
-        acceleration: Literal["none", "xformers", "tensorrt"] = "tensorrt",
+        acceleration: Literal["none", "tensorrt"] = "none",
         do_add_noise: bool = True,
         device_ids: Optional[List[int]] = None,
         use_lcm_lora: bool = True,

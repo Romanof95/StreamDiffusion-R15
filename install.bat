@@ -260,8 +260,8 @@ echo    - Stable Diffusion 1.5 / SDXL (HuggingFace cache)
 echo    - DWPose (dw-ll_ucoco_384.onnx, yolox_l.onnx — for OpenPose)
 echo.
 echo 2. To use in Smode:
-echo    - Chargez le package StreamDiffusion-R15 dans Smode
-echo    - Le script SmodeStreamDiffusion.py se chargera automatiquement
+echo    - Load the StreamDiffusion-R15 package in Smode
+echo    - The SmodeStreamDiffusion.py script will load automatically
 echo.
 echo 3. Documentation: see the docs/ folder for usage instructions and examples.
 echo.

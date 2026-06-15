@@ -29,8 +29,9 @@ class Mode(enum.IntEnum):
 
 class Acceleration(enum.IntEnum):
     NONE = 0
-    XFORMERS = 1
+    TORCHCOMPILE = 1
     TENSORRT = 2
+    
 
 
 class ConfigType(enum.IntEnum):

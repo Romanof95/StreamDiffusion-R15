@@ -138,7 +138,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         lora_dict: Optional[Dict[str, float]] = None,
         lcm_lora_id: Optional[str] = None,
         vae_id: Optional[str] = None,
-        acceleration: Literal["none", "xformers", "tensorrt"] = "tensorrt",
+        acceleration: Literal["none", "tensorrt"] = "none",
         warmup: int = 10,
         do_add_noise: bool = True,
         use_lcm_lora: bool = True,
@@ -380,11 +380,6 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             self.load_ip_adapter_faceid(pipe, self.faceid_config, is_sdxl=True)
 
         try:
-            if acceleration == "xformers":
-                try:
-                    stream.pipe.enable_xformers_memory_efficient_attention()
-                except Exception as e:
-                    logging.warning(f"xformers not available ({e}), using PyTorch native SDPA")
             if acceleration == "tensorrt":
                 self.enable_tensorrt_acceleration(
                     stream, model_id_or_path, use_lcm_lora, use_tiny_vae,

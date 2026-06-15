@@ -114,7 +114,7 @@ class ConfigPacket(Packet):
         self.guidance_scale = 5.0
         self.mode = Mode.IMAGE_TO_IMAGE
         self.cfg_type = "none"
-        self.acceleration = Acceleration.XFORMERS
+        self.acceleration = Acceleration.NONE
         self.lora_dict: Optional[Dict[str, float]] = None
 
     def from_bytes(self, data: bytes):

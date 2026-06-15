@@ -9,6 +9,8 @@ Responsibilities:
 """
 import os
 import sys
+
+from engines.streamdiffusion.base_wrapper import BaseStreamDiffusionWrapper
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 if sys.platform.startswith('win'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -94,7 +96,7 @@ class App:
             # Index 0 = last timestep with max noise (correct for 1-step distilled models).
             self.t_index_list = [0]
             self.mode = Mode.IMAGE_TO_IMAGE
-            self.acceleration = Acceleration.XFORMERS
+            self.acceleration = Acceleration.NONE
             self.cfg_type = "self" if self.mode == Mode.IMAGE_TO_IMAGE else "none"
             self.lora_dict: Dict[str, float] = None
             self.engine = None
@@ -182,10 +184,10 @@ class App:
             import gc
             gc.collect()
 
-        if self.acceleration == Acceleration.XFORMERS:
-            acceleration_str = "xformers"
-        elif self.acceleration == Acceleration.TENSORRT:
+        if self.acceleration == Acceleration.TENSORRT:
             acceleration_str = "tensorrt"
+        elif self.acceleration == Acceleration.TORCHCOMPILE:
+            acceleration_str = "torchcompile"
         else:
             acceleration_str = "none"
 
@@ -341,24 +343,35 @@ class App:
         send_message(self.socket, packet)
 
     def accelerate(self, previous_acceleration: Acceleration = Acceleration.NONE):
-        if self.acceleration == Acceleration.XFORMERS:
-            self.stream.stream.pipe.enable_xformers_memory_efficient_attention()
-            self.stream.recreate_pipe()
+        if self.acceleration == Acceleration.TORCHCOMPILE:
+            # torch.compile is activated during stream creation via setup_torch_compile()
+            # in the wrapper (base_wrapper.py). Ensure it's properly initialized.
+            if previous_acceleration == Acceleration.TENSORRT:
+                # Switching from TensorRT requires full stream recreation
+                self._create_stream()
+            else:
+                # Already in PyTorch mode; just recreate pipe with torch.compile active
+                self.stream.recreate_pipe()
+            logging.info("Torch.compile acceleration enabled")
         elif self.acceleration == Acceleration.TENSORRT:
             try:
-                if previous_acceleration == Acceleration.XFORMERS:
+                if previous_acceleration == Acceleration.TORCHCOMPILE:
+                    # Switching from torch.compile to TensorRT requires full stream recreation
                     self._create_stream()
                 else:
                     self.stream.enable_tensorrt_acceleration(self.stream.stream, self.model_name, True, True)
 
                 self._warmup_tensorrt()
+                logging.info("TensorRT acceleration enabled")
             except ModuleNotFoundError:
                 logging.warning("TensorRT module not found; please install it")
                 raise
             except Exception as e:
                 logging.warning(f"TensorRT acceleration not available; {e}")
         else:
+            # No acceleration (NONE) - use default PyTorch
             self.stream.recreate_pipe()
+            logging.info("Acceleration disabled (PyTorch default)")
 
     def _warmup_tensorrt(self):
         """Warm up TensorRT engine with dummy inferences."""
@@ -478,6 +491,7 @@ class App:
                     app.lora_dict = config_packet.lora_dict
                     app.acceleration = config_packet.acceleration
                     app.cache_dir = config_packet.cache_dir
+                    app.controlnet_config = config_packet.controlnet_config
 
                 if not self.stream:
                     update_parameters(self, config_packet)

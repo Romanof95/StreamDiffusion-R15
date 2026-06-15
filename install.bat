@@ -1,17 +1,17 @@
 @echo off
 REM ============================================================================
-REM StreamDiffusion-R15 - Installation Automatique
+REM StreamDiffusion-R15 - Automatic Installation
 REM ============================================================================
-REM Ce script installe automatiquement toutes les dependances necessaires
-REM pour StreamDiffusion-R15 avec ControlNet sur Windows.
+REM This script automatically installs all required dependencies
+REM for StreamDiffusion-R15 with ControlNet on Windows.
 REM
-REM Prerequis:
-REM   - Smode Compose installe (fournit Python 3.11.9 dans le dossier parent)
-REM   - NVIDIA GPU (RTX 2000/3000/4000/5000) avec 8+ GB VRAM
-REM   - CUDA 12.9+ installe (drivers NVIDIA recents)
-REM   - Connexion internet (15-20 GB a telecharger)
+REM Prerequisites:
+REM   - Smode Compose installed (provides Python 3.11.9 in the parent folder)
+REM   - NVIDIA GPU (RTX 2000/3000/4000/5000 series) with 8+ GB VRAM
+REM   - CUDA 12.9+ installed (recent NVIDIA drivers)
+REM   - Internet connection (15–20 GB of downloads required)
 REM
-REM GPU recommandes:
+REM Recommended GPUs:
 REM   - RTX 3060/3070/3080 (12 GB): SD 1.5 + ControlNet
 REM   - RTX 4070/4080/4090 (16+ GB): SD 1.5 + SDXL + ControlNet
 REM   - RTX 5080/5090 (16+ GB): SD 1.5 + SDXL + ControlNet + StreamV2V
@@ -22,108 +22,108 @@ color 0A
 
 echo.
 echo ============================================================================
-echo  StreamDiffusion-R15 - Installation Automatique
+echo  StreamDiffusion-R15 - Automatic Installation
 echo ============================================================================
 echo.
 
 REM ============================================================================
-REM Etape 0: Verifications preliminaires
+REM Etape 0: Preliminary checks
 REM ============================================================================
 
-echo [Etape 0/4] Verification des prerequis...
+echo [Etape 0/4] Checking prerequisite...
 echo.
 
-REM Utiliser le Python 3.11.9 fourni par Smode (meme que StartStreamDiffusion.bat)
+REM Use Python 3.11.9 provided by Smode (same as StartStreamDiffusion.bat)
 set "PYTHON_EXE=%CD%\..\python-3_11_9\python.exe"
 
 if not exist "%PYTHON_EXE%" (
     color 0C
-    echo [ERREUR] Python 3.11.9 de Smode non trouve:
+    echo [ERREUR] Python 3.11.9 not found:
     echo    %PYTHON_EXE%
     echo.
-    echo Assurez-vous que Smode Compose est installe et que ce package
-    echo se trouve dans le dossier Packages/ de Smode.
+    echo Make sure Smode Compose / Live is installed and this package
+    echo is located in the Packages/ folder of Smode.
     echo.
     pause
     exit /b 1
 )
 
-REM Afficher la version Python
+REM Display Python version
 for /f "tokens=2" %%i in ('"%PYTHON_EXE%" --version 2^>^&1') do set PYTHON_VERSION=%%i
-echo [OK] Python %PYTHON_VERSION% detecte (Smode).
+echo [OK] Python %PYTHON_VERSION% found (Smode).
 
-REM Verifier que CUDA Toolkit est installe (requis pour torch.compile / Triton)
+REM Verify that CUDA Toolkit is installed (required for torch.compile / Triton)
 set "CUDA_FOUND=0"
-REM Verifier CUDA_PATH (variable definie par l'installeur CUDA)
+REM Verify CUDA_PATH (variable defined by the CUDA installer)
 if defined CUDA_PATH (
     if exist "%CUDA_PATH%\bin\nvcc.exe" set "CUDA_FOUND=1"
 )
-REM Fallback: chercher CUDA 12.9 (installe par winget) dans le chemin standard
+REM Fallback: search for CUDA 12.9 (installed by winget) in the standard path
 if "%CUDA_FOUND%"=="0" (
     if exist "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin\nvcc.exe" set "CUDA_FOUND=1"
 )
 if "%CUDA_FOUND%"=="0" (
-    echo [INFO] CUDA Toolkit non detecte. Installation via winget...
+    echo [INFO] CUDA Toolkit not found. Installation via winget...
     winget install Nvidia.CUDA --version 12.9 --accept-source-agreements --accept-package-agreements --silent
     if !errorlevel! equ 0 (
-        echo [OK] CUDA Toolkit 12.9.1 installe avec succes.
-        echo [INFO] Note: un redemarrage peut etre necessaire pour que CUDA_PATH soit actif.
+        echo [OK] CUDA Toolkit 12.9.1 installed successfully.
+        echo [INFO] Note: a restart may be necessary for CUDA_PATH to be active.
     ) else (
         color 0E
-        echo [ATTENTION] Installation automatique du CUDA Toolkit echouee.
-        echo    Installez-le manuellement: https://developer.nvidia.com/cuda-toolkit-archive
-        echo    L'installation va continuer, mais torch.compile^(^) ne fonctionnera pas.
+        echo [ATTENTION] Automatic installation of CUDA Toolkit failed.
+        echo    Please install it manually: https://developer.nvidia.com/cuda-toolkit-archive
+        echo    The installation will continue, but torch.compile^(^) will not work.
         echo.
     )
 ) else (
-    echo [OK] CUDA Toolkit detecte.
+    echo [OK] CUDA Toolkit found.
 )
-echo [INFO] Verification GPU detaillee reportee a l'etape 2 (PyTorch CUDA check).
+echo [INFO] Verification GPU detailed report will be generated at step 2 (PyTorch CUDA check).
 
 echo.
 echo ============================================================================
-echo [Etape 1/4] Creation de l'environnement virtuel Python
+echo [Etape 1/4] Creation of the Python virtual environment
 echo ============================================================================
 echo.
 
-REM Verifier si .venv existe deja et est fonctionnel
+REM Verify if .venv already exists and is functional
 if exist ".venv\Scripts\activate.bat" (
-    echo [INFO] Environnement virtuel existant detecte et fonctionnel.
-    echo [INFO] Utilisation de l'environnement existant.
+    echo [INFO] Existing virtual environment found and functional.
+    echo [INFO] Using existing virtual environment.
     goto :skip_venv_creation
 )
 if exist ".venv" (
-    echo [INFO] Environnement virtuel corrompu detecte, suppression...
+    echo [INFO] Corrupted virtual environment detected, removal...
     rmdir /s /q .venv
-    echo [OK] Ancien environnement supprime.
+    echo [OK] Old virtual environment removed.
 )
 
-echo [INFO] Installation de virtualenv...
+echo [INFO] Installing virtualenv...
 "%PYTHON_EXE%" -m pip install virtualenv --quiet
-echo [INFO] Creation de l'environnement virtuel dans .venv...
+echo [INFO] Creation of the virtual environment in .venv...
 "%PYTHON_EXE%" -m virtualenv --copies .venv
 if %errorlevel% neq 0 (
     color 0C
-    echo [ERREUR] Impossible de creer l'environnement virtuel.
+    echo [ERREUR] Impossible to create the virtual environment.
     echo.
     pause
     exit /b 1
 )
-echo [OK] Environnement virtuel cree avec succes (Python %PYTHON_VERSION%).
+echo [OK] Virtual environment created successfully (Python %PYTHON_VERSION%).
 
 :skip_venv_creation
 
 echo.
-echo [INFO] Activation de l'environnement virtuel...
+echo [INFO] Activation of the virtual environment...
 call .venv\Scripts\activate.bat
 if %errorlevel% neq 0 (
     color 0C
-    echo [ERREUR] Impossible d'activer l'environnement virtuel.
+    echo [ERREUR] Impossible to activate the virtual environment.
     echo.
     pause
     exit /b 1
 )
-echo [OK] Environnement virtuel active.
+echo [OK] Virtual environment activated.
 
 REM Mettre a jour pip (apres activation, python = venv Python 3.11.9)
 echo.
@@ -133,23 +133,23 @@ echo [OK] pip mis a jour.
 
 echo.
 echo ============================================================================
-echo [Etape 2/4] Installation des dependances (requirements.txt)
+echo [Step 2/4] Installation of dependencies (requirements.txt)
 echo ============================================================================
 echo.
 
 if not exist "requirements.txt" (
     color 0C
-    echo [ERREUR] Le fichier requirements.txt est introuvable.
-    echo Assurez-vous d'etre dans le bon repertoire.
+    echo [ERREUR] The requirements.txt file is not found.
+    echo Make sure you are in the correct directory.
     echo.
     pause
     exit /b 1
 )
 
-echo [INFO] Installation de toutes les dependances depuis requirements.txt...
-echo [INFO] Cette etape peut prendre 15-20 minutes selon votre connexion...
+echo [INFO] Installation of all dependencies from requirements.txt...
+echo [INFO] This step may take 15-20 minutes depending on your connection...
 echo.
-echo Packages principaux qui seront installes:
+echo Main packages that will be installed:
 echo   - PyTorch 2.10.0 stable + CUDA 12.8 (runtime PyTorch)
 echo   - TensorRT 10.9.0.34
 echo   - diffusers 0.36.0 (Hugging Face)
@@ -158,7 +158,7 @@ echo   - controlnet-aux 0.0.10 (Canny, Depth, OpenPose)
 echo   - easy-dwpose 1.0.2 (pose detection)
 echo   - triton-windows 3.3.1 (torch.compile)
 echo.
-echo [INFO] L'installation va commencer. Gardez ce terminal ouvert...
+echo [INFO] Installation will start. Keep this terminal open...
 echo.
 
 python -m pip install -r requirements.txt --verbose
@@ -166,53 +166,53 @@ python -m pip install -r requirements.txt --verbose
 if %errorlevel% neq 0 (
     color 0C
     echo.
-    echo [ERREUR] Echec de l'installation des dependances.
+    echo [ERREUR] Dependencies installation failed.
     echo.
     pause
     exit /b 1
 )
 
 echo.
-echo [OK] Toutes les dependances installees avec succes.
+echo [OK] All dependencies installed successfully.
 
 REM Installer easy-dwpose separement (conflit artificiel huggingface_hub<0.25, API inchangee)
 echo.
-echo [INFO] Installation de easy-dwpose (--no-deps)...
+echo [INFO] Installation of easy-dwpose (--no-deps)...
 python -m pip install easy-dwpose==1.0.2 --no-deps --quiet
-echo [OK] easy-dwpose installe.
+echo [OK] easy-dwpose installed.
 
 REM Installer insightface depuis wheel pre-compile Windows (evite besoin de MSVC)
 REM Requis pour IP-Adapter FaceID. Incompatible avec numpy 2.x.
 echo.
-echo [INFO] Installation de insightface (IP-Adapter FaceID)...
+echo [INFO] Installation of insightface (IP-Adapter FaceID)...
 python -m pip install "https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl" --quiet
 REM Downgrade numpy pour compatibilite insightface (scipy/opencv restent compatibles)
 python -m pip install "numpy==1.26.4" --quiet
-echo [OK] insightface installe (numpy 1.26.4 pour compatibilite).
+echo [OK] insightface installed (numpy 1.26.4 for compatibility).
 
 REM Verifier que PyTorch et CUDA fonctionnent
 echo.
-echo [INFO] Verification de PyTorch et CUDA...
-python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA disponible: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+echo [INFO] Verification of PyTorch and CUDA...
+python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
 
 if %errorlevel% neq 0 (
     color 0E
     echo.
-    echo [ATTENTION] PyTorch ou CUDA ne semble pas fonctionner correctement.
-    echo Verifiez votre installation CUDA et les drivers NVIDIA.
-    echo [INFO] L'installation continue...
+    echo [ATTENTION] PyTorch or CUDA does not seem to be working correctly.
+    echo Verify your CUDA installation and NVIDIA drivers.
+    echo [INFO] Installation will continue...
 ) else (
-    echo [OK] PyTorch et CUDA fonctionnent correctement.
+    echo [OK] PyTorch and CUDA are working correctly.
 )
 
 echo.
 echo ============================================================================
-echo [Etape 3/4] Configuration des binaires CUDA et headers Python
+echo [Step 3/4] Configuration of CUDA binaries and Python headers
 echo ============================================================================
 echo.
 
-echo [INFO] Configuration pour torch.compile() et Triton...
-echo [INFO] Cette etape copie les outils CUDA et headers Python necessaires.
+echo [INFO] Configuration for torch.compile() and Triton...
+echo [INFO] This step copies the necessary CUDA tools and Python headers.
 echo.
 
 python setup_venv.py
@@ -220,20 +220,20 @@ python setup_venv.py
 if %errorlevel% neq 0 (
     color 0E
     echo.
-    echo [ATTENTION] La configuration des binaires a echoue partiellement.
-    echo StreamDiffusion fonctionnera quand meme, mais torch.compile^(^) pourrait ne pas marcher.
-    echo [INFO] L'installation continue...
+    echo [ATTENTION] The configuration of the binaries has failed partially.
+    echo StreamDiffusion will work anyway, but torch.compile^(^) might not work.
+    echo [INFO] Installation will continue...
 ) else (
     echo [OK] Binaires CUDA et headers Python configures.
 )
 
 echo.
 echo ============================================================================
-echo [Etape 4/4] Verification de l'installation
+echo [Step 4/4] Verification of the installation
 echo ============================================================================
 echo.
 
-echo [INFO] Test de l'installation...
+echo [INFO] Test of the installation...
 echo.
 
 python verify_install.py
@@ -241,8 +241,8 @@ python verify_install.py
 if %errorlevel% neq 0 (
     color 0C
     echo.
-    echo [ERREUR] Le test d'installation a echoue.
-    echo Verifiez les messages d'erreur ci-dessus.
+    echo [ERREUR] The installation test has failed.
+    echo Verify the error messages above.
     echo.
     pause
     exit /b 1
@@ -250,25 +250,25 @@ if %errorlevel% neq 0 (
 
 echo.
 echo ============================================================================
-echo  Installation Terminee avec Succes!
+echo  Installation completed successfully!
 echo ============================================================================
 echo.
-echo Prochaines etapes:
+echo Next steps:
 echo.
-echo 1. Les modeles seront telecharges automatiquement au premier lancement:
+echo 1. The models will be downloaded automatically on the first launch:
 echo    - Stable Diffusion 1.5 / SDXL (HuggingFace cache)
-echo    - DWPose (dw-ll_ucoco_384.onnx, yolox_l.onnx — pour OpenPose)
+echo    - DWPose (dw-ll_ucoco_384.onnx, yolox_l.onnx — for OpenPose)
 echo.
-echo 2. Pour utiliser dans Smode:
+echo 2. To use in Smode:
 echo    - Chargez le package StreamDiffusion-R15 dans Smode
 echo    - Le script SmodeStreamDiffusion.py se chargera automatiquement
 echo.
-echo 3. Documentation: voir le dossier docs/
+echo 3. Documentation: see the docs/ folder for usage instructions and examples.
 echo.
-echo Espace disque utilise: ~12-15 GB total
-echo   - Environnement .venv: ~3 GB
-echo   - Modeles HuggingFace (cache): ~5-8 GB
-echo   - Checkpoints DWPose (OpenPose): ~400 MB (au premier lancement)
+echo Disk space used: ~12-15 GB total
+echo   - Environment .venv: ~3 GB
+echo   - Models HuggingFace (cache): ~5-8 GB
+echo   - Checkpoints DWPose (OpenPose): ~400 MB (on first launch)
 echo.
 echo ============================================================================
 

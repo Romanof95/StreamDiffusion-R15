@@ -21,18 +21,29 @@ class InterProcessEvent:
         CREATE_EVENT_MANUAL_RESET = 0x00000001
         CREATE_EVENT_INITIAL_SET = 0x00000002
         self.signal_awakes_all_clients = signal_awakes_all_clients
-        flags = CREATE_EVENT_MANUAL_RESET if signal_awakes_all_clients else 0 | CREATE_EVENT_INITIAL_SET if initial_signaled_state else 0
+
+        if signal_awakes_all_clients:
+            flags |= CREATE_EVENT_MANUAL_RESET
+
+        if initial_signaled_state:
+            flags |= CREATE_EVENT_INITIAL_SET
+
         self.event = win32event.CreateEvent(None, flags, win32event.EVENT_ALL_ACCESS, name)
-        if win32api.GetLastError() != 0:
+        if win32api.GetLastError() not in (0, 183):
+            err = win32api.GetLastError()
             raise RuntimeError(f"Failed to create event {name} code: {win32api.GetLastError()}")
         return True
 
     def open(self, name) -> bool:
         if self.event is not None:
             raise RuntimeError("Event already assigned")
-
         self.event = win32event.OpenEvent(win32event.SYNCHRONIZE, False, name)
-        if win32api.GetLastError() != 0:
+        result = win32event.WaitForSingleObject(self.event, 10000)
+        if result == win32event.WAIT_TIMEOUT:
+            raise RuntimeError(f"Failed to open event {name} code: {win32api.GetLastError()}")
+        if result == win32event.WAIT_FAILED:
+            raise RuntimeError(f"Failed to open event {name} code: {win32api.GetLastError()}")
+        if win32api.GetLastError() not in (0, 183): # array already exist signaling that the event is already open
             raise RuntimeError(f"Failed to open event {name} code: {win32api.GetLastError()}")
         return True
 

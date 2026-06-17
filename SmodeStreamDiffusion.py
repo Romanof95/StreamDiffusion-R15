@@ -10,6 +10,7 @@ Responsibilities:
 import os
 import sys
 
+from config.schema import StreamDiffusionConfig
 from engines.streamdiffusion.base_wrapper import BaseStreamDiffusionWrapper
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 if sys.platform.startswith('win'):
@@ -112,6 +113,12 @@ class App:
             self.smodeToStreamDiffusionInterProcessEvent.open(
                 "Global\\SmodeToStreamDiffusion-" + config.uuid
             )
+
+            self.canny_config = None
+            self.depth_config = None
+            self.openpose_config = None
+            self.similar_image_filter_config = None
+
         except Exception as e:
             logging.error(f"Failed to initialize App: {e}")
             if self.socket:
@@ -139,7 +146,6 @@ class App:
 
         self.low_latency = LowLatencyController()
 
-        self.config_file_path = Path(__file__).parent / "controlnet_config.json"
         self.last_config_check = 0
 
         # Config file can be written by a Smode controller script in parallel
@@ -147,7 +153,6 @@ class App:
         import threading
         self.config_lock = threading.Lock()
 
-        self.controlnet_config = self._load_controlnet_config()
         self.controlnet_skip_frames = self.controlnet_config.get('controlnet_skip_frames', 1)
         self.current_delta = self.controlnet_config.get('delta', 1.0)
         self.config_check_interval = 2.0
@@ -397,35 +402,9 @@ class App:
                 del dummy_input
                 torch.cuda.empty_cache()
 
-    def _load_controlnet_config(self):
-        """Thread-safe load of the ControlNet config JSON."""
-        with self.config_lock:
-            try:
-                if self.config_file_path.exists():
-                    with open(self.config_file_path, 'r') as f:
-                        config = json.load(f)
-                else:
-                    config = {
-                        'controlnet_enabled': False,
-                        'canny_enabled': False,
-                        'canny_scale': 0.5,
-                        'canny_low_threshold': 100,
-                        'canny_high_threshold': 200,
-                        'depth_enabled': False,
-                        'depth_scale': 0.5,
-                        'profiling_enabled': False
-                    }
-
-                self._cache_config_values(config)
-
-                return config
-            except Exception as e:
-                logging.warning(f"Failed to load ControlNet config: {e}")
-                return self.controlnet_config
-
-    def _cache_config_values(self, config):
+    def _cache_config_values(self, config: dict):
         """Cache frequently accessed config values to avoid dict lookups in the hot path."""
-        self._cached_canny_scale = config.get('canny_scale', 0.5)
+        self._cached_canny_scale = config.enabled
         self._cached_depth_scale = config.get('depth_scale', 0.5)
         self._cached_openpose_scale = config.get('openpose_scale', 0.8)
 
@@ -491,10 +470,18 @@ class App:
                     app.lora_dict = config_packet.lora_dict
                     app.acceleration = config_packet.acceleration
                     app.cache_dir = config_packet.cache_dir
-                    app.controlnet_config = config_packet.controlnet_config
+                    app.canny_config = config_packet.canny_config
+                    app.depth_config = config_packet.depth_config
+                    app.openpose_config = config_packet.openpose_config
+                    app.similar_image_filter_config = config_packet.similar_image_filter_config
+                    app.controlnet_ipc_config = config_packet.controlnet_ipc_config
 
                 if not self.stream:
                     update_parameters(self, config_packet)
+                    if config_packet.controlnet_config is not None:
+                        app.apply_controlnet_config(
+                            config_packet.controlnet_config
+                        )
                     self._create_stream()
                 else:
                     model_has_changed = self.model_name != config_packet.model_name
@@ -514,6 +501,10 @@ class App:
                     update_t_index_list = self.t_index_list != config_packet.t_index_list
                     previous_acceleration = self.acceleration
                     update_parameters(self, config_packet)
+                    if config_packet.controlnet_config is not None:
+                        app.apply_controlnet_config(
+                            config_packet.controlnet_config
+                        )
 
                     if model_has_changed or lora_dict_has_changed:
                         self._create_stream()
@@ -698,6 +689,18 @@ class App:
                 logging.warning(f"Received unexpected command: {cmd}")
         return False
 
+    def apply_controlnet_config(self, config: StreamDiffusionConfig):
+        """Apply the given controlnet configuration."""
+        self.controlnet_config = config
+        self.controlnet_manager.load_models()
+        self.controlnet_manager.update_active_list()
+
+        if self.preprocessor_orchestrator:
+            self.preprocessor_orchestrator.update_models(self.controlnet_config)
+
+        if self.engine:
+            self.engine.update_params(self.controlnet_config)
+
     def _maybe_reload_config(self, timings: dict) -> bool:
         """Periodically reload controlnet_config.json and apply changes live.
 
@@ -708,7 +711,6 @@ class App:
                 time.time() - self.last_config_check > self.config_check_interval):
             return False
 
-        new_config = self._load_controlnet_config()
         with self.config_lock:
             if new_config != self.controlnet_config:
                 logging.info("ControlNet configuration updated")

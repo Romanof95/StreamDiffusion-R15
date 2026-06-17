@@ -1,5 +1,4 @@
 """Typed configuration schema for StreamDiffusion (SD 1.5 / SDXL)."""
-import json
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
@@ -105,12 +104,6 @@ class StreamDiffusionConfig:
 
     # Low-latency mode (controlled GC + HIGH process priority)
     low_latency_mode: bool = False
-
-    @classmethod
-    def from_json(cls, path: str) -> "StreamDiffusionConfig":
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return cls.from_dict(data)
 
     @classmethod
     def from_dict(cls, data: dict) -> "StreamDiffusionConfig":

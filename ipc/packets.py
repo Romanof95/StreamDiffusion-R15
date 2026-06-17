@@ -20,6 +20,7 @@ from .protocol import (
 )
 from .socket_helpers import read_string
 
+from config.schema import CannyConfig, DepthConfig, OpenPoseConfig, SimilarImageFilterConfig
 
 class Packet:
     def __init__(self, cmd: CommandType, payload: bytes):
@@ -116,6 +117,11 @@ class ConfigPacket(Packet):
         self.cfg_type = "none"
         self.acceleration = Acceleration.NONE
         self.lora_dict: Optional[Dict[str, float]] = None
+        self.canny_config: Optional[CannyConfig] = None
+        self.depth_config: Optional[DepthConfig] = None
+        self.openpose_config: Optional[OpenPoseConfig] = None
+        self.similar_image_filter_config: Optional[SimilarImageFilterConfig] = None
+        self.controlnet_ipc_config: Optional[bytes] = None
 
     def from_bytes(self, data: bytes):
         offset = 0

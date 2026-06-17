@@ -9,7 +9,7 @@ REM Prerequisites:
 REM   - Smode Compose installed (provides Python 3.11.9 in the parent folder)
 REM   - NVIDIA GPU (RTX 2000/3000/4000/5000 series) with 8+ GB VRAM
 REM   - CUDA 12.9+ installed (recent NVIDIA drivers)
-REM   - Internet connection (15–20 GB of downloads required)
+REM   - Internet connection (15-20 GB of downloads required)
 REM
 REM Recommended GPUs:
 REM   - RTX 3060/3070/3080 (12 GB): SD 1.5 + ControlNet

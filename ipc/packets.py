@@ -78,7 +78,7 @@ class FrameDataPacket(Packet):
 # LRU cache for parsed CONFIG payloads: identical bytes are common because
 # Smode resends on every parameter change.
 _CONFIG_CACHE: "OrderedDict[str, ConfigPacket]" = OrderedDict()
-_CONFIG_CACHE_MAX_SIZE = 32
+_CONFIG_CACHE_MAX_SIZE = 28
 
 
 def _parse_config_with_cache(data: bytes):
@@ -117,11 +117,11 @@ class ConfigPacket(Packet):
         self.cfg_type = "none"
         self.acceleration = Acceleration.NONE
         self.lora_dict: Optional[Dict[str, float]] = None
+        self.controlnet_ipc_config: Optional[bytes] = None
         self.canny_config: Optional[CannyConfig] = None
         self.depth_config: Optional[DepthConfig] = None
         self.openpose_config: Optional[OpenPoseConfig] = None
         self.similar_image_filter_config: Optional[SimilarImageFilterConfig] = None
-        self.controlnet_ipc_config: Optional[bytes] = None
 
     def from_bytes(self, data: bytes):
         offset = 0
@@ -184,8 +184,136 @@ class ConfigPacket(Packet):
                 offset += 4
         else:
             self.lora_dict = None
-        return self
 
+        if offset < len(data):
+            self.similar_image_filter_config, offset = (
+                self.parse_similar_image_filter(data, offset)
+            )
+
+        if offset < len(data):
+            self.controlnet_ipc_config, offset = (
+                self.parse_controlnet_ipc_config(data, offset)
+            )
+
+        if offset < len(data):
+            self.canny_config, offset = (
+                self.parse_canny_config(data, offset)
+            )
+
+        if offset < len(data):
+            self.depth_config, offset = (
+                self.parse_depth_config(data, offset)
+            )
+
+        if offset < len(data):
+            self.openpose_config, offset = (
+                self.parse_openpose_config(data, offset)
+            )
+
+        return self
+    
+    def parse_controlnet_ipc_config(self, data : bytes, offset: int):
+        if offset + 4 > len(data):
+            raise ValueError("Insufficient data for controlnet_ipc_config length")
+        
+        controlnet_ipc_config_len, = struct.unpack_from(ENDIAN_FORMAT + UINT32, data, offset)
+        offset += 4
+        
+        if offset + controlnet_ipc_config_len > len(data):
+            raise ValueError("Insufficient data for controlnet_ipc_config payload")
+        
+        self.controlnet_ipc_config = data[offset:offset + controlnet_ipc_config_len]
+        offset += controlnet_ipc_config_len
+        
+        return self.controlnet_ipc_config, offset
+    
+    def parse_similar_image_filter(self, data : bytes, offset: int):
+        SIZE = 12
+        if offset + SIZE > len(data):
+            raise ValueError("Insufficient data for SimilarImageFilterConfig")
+        
+        enabled, threshold, max_skip = struct.unpack_from(
+            ENDIAN_FORMAT + UINT32 + FLOAT32 + UINT32,
+            data,
+            offset
+        )
+
+        return ( 
+            SimilarImageFilterConfig(
+            enabled=bool(enabled),
+            threshold=threshold,    
+            max_skip=max_skip
+            ), offset + 12, 
+        )
+
+    def parse_canny_config(self, data : bytes, offset: int):
+        SIZE = 28
+        if offset + SIZE > len(data):
+            raise ValueError("Insufficient data for data of CannyConfig")
+        
+        enabled, scale, resolution, low_threshold, high_threshold, aperture_size, l2_gradient = struct.unpack_from(
+            ENDIAN_FORMAT + UINT32 + FLOAT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32,
+            data,
+            offset
+        )
+
+        return ( 
+            CannyConfig(
+            enabled=bool(enabled),
+            scale=scale,
+            resolution=resolution,
+            low_threshold=low_threshold,
+            high_threshold=high_threshold,
+            aperture_size=aperture_size,
+            l2_gradient=l2_gradient
+            ), offset + 28, 
+        )
+
+    def parse_depth_config(self, data : bytes, offset: int):
+        SIZE = 44
+        if offset + SIZE > len(data):
+            raise ValueError("Insufficient data for data of DepthConfig")
+        
+        enabled, scale, method, model_size, resolution, blur_kernel, contrast, brightness, near_threshold, far_threshold, invert = struct.unpack_from(
+            ENDIAN_FORMAT + UINT32 + FLOAT32 + UINT32 + UINT32 + UINT32 + UINT32 + FLOAT32 + UINT32  + UINT32 + UINT32 + UINT32,
+            data,
+            offset
+        )
+
+        return (
+            DepthConfig(
+            enabled=bool(enabled),
+            scale=scale,
+            method=read_string(method, offset),
+            model_size=read_string(model_size, offset),
+            resolution=resolution,
+            blur_kernel=blur_kernel,
+            contrast=contrast,
+            brightness=brightness,
+            near_threshold=near_threshold,
+            far_threshold=far_threshold,
+            invert=bool(invert)
+            ), offset + 44, 
+        )
+
+    def parse_openpose_config(self, data : bytes, offset: int):
+        SIZE = 12
+        if offset + SIZE > len(data):
+            raise ValueError("Insufficient data for OpenPoseConfig")
+
+        enabled, scale, detect_resolution = struct.unpack_from(
+            ENDIAN_FORMAT + UINT32 + FLOAT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32,
+            data,
+            offset
+        )
+
+        return (
+            OpenPoseConfig(
+            enabled=bool(enabled),
+            scale=scale,
+            detect_resolution=detect_resolution
+            ), offset + 12,
+        )
 
 class UuidPacket(Packet):
     def __init__(self, uuid: str):

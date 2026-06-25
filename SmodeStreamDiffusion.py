@@ -10,7 +10,7 @@ Responsibilities:
 import os
 import sys
 
-from config.schema import StreamDiffusionConfig
+from config.schema import (ControlNetConfig, StreamDiffusionConfig, CannyConfig, OpenPoseConfig, DepthConfig)
 from engines.streamdiffusion.base_wrapper import BaseStreamDiffusionWrapper
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 if sys.platform.startswith('win'):
@@ -32,7 +32,6 @@ os.environ.setdefault(
 import socket
 import time
 import select
-import json
 from pathlib import Path
 from typing import Dict, Optional
 import torch
@@ -65,7 +64,6 @@ from ipc import (
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
 
 class App:
     def __init__(
@@ -103,6 +101,7 @@ class App:
             self.engine = None
             self.is_sdxl = False
 
+
             self.streamDiffusionToSmodeInterProcessEvent = InterProcessEvent()
             self.streamDiffusionToSmodeInterProcessEvent.create(
                 "Global\\StreamDiffusionToSmode-" + config.uuid,
@@ -113,12 +112,6 @@ class App:
             self.smodeToStreamDiffusionInterProcessEvent.open(
                 "Global\\SmodeToStreamDiffusion-" + config.uuid
             )
-
-            self.canny_config = None
-            self.depth_config = None
-            self.openpose_config = None
-            self.similar_image_filter_config = None
-
         except Exception as e:
             logging.error(f"Failed to initialize App: {e}")
             if self.socket:
@@ -146,18 +139,13 @@ class App:
 
         self.low_latency = LowLatencyController()
 
-        self.last_config_check = 0
-
-        # Config file can be written by a Smode controller script in parallel
-        # with the main loop reading it; serialize access.
-        import threading
-        self.config_lock = threading.Lock()
-
-        self.controlnet_skip_frames = self.controlnet_config.get('controlnet_skip_frames', 1)
+        self.controlnet_config = ControlNetConfig(
+                    canny=CannyConfig(),
+                    depth=DepthConfig(),
+                    openpose=OpenPoseConfig(),
+                )
+        self.controlnet_skip_frames = self.controlnet_config.controlnet_skip_frames
         self.current_delta = self.controlnet_config.get('delta', 1.0)
-        self.config_check_interval = 2.0
-        self.frames_processed = 0
-        self.config_check_frame_interval = 60
 
         # torch.compile warmup runs once at startup, not on every prepare() call.
         self.warmup_completed = False
@@ -402,26 +390,27 @@ class App:
                 del dummy_input
                 torch.cuda.empty_cache()
 
-    def _cache_config_values(self, config: dict):
-        """Cache frequently accessed config values to avoid dict lookups in the hot path."""
-        self._cached_canny_scale = config.enabled
-        self._cached_depth_scale = config.get('depth_scale', 0.5)
-        self._cached_openpose_scale = config.get('openpose_scale', 0.8)
+    def _cache_config_values(self, config: ControlNetConfig):
+        self._cached_canny_scale = config.canny.scale
+        self._cached_depth_scale = config.depth.scale
+        self._cached_openpose_scale = config.openpose.scale
 
-        self._cached_profiling_enabled = config.get('profiling_enabled', False)
+        self._cached_profiling_enabled = config.profiling_enabled
+        self._cached_preview_mode = config.preview_mode
 
-        self._cached_preview_mode = config.get('preview_mode', 'normal')
+        self._cached_controlnet_enabled = config.controlnet_enabled
+        self._cached_canny_enabled = config.canny.enabled
+        self._cached_depth_enabled = config.depth.enabled
+        self._cached_openpose_enabled = config.openpose.enabled
 
-        self._cached_controlnet_enabled = config.get('controlnet_enabled', False)
-        self._cached_canny_enabled = config.get('canny_enabled', False)
-        self._cached_depth_enabled = config.get('depth_enabled', False)
-        self._cached_openpose_enabled = config.get('openpose_enabled', False)
+        self._cached_controlnet_skip_frames = config.controlnet_skip_frames
+        self._cached_controlnet_guidance_strength = config.controlnet_guidance_strength
 
-        self._cached_controlnet_skip_frames = config.get('controlnet_skip_frames', 1)
+        self._cached_openpose_detect_resolution = (
+            config.openpose.detect_resolution
+        )
 
-        self._cached_controlnet_guidance_strength = config.get('controlnet_guidance_strength', 1.0)
-
-        self._cached_openpose_detect_resolution = config.get('openpose_detect_resolution', 512)
+        self.controlnet_manager.update_active_list()
 
         # Pre-build ControlNet active list (avoid list construction in hot path).
         self.controlnet_manager.update_active_list()
@@ -453,7 +442,7 @@ class App:
         """Process incoming CONFIG / STOP messages. Returns True on STOP."""
         for cmd, payload in messages.items():
             if cmd == CommandType.CONFIG:
-                config_packet = _parse_config_with_cache(payload)
+                config_packet = payload
                 logging.info(f"Received CONFIG command: {vars(config_packet)}")
 
                 def update_parameters(app: App, config_packet: ConfigPacket):
@@ -470,18 +459,13 @@ class App:
                     app.lora_dict = config_packet.lora_dict
                     app.acceleration = config_packet.acceleration
                     app.cache_dir = config_packet.cache_dir
-                    app.canny_config = config_packet.canny_config
-                    app.depth_config = config_packet.depth_config
-                    app.openpose_config = config_packet.openpose_config
-                    app.similar_image_filter_config = config_packet.similar_image_filter_config
-                    app.controlnet_ipc_config = config_packet.controlnet_ipc_config
+                    app.similar_image_filter_enabled = config_packet.similar_image_filter_enabled
+                    app.similar_image_filter_threshold = config_packet.similar_image_filter_threshold
+                    app.similar_image_filter_max_skip = config_packet.similar_image_filter_max_skip
+                    app.controlnet_config = config_packet.controlnet_config
 
                 if not self.stream:
                     update_parameters(self, config_packet)
-                    if config_packet.controlnet_config is not None:
-                        app.apply_controlnet_config(
-                            config_packet.controlnet_config
-                        )
                     self._create_stream()
                 else:
                     model_has_changed = self.model_name != config_packet.model_name
@@ -501,10 +485,6 @@ class App:
                     update_t_index_list = self.t_index_list != config_packet.t_index_list
                     previous_acceleration = self.acceleration
                     update_parameters(self, config_packet)
-                    if config_packet.controlnet_config is not None:
-                        app.apply_controlnet_config(
-                            config_packet.controlnet_config
-                        )
 
                     if model_has_changed or lora_dict_has_changed:
                         self._create_stream()
@@ -586,8 +566,8 @@ class App:
                                 )
                             else:
                                 from pipeline.attention_processors import enable_cached_attention
-                                maxframes = self.controlnet_config.get('streamv2v_cache_maxframes', 1)
-                                interval = self.controlnet_config.get('streamv2v_cache_interval', 1)
+                                maxframes = self.controlnet_config.streamv2v_cache_maxframes
+                                interval = self.controlnet_config.streamv2v_cache_interval
                                 count = enable_cached_attention(
                                     self.stream.stream.unet,
                                     cache_maxframes=maxframes,
@@ -687,194 +667,6 @@ class App:
                 return True
             else:
                 logging.warning(f"Received unexpected command: {cmd}")
-        return False
-
-    def apply_controlnet_config(self, config: StreamDiffusionConfig):
-        """Apply the given controlnet configuration."""
-        self.controlnet_config = config
-        self.controlnet_manager.load_models()
-        self.controlnet_manager.update_active_list()
-
-        if self.preprocessor_orchestrator:
-            self.preprocessor_orchestrator.update_models(self.controlnet_config)
-
-        if self.engine:
-            self.engine.update_params(self.controlnet_config)
-
-    def _maybe_reload_config(self, timings: dict) -> bool:
-        """Periodically reload controlnet_config.json and apply changes live.
-
-        Returns True if the stream was recreated and frame processing should be skipped.
-        """
-        self.frames_processed += 1
-        if not (self.frames_processed % self.config_check_frame_interval == 0 and
-                time.time() - self.last_config_check > self.config_check_interval):
-            return False
-
-        with self.config_lock:
-            if new_config != self.controlnet_config:
-                logging.info("ControlNet configuration updated")
-
-                old_skip = self.controlnet_skip_frames
-                self.controlnet_skip_frames = new_config.get('controlnet_skip_frames', 1)
-                if old_skip != self.controlnet_skip_frames:
-                    logging.info(f"ControlNet frame skipping updated: {old_skip} -> {self.controlnet_skip_frames}")
-
-                if hasattr(self.stream, 'stream'):
-                    ssf_enabled = new_config.get('similar_image_filter_enabled', True)
-                    ssf_threshold = new_config.get('similar_image_filter_threshold', 0.95)
-                    ssf_max_skip = new_config.get('similar_image_filter_max_skip', 10)
-
-                    if ssf_enabled:
-                        self.stream.stream.enable_similar_image_filter(ssf_threshold, ssf_max_skip)
-                        logging.info(f"Similar Image Filter updated: threshold={ssf_threshold}, max_skip={ssf_max_skip}")
-                    else:
-                        self.stream.stream.disable_similar_image_filter()
-                        logging.info("Similar Image Filter disabled")
-                    _inner = self.stream.stream
-                    self._ssf_enabled_cached = (
-                        getattr(_inner, "similar_image_filter", False)
-                        and getattr(_inner, "similar_filter", None) is not None
-                    )
-
-                old_delta = getattr(self, 'current_delta', 1.0)
-                new_delta = new_config.get('delta', 1.0)
-                if old_delta != new_delta and hasattr(self.stream, 'stream'):
-                    self.current_delta = new_delta
-                    logging.info(f"Delta updated: {old_delta:.2f} -> {new_delta:.2f}")
-
-                    try:
-                        self.stream.stream.prepare(
-                            self.current_prompt,
-                            self.negative_prompt,
-                            num_inference_steps=self.num_inference_steps,
-                            guidance_scale=self.guidance_scale,
-                            delta=new_delta,
-                            seed=self.seed,
-                        )
-                        logging.info("Delta applied immediately")
-                    except Exception as e:
-                        logging.warning(f"Could not apply delta immediately: {e}")
-
-                # Capture old FaceID values BEFORE overwriting controlnet_config
-                # so later blocks can detect changes correctly.
-                _old_faceid_scale = self.controlnet_config.get('faceid_scale', 0.6)
-                _old_faceid_enabled = self.controlnet_config.get('faceid_enabled', False)
-                _old_faceid_plus_v2 = self.controlnet_config.get('faceid_plus_v2', False)
-
-                self.controlnet_config = new_config
-                self.controlnet_manager.load_models()
-                # Re-sync after load_models so newly enabled CNs take effect this cycle.
-                self.controlnet_manager.update_active_list()
-
-                self.low_latency.apply(
-                    new_config.get("low_latency_mode", False)
-                )
-
-                if self.engine is not None:
-                    try:
-                        self.engine.update_params(new_config)
-                    except Exception as e:
-                        logging.warning(f"[Engine] update_params failed: {e}")
-
-                if self.preprocessor_orchestrator is not None:
-                    self.preprocessor_orchestrator.update_models(new_config)
-
-                if hasattr(self.stream, 'stream') and hasattr(self.stream.stream, 'enable_profiling'):
-                    profiling_enabled = new_config.get('profiling_enabled', False)
-                    self.stream.stream.enable_profiling = profiling_enabled
-                    logging.info(f"GPU profiling {'enabled' if profiling_enabled else 'disabled'}")
-
-                if hasattr(self.stream, 'stream'):
-                    old_strength = getattr(self.stream.stream, '_cached_controlnet_guidance_strength', 1.0)
-                    new_strength = new_config.get('controlnet_guidance_strength', 1.0)
-                    if abs(old_strength - new_strength) > 0.01:
-                        self.stream.stream._cached_controlnet_guidance_strength = new_strength
-                        self._cached_controlnet_guidance_strength = new_strength
-                        if hasattr(self.stream.stream, '_guidance_strength_logged'):
-                            delattr(self.stream.stream, '_guidance_strength_logged')
-                        logging.info(f"ControlNet guidance strength: {old_strength:.2f} -> {new_strength:.2f}")
-
-                if hasattr(self.stream, 'stream'):
-                    new_fb = new_config.get('latent_feedback_strength', 0.0)
-                    old_fb = getattr(self.stream.stream, 'latent_feedback_strength', 0.0)
-                    if abs(old_fb - new_fb) > 0.001:
-                        self.stream.stream.latent_feedback_strength = new_fb
-                        if new_fb == 0.0:
-                            self.stream.stream._prev_latent = None
-                        logging.info(f"Latent feedback strength: {old_fb:.3f} -> {new_fb:.3f}")
-
-                # FaceID live scale update.
-                if self.faceid_processor is not None:
-                    new_scale = new_config.get('faceid_scale', 0.6)
-                    if abs(new_scale - _old_faceid_scale) > 0.01:
-                        if self.stream is not None and hasattr(self.stream, 'set_faceid_scale'):
-                            success = self.stream.set_faceid_scale(new_scale)
-                            actual_scales = set()
-                            try:
-                                for proc in self.stream.stream.unet.attn_processors.values():
-                                    if hasattr(proc, 'scale'):
-                                        sc = proc.scale
-                                        if isinstance(sc, list):
-                                            sc = sc[0] if sc else None
-                                        if sc is not None:
-                                            actual_scales.add(round(float(sc), 3))
-                            except Exception:
-                                pass
-                            if success:
-                                logging.info(f"[FaceID] Scale: {_old_faceid_scale:.2f} -> "
-                                             f"{new_scale:.2f} (processors: {actual_scales})")
-                            else:
-                                logging.warning(f"[FaceID] Scale update failed (IP-Adapter not loaded)")
-
-                # FaceID plus_v2 toggle or enable change requires stream recreation.
-                new_v2 = new_config.get('faceid_plus_v2', False)
-                new_fid = new_config.get('faceid_enabled', False)
-                if (new_v2 != _old_faceid_plus_v2 and new_fid) or (new_fid != _old_faceid_enabled):
-                    logging.info(f"[FaceID] Config change requires stream reload "
-                                 f"(enabled: {_old_faceid_enabled}->{new_fid}, v2: {_old_faceid_plus_v2}->{new_v2})")
-                    self._cache_config_values(new_config)
-                    self._create_stream()
-                    return True
-
-                if hasattr(self.stream, 'stream'):
-                    new_man = new_config.get('motion_aware_noise', False)
-                    old_man = getattr(self.stream.stream, 'motion_aware_noise', False)
-                    if new_man != old_man:
-                        self.stream.stream.motion_aware_noise = new_man
-                        if not new_man:
-                            self.stream.stream._prev_input_latent = None
-                            self.stream.stream._motion_noise_scale = 1.0
-                        logging.info(f"Motion-aware noise {'enabled' if new_man else 'disabled'}")
-                    new_sens = new_config.get('motion_aware_noise_sensitivity', 0.5)
-                    old_sens = getattr(self.stream.stream, 'motion_aware_noise_sensitivity', 0.5)
-                    if abs(old_sens - new_sens) > 0.01:
-                        self.stream.stream.motion_aware_noise_sensitivity = new_sens
-                        logging.info(f"Motion-aware noise sensitivity: {old_sens:.2f} -> {new_sens:.2f}")
-
-                # StreamV2V toggle (PyTorch UNet only; TRT engine kvo cache is baked-in).
-                if hasattr(self.stream, 'stream'):
-                    new_v2v = new_config.get('streamv2v_enabled', False)
-                    old_v2v = getattr(self, '_streamv2v_active', False)
-                    if new_v2v != old_v2v:
-                        if getattr(self.stream.stream.unet, '_is_v2v', False) or \
-                           not hasattr(self.stream.stream.unet, 'attn_processors'):
-                            logging.warning(
-                                "[StreamV2V] TRT engine: runtime toggle not supported "
-                                "(kvo cache is engine I/O). Change config and restart."
-                            )
-                        else:
-                            from pipeline.attention_processors import StreamV2VAttnProcessor2_0
-                            for proc in self.stream.stream.unet.attn_processors.values():
-                                if isinstance(proc, StreamV2VAttnProcessor2_0):
-                                    proc._cache_enabled = new_v2v
-                            if not new_v2v:
-                                from pipeline.attention_processors import reset_attention_cache
-                                reset_attention_cache(self.stream.stream.unet)
-                            logging.info(f"[StreamV2V] {'Enabled' if new_v2v else 'Disabled'}")
-                            self._streamv2v_active = new_v2v
-
-        self.last_config_check = time.time()
         return False
 
     def _process_frame(self, timings: dict) -> None:
@@ -1039,7 +831,7 @@ class App:
         logging.info("Entering main command loop")
 
         self.low_latency.apply(
-            self.controlnet_config.get("low_latency_mode", False)
+            self.controlnet_config.low_latency_mode
         )
 
         last_frame_wall_time = 0.0
@@ -1075,9 +867,6 @@ class App:
 
                     if self.output_tensors is None:
                         self._create_tensors(3, self.width, self.height)
-
-                    if self._maybe_reload_config(timings):
-                        continue
 
                     profiling_enabled = self._cached_profiling_enabled
 
@@ -1227,22 +1016,21 @@ if __name__ == "__main__":
         description="Smode Bridge Client Application"
     )
     parser.add_argument(
-        "--port", type=int, required=True, help="Port number"
+        "--port", type=int, default=4190, help="Port number"
     )
     parser.add_argument(
-        "--uuid", type=str, required=True, help="Smode modifier UUID"
+        "--uuid", type=str, default="9598a3b7-c13c-4ae3-9b64-2ed55275f03b", help="Smode modifier UUID"
     )
     parser.add_argument(
-        "--width", type=int, required=True, help="Width of the image"
+        "--width", type=int, default=512, help="Width of the image"
     )
     parser.add_argument(
-        "--height", type=int, required=True, help="Height of the image"
+        "--height", type=int, default=512, help="Height of the image")
+    parser.add_argument(
+        "--device", type=int, default=0, help="The CUDA device index to use"
     )
     parser.add_argument(
-        "--device", type=int, required=True, help="The cuda device index to use"
-    )
-    parser.add_argument(
-        "--model", type=str, required=True, help="Model name to use"
+        "--model", type=str, default="stabilityai/sd-turbo", help="Model name to use"
     )
 
     args = parser.parse_args()

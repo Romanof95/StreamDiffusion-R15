@@ -81,22 +81,22 @@ _CONFIG_CACHE: "OrderedDict[str, ConfigPacket]" = OrderedDict()
 _CONFIG_CACHE_MAX_SIZE = 28
 
 
-def _parse_config_with_cache(data: bytes):
-    """Parse a config packet with LRU caching keyed on payload hash."""
-    data_hash = hashlib.md5(data).hexdigest()
+# def _parse_config_with_cache(data: bytes):
+#     """Parse a config packet with LRU caching keyed on payload hash."""
+#     data_hash = hashlib.md5(data).hexdigest()
 
-    if data_hash in _CONFIG_CACHE:
-        _CONFIG_CACHE.move_to_end(data_hash)
-        return _CONFIG_CACHE[data_hash]
+#     if data_hash in _CONFIG_CACHE:
+#         _CONFIG_CACHE.move_to_end(data_hash)
+#         return _CONFIG_CACHE[data_hash]
 
-    config_packet = ConfigPacket()
-    config_packet.from_bytes(data)
+#     config_packet = ConfigPacket()
+#     config_packet.from_bytes(data)
 
-    if len(_CONFIG_CACHE) >= _CONFIG_CACHE_MAX_SIZE:
-        _CONFIG_CACHE.popitem(last=False)
+#     if len(_CONFIG_CACHE) >= _CONFIG_CACHE_MAX_SIZE:
+#         _CONFIG_CACHE.popitem(last=False)
 
-    _CONFIG_CACHE[data_hash] = config_packet
-    return config_packet
+#     _CONFIG_CACHE[data_hash] = config_packet
+#     return config_packet
 
 
 class ConfigPacket(Packet):

@@ -10,81 +10,41 @@ from typing import Optional, Tuple
 from .schema import StreamDiffusionConfig
 
 
-class ConfigManager:
-    """Thread-safe configuration manager with hot-reload support."""
+import threading
+from copy import deepcopy
+from typing import Optional
 
-    def __init__(self, config_path: str, device: torch.device, dtype: torch.dtype):
-        self._path = Path(config_path)
+import torch
+
+from .schema import ControlNetConfig
+
+class ConfigManager:
+    """Thread-safe ControlNet configuration manager."""
+
+    def __init__(self, config: ControlNetConfig, device: torch.device, dtype: torch.dtype,
+    ):
+        self._config = config
         self._device = device
         self._dtype = dtype
         self._lock = threading.Lock()
-        self._config: Optional[StreamDiffusionConfig] = None
-        self._raw_dict: Optional[dict] = None
-        self._last_check_time: float = 0.0
-        self._last_modified: float = 0.0
         self._gaussian_kernel_cache: Optional[torch.Tensor] = None
         self._gaussian_kernel_size: int = 0
-        self.check_interval: float = 2.0
 
-        self._config = self._load()
         self._update_gaussian_kernel()
 
-    def _load(self) -> StreamDiffusionConfig:
-        """Load config from JSON file. Returns defaults if file is missing or invalid."""
-        try:
-            if self._path.exists():
-                with open(self._path, "r", encoding="utf-8") as f:
-                    self._raw_dict = json.load(f)
-                return StreamDiffusionConfig.from_dict(self._raw_dict)
-            else:
-                logging.warning(f"Config file not found: {self._path}, using defaults")
-                self._raw_dict = {}
-                return StreamDiffusionConfig()
-        except Exception as e:
-            logging.warning(f"Failed to load config: {e}")
-            if self._config is not None:
-                return self._config
-            self._raw_dict = {}
-            return StreamDiffusionConfig()
-
-    def get(self) -> StreamDiffusionConfig:
-        """Get current typed config (thread-safe, no I/O)."""
-        return self._config
-
-    def get_raw_dict(self) -> Optional[dict]:
-        """Get the raw dictionary from the last JSON load."""
-        return self._raw_dict
-
-    def reload(self) -> Tuple[bool, StreamDiffusionConfig]:
-        """Force reload config from file. Returns (changed, config)."""
+    def get(self) -> ControlNetConfig:
+        """Get the current configuration."""
         with self._lock:
-            old_config = self._config
-            self._config = self._load()
-            self._last_check_time = time.time()
+            return self._config
 
-            changed = self._has_changed(old_config, self._config)
-            if changed:
-                self._update_gaussian_kernel()
-                logging.info("Config reloaded (changes detected)")
+    def update(self, config: ControlNetConfig) -> bool:
+        """Update the configuration True if the configuration changed."""
+        with self._lock:
+            if config == self._config:
+                return False
 
-            return changed, self._config
-
-    def reload_if_due(self) -> Tuple[bool, StreamDiffusionConfig]:
-        """Reload config if check_interval has elapsed since last check."""
-        now = time.time()
-        if now - self._last_check_time < self.check_interval:
-            return False, self._config
-
-        return self.reload()
-
-    def _has_changed(self, old: StreamDiffusionConfig, new: StreamDiffusionConfig) -> bool:
-        if old is None:
-            return True
-        try:
-            old_dict = old.to_dict()
-            new_dict = new.to_dict()
-            return old_dict != new_dict
-        except Exception:
+            self._config = config
+            self._update_gaussian_kernel()
             return True
 
     def _update_gaussian_kernel(self):

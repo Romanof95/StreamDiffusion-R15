@@ -10,7 +10,7 @@ Responsibilities:
 import os
 import sys
 
-from config.schema import (ControlNetConfig, StreamDiffusionConfig, CannyConfig, OpenPoseConfig, DepthConfig)
+from config.schema import (ControlNetConfig, CannyConfig, OpenPoseConfig, DepthConfig)
 from engines.streamdiffusion.base_wrapper import BaseStreamDiffusionWrapper
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 if sys.platform.startswith('win'):
@@ -145,7 +145,7 @@ class App:
                     openpose=OpenPoseConfig(),
                 )
         self.controlnet_skip_frames = self.controlnet_config.controlnet_skip_frames
-        self.current_delta = self.controlnet_config.get('delta', 1.0)
+        self.current_delta = 1.0
 
         # torch.compile warmup runs once at startup, not on every prepare() call.
         self.warmup_completed = False
@@ -442,7 +442,7 @@ class App:
         """Process incoming CONFIG / STOP messages. Returns True on STOP."""
         for cmd, payload in messages.items():
             if cmd == CommandType.CONFIG:
-                config_packet = payload
+                config_packet = _parse_config_with_cache(payload)    
                 logging.info(f"Received CONFIG command: {vars(config_packet)}")
 
                 def update_parameters(app: App, config_packet: ConfigPacket):
@@ -459,13 +459,12 @@ class App:
                     app.lora_dict = config_packet.lora_dict
                     app.acceleration = config_packet.acceleration
                     app.cache_dir = config_packet.cache_dir
-                    app.similar_image_filter_enabled = config_packet.similar_image_filter_enabled
-                    app.similar_image_filter_threshold = config_packet.similar_image_filter_threshold
-                    app.similar_image_filter_max_skip = config_packet.similar_image_filter_max_skip
-                    app.controlnet_config = config_packet.controlnet_config
+                    app.similar_image_filter = config_packet.similar_image_filter_config
+                    app.controlnet_config = config_packet.controlnet_configig
 
                 if not self.stream:
                     update_parameters(self, config_packet)
+                    self.controlnet_manager.update_config(self.controlnet_config)
                     self._create_stream()
                 else:
                     model_has_changed = self.model_name != config_packet.model_name
@@ -521,14 +520,13 @@ class App:
                             self.stream.stream.denoising_steps_num = new_len
 
                 if self.stream and hasattr(self.stream, 'stream'):
-                    delta = self.controlnet_config.get('delta', 1.0)
 
                     self.stream.stream.prepare(
                         self.current_prompt,
                         self.negative_prompt,
                         num_inference_steps=self.num_inference_steps,
                         guidance_scale=config_packet.guidance_scale,
-                        delta=delta,
+                        delta=self.current_delta,
                         seed=self.seed,
                     )
 

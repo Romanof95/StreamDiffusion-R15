@@ -1,4 +1,5 @@
 """Wire packets for the Smode <-> Python IPC protocol."""
+
 from __future__ import annotations
 
 import hashlib
@@ -20,7 +21,14 @@ from .protocol import (
 )
 from .socket_helpers import read_string
 
-from config.schema import CannyConfig, DepthConfig, OpenPoseConfig, SimilarImageFilterConfig
+from config.schema import (
+    ControlNetConfig,
+    CannyConfig,
+    DepthConfig,
+    OpenPoseConfig,
+    SimilarImageFilterConfig,
+)
+
 
 class Packet:
     def __init__(self, cmd: CommandType, payload: bytes):
@@ -28,15 +36,11 @@ class Packet:
         self.payload = payload
 
     def to_bytes(self) -> bytes:
-        payload_bytes = struct.pack(
-            ENDIAN_FORMAT + UINT32, self.cmd.value
-        ) + self.payload
-        size = len(payload_bytes)
-        header = struct.pack(
-            ENDIAN_FORMAT + UINT32 + UINT32,
-            MAGIC_NUMBER,
-            size
+        payload_bytes = (
+            struct.pack(ENDIAN_FORMAT + UINT32, self.cmd.value) + self.payload
         )
+        size = len(payload_bytes)
+        header = struct.pack(ENDIAN_FORMAT + UINT32 + UINT32, MAGIC_NUMBER, size)
         return header + payload_bytes
 
 
@@ -55,17 +59,9 @@ class FrameDataPacket(Packet):
     ):
         payload = struct.pack(ENDIAN_FORMAT + UINT64, device)
         payload += struct.pack(ENDIAN_FORMAT + UINT32, len(handle)) + handle
-        payload += (
-            struct.pack(ENDIAN_FORMAT + UINT32, len(event_handle))
-            + event_handle
-        )
+        payload += struct.pack(ENDIAN_FORMAT + UINT32, len(event_handle)) + event_handle
         payload += struct.pack(
-            ENDIAN_FORMAT
-            + UINT32
-            + UINT32
-            + UINT32
-            + UINT32
-            + UINT32,
+            ENDIAN_FORMAT + UINT32 + UINT32 + UINT32 + UINT32 + UINT32,
             storage_size_bytes,
             storage_offset_bytes,
             channels,
@@ -81,22 +77,22 @@ _CONFIG_CACHE: "OrderedDict[str, ConfigPacket]" = OrderedDict()
 _CONFIG_CACHE_MAX_SIZE = 28
 
 
-# def _parse_config_with_cache(data: bytes):
-#     """Parse a config packet with LRU caching keyed on payload hash."""
-#     data_hash = hashlib.md5(data).hexdigest()
+def _parse_config_with_cache(data: bytes):
+    """Parse a config packet with LRU caching keyed on payload hash."""
+    data_hash = hashlib.md5(data).hexdigest()
 
-#     if data_hash in _CONFIG_CACHE:
-#         _CONFIG_CACHE.move_to_end(data_hash)
-#         return _CONFIG_CACHE[data_hash]
+    if data_hash in _CONFIG_CACHE:
+        _CONFIG_CACHE.move_to_end(data_hash)
+        return _CONFIG_CACHE[data_hash]
 
-#     config_packet = ConfigPacket()
-#     config_packet.from_bytes(data)
+    config_packet = ConfigPacket()
+    config_packet.from_bytes(data)
 
-#     if len(_CONFIG_CACHE) >= _CONFIG_CACHE_MAX_SIZE:
-#         _CONFIG_CACHE.popitem(last=False)
+    if len(_CONFIG_CACHE) >= _CONFIG_CACHE_MAX_SIZE:
+        _CONFIG_CACHE.popitem(last=False)
 
-#     _CONFIG_CACHE[data_hash] = config_packet
-#     return config_packet
+    _CONFIG_CACHE[data_hash] = config_packet
+    return config_packet
 
 
 class ConfigPacket(Packet):
@@ -117,11 +113,11 @@ class ConfigPacket(Packet):
         self.cfg_type = "none"
         self.acceleration = Acceleration.NONE
         self.lora_dict: Optional[Dict[str, float]] = None
-        self.controlnet_ipc_config: Optional[bytes] = None
+        self.similar_image_filter_config: Optional[SimilarImageFilterConfig] = None
+        self.controlnet_config: Optional[ControlNetConfig] = None
         self.canny_config: Optional[CannyConfig] = None
         self.depth_config: Optional[DepthConfig] = None
         self.openpose_config: Optional[OpenPoseConfig] = None
-        self.similar_image_filter_config: Optional[SimilarImageFilterConfig] = None
 
     def from_bytes(self, data: bytes):
         offset = 0
@@ -135,28 +131,20 @@ class ConfigPacket(Packet):
         self.negative_prompt, offset = read_string(data, offset)
 
         if offset + 16 > len(data):
-            raise ValueError(
-                "Insufficient data for seed, width, and height in CONFIG"
-            )
-        self.seed, = struct.unpack_from(ENDIAN_FORMAT + UINT64, data, offset)
+            raise ValueError("Insufficient data for seed, width, and height in CONFIG")
+        (self.seed,) = struct.unpack_from(ENDIAN_FORMAT + UINT64, data, offset)
         offset += 8
         t_index_list_len = 0
         (
             self.width,
             self.height,
             t_index_list_len,
-        ) = struct.unpack_from(
-            ENDIAN_FORMAT + UINT32 + UINT32 + UINT32, data, offset
-        )
+        ) = struct.unpack_from(ENDIAN_FORMAT + UINT32 + UINT32 + UINT32, data, offset)
         offset += 12
         for _ in range(t_index_list_len):
             if offset + 4 > len(data):
-                raise ValueError(
-                    "Insufficient data for t_index_list in CONFIG"
-                )
-            t_index_value, = struct.unpack_from(
-                ENDIAN_FORMAT + UINT32, data, offset
-            )
+                raise ValueError("Insufficient data for t_index_list in CONFIG")
+            (t_index_value,) = struct.unpack_from(ENDIAN_FORMAT + UINT32, data, offset)
             self.t_index_list.append(t_index_value)
             offset += 4
         (
@@ -170,7 +158,7 @@ class ConfigPacket(Packet):
         self.cfg_type = config_type_to_str(ConfigType(cfg_type))
         offset += 16
         if offset + 4 <= len(data):
-            lora_dict_len, = struct.unpack_from(ENDIAN_FORMAT + UINT32, data, offset)
+            (lora_dict_len,) = struct.unpack_from(ENDIAN_FORMAT + UINT32, data, offset)
             offset += 4
             self.lora_dict = {}
             for _ in range(lora_dict_len):
@@ -179,147 +167,192 @@ class ConfigPacket(Packet):
                 key, offset = read_string(data, offset)
                 if offset + 4 > len(data):
                     raise ValueError("Insufficient data for lora_dict value")
-                value, = struct.unpack_from(ENDIAN_FORMAT + FLOAT32, data, offset)
+                (value,) = struct.unpack_from(ENDIAN_FORMAT + FLOAT32, data, offset)
                 self.lora_dict[key] = value
                 offset += 4
         else:
             self.lora_dict = None
 
         if offset < len(data):
-            self.similar_image_filter_config, offset = (
-                self.parse_similar_image_filter(data, offset)
+            self.similar_image_filter_config, offset = self.parse_similar_image_filter(
+                data, offset
             )
 
         if offset < len(data):
-            self.controlnet_ipc_config, offset = (
-                self.parse_controlnet_ipc_config(data, offset)
+            self.controlnet_ipc_config, offset = self.parse_controlnet_ipc_config(
+                data, offset
             )
 
         if offset < len(data):
-            self.canny_config, offset = (
-                self.parse_canny_config(data, offset)
-            )
+            self.canny_config, offset = self.parse_canny_config(data, offset)
 
         if offset < len(data):
-            self.depth_config, offset = (
-                self.parse_depth_config(data, offset)
-            )
+            self.depth_config, offset = self.parse_depth_config(data, offset)
 
         if offset < len(data):
-            self.openpose_config, offset = (
-                self.parse_openpose_config(data, offset)
-            )
+            self.openpose_config, offset = self.parse_openpose_config(data, offset)
 
         return self
-    
-    def parse_controlnet_ipc_config(self, data : bytes, offset: int):
-        if offset + 4 > len(data):
-            raise ValueError("Insufficient data for controlnet_ipc_config length")
-        
-        controlnet_ipc_config_len, = struct.unpack_from(ENDIAN_FORMAT + UINT32, data, offset)
-        offset += 4
-        
-        if offset + controlnet_ipc_config_len > len(data):
-            raise ValueError("Insufficient data for controlnet_ipc_config payload")
-        
-        self.controlnet_ipc_config = data[offset:offset + controlnet_ipc_config_len]
-        offset += controlnet_ipc_config_len
-        
-        return self.controlnet_ipc_config, offset
-    
-    def parse_similar_image_filter(self, data : bytes, offset: int):
+
+    def parse_similar_image_filter(self, data: bytes, offset: int):
         SIZE = 12
+
         if offset + SIZE > len(data):
             raise ValueError("Insufficient data for SimilarImageFilterConfig")
-        
+
         enabled, threshold, max_skip = struct.unpack_from(
             ENDIAN_FORMAT + UINT32 + FLOAT32 + UINT32,
             data,
-            offset
+            offset,
         )
 
-        return ( 
+        return (
             SimilarImageFilterConfig(
-            enabled=bool(enabled),
-            threshold=threshold,    
-            max_skip=max_skip
-            ), offset + 12, 
+                enabled=bool(enabled),
+                threshold=threshold,
+                max_skip=max_skip,
+            ),
+            offset + SIZE,
         )
 
-    def parse_canny_config(self, data : bytes, offset: int):
+    def parse_controlnet_ipc_config(self, data: bytes, offset: int):
+        if offset + 4 > len(data):
+            raise ValueError("Insufficient data for controlnet_ipc_config length")
+
+        (payload_len,) = struct.unpack_from(
+            ENDIAN_FORMAT + UINT32,
+            data,
+            offset,
+        )
+        offset += 4
+
+        if offset + payload_len > len(data):
+            raise ValueError("Insufficient data for controlnet_ipc_config payload")
+
+        payload = data[offset : offset + payload_len]
+        offset += payload_len
+
+        return payload, offset
+
+    def parse_canny_config(self, data: bytes, offset: int):
         SIZE = 28
+
         if offset + SIZE > len(data):
-            raise ValueError("Insufficient data for data of CannyConfig")
-        
-        enabled, scale, resolution, low_threshold, high_threshold, aperture_size, l2_gradient = struct.unpack_from(
-            ENDIAN_FORMAT + UINT32 + FLOAT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32,
+            raise ValueError("Insufficient data for CannyConfig")
+
+        (
+            enabled,
+            scale,
+            resolution,
+            low_threshold,
+            high_threshold,
+            aperture_size,
+            l2_gradient,
+        ) = struct.unpack_from(
+            ENDIAN_FORMAT
+            + UINT32
+            + FLOAT32
+            + UINT32
+            + UINT32
+            + UINT32
+            + UINT32
+            + UINT32,
             data,
-            offset
+            offset,
         )
 
-        return ( 
+        return (
             CannyConfig(
-            enabled=bool(enabled),
-            scale=scale,
-            resolution=resolution,
-            low_threshold=low_threshold,
-            high_threshold=high_threshold,
-            aperture_size=aperture_size,
-            l2_gradient=l2_gradient
-            ), offset + 28, 
+                enabled=bool(enabled),
+                scale=scale,
+                resolution=resolution,
+                low_threshold=low_threshold,
+                high_threshold=high_threshold,
+                aperture_size=aperture_size,
+                l2_gradient=bool(l2_gradient),
+            ),
+            offset + SIZE,
         )
 
-    def parse_depth_config(self, data : bytes, offset: int):
+    def parse_depth_config(self, data: bytes, offset: int):
         SIZE = 44
+
         if offset + SIZE > len(data):
-            raise ValueError("Insufficient data for data of DepthConfig")
-        
-        enabled, scale, method, model_size, resolution, blur_kernel, contrast, brightness, near_threshold, far_threshold, invert = struct.unpack_from(
-            ENDIAN_FORMAT + UINT32 + FLOAT32 + UINT32 + UINT32 + UINT32 + UINT32 + FLOAT32 + UINT32  + UINT32 + UINT32 + UINT32,
+            raise ValueError("Insufficient data for DepthConfig")
+        (
+            enabled,
+            scale,
+            method,
+            model_size,
+            resolution,
+            blur_kernel,
+            contrast,
+            brightness,
+            near_threshold,
+            far_threshold,
+            invert,
+        ) = struct.unpack_from(
+            ENDIAN_FORMAT
+            + UINT32
+            + FLOAT32
+            + UINT32
+            + UINT32
+            + UINT32
+            + UINT32
+            + FLOAT32
+            + UINT32
+            + UINT32
+            + UINT32
+            + UINT32,
             data,
-            offset
+            offset,
         )
 
         return (
             DepthConfig(
-            enabled=bool(enabled),
-            scale=scale,
-            method=read_string(method, offset),
-            model_size=read_string(model_size, offset),
-            resolution=resolution,
-            blur_kernel=blur_kernel,
-            contrast=contrast,
-            brightness=brightness,
-            near_threshold=near_threshold,
-            far_threshold=far_threshold,
-            invert=bool(invert)
-            ), offset + 44, 
+                enabled=bool(enabled),
+                scale=scale,
+                method=str(method),
+                model_size=str(model_size),
+                resolution=resolution,
+                blur_kernel=blur_kernel,
+                contrast=contrast,
+                brightness=brightness,
+                near_threshold=near_threshold,
+                far_threshold=far_threshold,
+                invert=bool(invert),
+            ),
+            offset + SIZE,
         )
 
-    def parse_openpose_config(self, data : bytes, offset: int):
+    def parse_openpose_config(self, data: bytes, offset: int):
         SIZE = 12
+
         if offset + SIZE > len(data):
             raise ValueError("Insufficient data for OpenPoseConfig")
-
-        enabled, scale, detect_resolution = struct.unpack_from(
-            ENDIAN_FORMAT + UINT32 + FLOAT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32 + UINT32,
+        (
+            enabled,
+            scale,
+            detect_resolution,
+        ) = struct.unpack_from(
+            ENDIAN_FORMAT + UINT32 + FLOAT32 + UINT32,
             data,
-            offset
+            offset,
         )
 
         return (
             OpenPoseConfig(
-            enabled=bool(enabled),
-            scale=scale,
-            detect_resolution=detect_resolution
-            ), offset + 12,
+                enabled=bool(enabled),
+                scale=scale,
+                detect_resolution=detect_resolution,
+            ),
+            offset + SIZE,
         )
+
 
 class UuidPacket(Packet):
     def __init__(self, uuid: str):
-        payload = struct.pack(ENDIAN_FORMAT + UINT32, len(uuid)) + uuid.encode(
-            "utf-8"
-        )
+        payload = struct.pack(ENDIAN_FORMAT + UINT32, len(uuid)) + uuid.encode("utf-8")
         super().__init__(CommandType.UUID, payload)
 
 

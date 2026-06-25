@@ -99,3 +99,26 @@ class ControlNetConfig:
     # Low-latency mode (controlled GC + HIGH process priority)
     low_latency_mode: bool = False
 
+    def get(self, key, default=None):
+        if hasattr(self, key):
+            return getattr(self, key)
+
+        # Nested FaceID settings
+        if key.startswith("faceid_"):
+            return getattr(self.faceid, key.removeprefix("faceid_"), default)
+
+        # Nested StreamV2V settings
+        if key.startswith("streamv2v_"):
+            return getattr(self.streamv2v, key.removeprefix("streamv2v_"), default)
+
+        # Nested preprocessors
+        if key.startswith("canny_"):
+            return getattr(self.canny, key.removeprefix("canny_"), default)
+
+        if key.startswith("depth_"):
+            return getattr(self.depth, key.removeprefix("depth_"), default)
+
+        if key.startswith("openpose_"):
+            return getattr(self.openpose, key.removeprefix("openpose_"), default)
+
+        return default

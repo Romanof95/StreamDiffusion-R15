@@ -2,6 +2,13 @@
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
+@dataclass
+class CNConfig:
+    controlnet_enabled: bool = True
+    controlnet_guidance_strength: float = 0.58
+    controlnet_skip_frames: int = 1
+    preview_mode: str = "normal"
+
 
 @dataclass
 class CannyConfig:
@@ -65,15 +72,10 @@ class SimilarImageFilterConfig:
     threshold: float = 0.95
     max_skip: int = 5
 
-@dataclass(frozen=True) # immutable dataclass
+@dataclass
 class ControlNetConfig:
     """Top-level configuration for ControlNet"""
-
-    # Global ControlNet settings
-    controlnet_enabled: bool = True
-    controlnet_guidance_strength: float = 0.58
-    controlnet_skip_frames: int = 1
-    preview_mode: str = "normal"
+    controlnet: CNConfig = field(default_factory=CNConfig)
 
     # Individual ControlNet configs
     canny: CannyConfig = field(default_factory=CannyConfig)
@@ -102,6 +104,11 @@ class ControlNetConfig:
     def get(self, key, default=None):
         if hasattr(self, key):
             return getattr(self, key)
+        
+        # Nested controlnet settings
+        if key.startswith("faceid_"):
+            return getattr(self.controlnet, key.removeprefix("controlnet_"), default)
+
 
         # Nested FaceID settings
         if key.startswith("faceid_"):

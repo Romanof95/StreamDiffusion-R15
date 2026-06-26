@@ -23,6 +23,7 @@ from .socket_helpers import read_string
 
 from config.schema import (
     ControlNetConfig,
+    CNConfig,
     CannyConfig,
     DepthConfig,
     OpenPoseConfig,
@@ -114,11 +115,13 @@ class ConfigPacket(Packet):
         self.acceleration = Acceleration.NONE
         self.lora_dict: Optional[Dict[str, float]] = None
         self.similar_image_filter_config: Optional[SimilarImageFilterConfig] = None
-        self.controlnet_config: Optional[ControlNetConfig] = None
-        self.canny_config: Optional[CannyConfig] = None
-        self.depth_config: Optional[DepthConfig] = None
-        self.openpose_config: Optional[OpenPoseConfig] = None
-
+        self.controlnet_config = ControlNetConfig(
+            controlnet=CNConfig(),
+            canny=CannyConfig(),
+            depth=DepthConfig(),
+            openpose=OpenPoseConfig(),
+        )
+        
     def from_bytes(self, data: bytes):
         offset = 0
         self.t_index_list = []
@@ -179,18 +182,18 @@ class ConfigPacket(Packet):
             )
 
         if offset < len(data):
-            self.controlnet_ipc_config, offset = self.parse_controlnet_ipc_config(
+            self.controlnet_config.controlnet, offset = self.parse_controlnet_config(
                 data, offset
             )
 
         if offset < len(data):
-            self.canny_config, offset = self.parse_canny_config(data, offset)
+            self.controlnet_config.canny, offset = self.parse_canny_config(data, offset)
 
         if offset < len(data):
-            self.depth_config, offset = self.parse_depth_config(data, offset)
+            self.controlnet_config.depth, offset = self.parse_depth_config(data, offset)
 
         if offset < len(data):
-            self.openpose_config, offset = self.parse_openpose_config(data, offset)
+            self.controlnet_config.openpose, offset = self.parse_openpose_config(data, offset)
 
         return self
 
@@ -215,24 +218,34 @@ class ConfigPacket(Packet):
             offset + SIZE,
         )
 
-    def parse_controlnet_ipc_config(self, data: bytes, offset: int):
-        if offset + 4 > len(data):
-            raise ValueError("Insufficient data for controlnet_ipc_config length")
+    def parse_controlnet_config(self, data: bytes, offset: int):
+        SIZE = 16
 
-        (payload_len,) = struct.unpack_from(
-            ENDIAN_FORMAT + UINT32,
+        if offset + SIZE > len(data):
+            raise ValueError("Insufficient data for controlnet_config length")
+        (
+            enabled,
+            preview_mode,
+            guidance_strength,
+            skip_frames,
+        ) = struct.unpack_from(
+            ENDIAN_FORMAT +
+            UINT32 +
+            UINT32 +
+            FLOAT32 +
+            UINT32,
             data,
             offset,
         )
-        offset += 4
-
-        if offset + payload_len > len(data):
-            raise ValueError("Insufficient data for controlnet_ipc_config payload")
-
-        payload = data[offset : offset + payload_len]
-        offset += payload_len
-
-        return payload, offset
+        return (
+            CNConfig(
+                controlnet_enabled=bool(enabled),
+                preview_mode=preview_mode,
+                controlnet_guidance_strength=guidance_strength,
+                controlnet_skip_frames=skip_frames,
+            ),
+            offset + SIZE,
+        )
 
     def parse_canny_config(self, data: bytes, offset: int):
         SIZE = 28

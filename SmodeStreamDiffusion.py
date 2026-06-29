@@ -10,7 +10,7 @@ Responsibilities:
 import os
 import sys
 
-from config.schema import (ControlNetConfig, CNConfig, CannyConfig, OpenPoseConfig, DepthConfig)
+from config.schema import (ControlNetConfig, CNConfig, CannyConfig, OpenPoseConfig, DepthConfig, SimilarImageFilterConfig)
 from engines.streamdiffusion.base_wrapper import BaseStreamDiffusionWrapper
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 if sys.platform.startswith('win'):
@@ -139,6 +139,8 @@ class App:
 
         self.low_latency = LowLatencyController()
 
+        self.similar_image_filter = SimilarImageFilterConfig()
+
         self.controlnet_config = ControlNetConfig(
                     controlnet = CNConfig(),
                     canny=CannyConfig(),
@@ -146,7 +148,9 @@ class App:
                     openpose=OpenPoseConfig(),
                 )
         
-        self.controlnet_skip_frames = self.controlnet_config.controlnet.controlnet_skip_frames
+        self._cache_config_values(self.controlnet_config)
+        
+        self.controlnet_skip_frames = self.controlnet_config.controlnet.skip_frames
         self.current_delta = 1.0
 
         # torch.compile warmup runs once at startup, not on every prepare() call.
@@ -400,13 +404,13 @@ class App:
         self._cached_profiling_enabled = config.profiling_enabled
         self._cached_preview_mode = config.controlnet.preview_mode
 
-        self._cached_controlnet_enabled = config.controlnet.controlnet_enabled
+        self._cached_controlnet_enabled = config.controlnet.enabled
         self._cached_canny_enabled = config.canny.enabled
         self._cached_depth_enabled = config.depth.enabled
         self._cached_openpose_enabled = config.openpose.enabled
 
-        self._cached_controlnet_skip_frames = config.controlnet.controlnet_skip_frames
-        self._cached_controlnet_guidance_strength = config.controlnet.controlnet_guidance_strength
+        self._cached_controlnet_skip_frames = config.controlnet.skip_frames
+        self._cached_controlnet_guidance_strength = config.controlnet.guidance_strength
 
         self._cached_openpose_detect_resolution = (
             config.openpose.detect_resolution
@@ -423,7 +427,6 @@ class App:
         ready_to_read, _, in_error = select.select(
             [self.socket], [], [], 0
         )
-        logging.info(f"socket ready = {bool(ready_to_read)}")
         if ready_to_read:
             while True:
                 try:
@@ -446,7 +449,6 @@ class App:
         for cmd, payload in messages.items():
             if cmd == CommandType.CONFIG:
                 config_packet = _parse_config_with_cache(payload)    
-                logging.info(f"Received CONFIG command: {vars(config_packet)}")
 
                 def update_parameters(app: App, config_packet: ConfigPacket):
                     app.model_name = config_packet.model_name
@@ -467,6 +469,7 @@ class App:
 
                 if not self.stream:
                     update_parameters(self, config_packet)
+                    # self.apply_controlnet_config(config_packet.controlnet_config)
                     self._cache_config_values(self.controlnet_config)
                     self._create_stream()
                 else:

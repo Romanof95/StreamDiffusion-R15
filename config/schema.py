@@ -4,9 +4,9 @@ from typing import List, Optional
 
 @dataclass
 class CNConfig:
-    controlnet_enabled: bool = True
-    controlnet_guidance_strength: float = 0.58
-    controlnet_skip_frames: int = 1
+    enabled: bool = True
+    guidance_strength: float = 0.58
+    skip_frames: int = 1
     preview_mode: str = "normal"
 
 
@@ -106,9 +106,8 @@ class ControlNetConfig:
             return getattr(self, key)
         
         # Nested controlnet settings
-        if key.startswith("faceid_"):
+        if key.startswith("controlnet_"):
             return getattr(self.controlnet, key.removeprefix("controlnet_"), default)
-
 
         # Nested FaceID settings
         if key.startswith("faceid_"):

@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .base import BasePreprocessor
+from ipc import ConfigPacket
 
 
 class PreprocessorOrchestrator:
@@ -51,7 +52,7 @@ class PreprocessorOrchestrator:
             del self._cached_results[name]
         logging.info(f"[Orchestrator] Unregistered processor: {name}")
 
-    def update_models(self, config) -> None:
+    def update_models(self, config: ConfigPacket) -> None:
         """Load/unload processor models based on config."""
         if hasattr(config, 'canny'):
             processor_configs = {
@@ -67,6 +68,7 @@ class PreprocessorOrchestrator:
             }
 
         for name, (enabled, sub_config) in processor_configs.items():
+            processor = self._processors.get(name)
             if name not in self._processors:
                 continue
 
@@ -78,7 +80,7 @@ class PreprocessorOrchestrator:
             elif processor.is_loaded:
                 processor.unload_model()
                 if name in self._cached_results:
-                    del self._cached_results[name]
+                    self._cached_results.pop(name, None)
 
     def preprocess(self, image_tensor: torch.Tensor, config,
                    skip_frames: int = 1) -> Optional[Dict[str, torch.Tensor]]:
@@ -113,14 +115,18 @@ class PreprocessorOrchestrator:
             sub_configs = {'canny': config, 'depth': config, 'openpose': config}
 
         if sig != self._active_signature:
+            self._active_names_cache = []
             enabled_map = {
-                'canny': sig[0], 'depth': sig[1], 'openpose': sig[2],
+                'canny': config.canny.enabled,
+                'depth': config.depth.enabled,
+                'openpose': config.openpose.enabled,
             }
             self._active_names_cache = [
                 name for name, enabled in enabled_map.items()
                 if enabled and name in self._processors and self._processors[name].is_loaded
             ]
             self._active_signature = sig
+            self._cached_results.clear()
 
         active_names = self._active_names_cache
 

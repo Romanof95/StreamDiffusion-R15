@@ -253,10 +253,10 @@ class ConfigPacket(Packet):
         )
         return (
             CNConfig(
-                controlnet_enabled=bool(enabled),
+                enabled=bool(enabled),
                 preview_mode=PREVIEW_MODE_MAP.get(preview_mode, "normal"),
-                controlnet_guidance_strength=guidance_strength,
-                controlnet_skip_frames=skip_frames,
+                guidance_strength=guidance_strength,
+                skip_frames=skip_frames,
             ),
             offset + SIZE,
         )

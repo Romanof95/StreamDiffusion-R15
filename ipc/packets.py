@@ -11,6 +11,7 @@ from .protocol import (
     ENDIAN_FORMAT,
     MAGIC_NUMBER,
     UINT32,
+    INT32,
     UINT64,
     FLOAT32,
     CommandType,
@@ -29,6 +30,18 @@ from config.schema import (
     OpenPoseConfig,
     SimilarImageFilterConfig,
 )
+
+
+# Enum index -> string, mirroring the plugin C++ enums.
+PREVIEW_MODE_MAP = {
+    0: "normal",
+    1: "canny_preview",
+    2: "depth_preview",
+    3: "openpose_preview",
+    4: "mask_preview",
+}
+DEPTH_METHOD_MAP = {0: "grayscale", 1: "sobel", 2: "laplacian"}
+DEPTH_MODEL_SIZE_MAP = {0: "small", 1: "base", 2: "large"}
 
 
 class Packet:
@@ -160,6 +173,11 @@ class ConfigPacket(Packet):
         )
         self.cfg_type = config_type_to_str(ConfigType(cfg_type))
         offset += 16
+        if offset < len(data):
+            self.similar_image_filter_config, offset = self.parse_similar_image_filter(
+                data, offset
+            )
+
         if offset + 4 <= len(data):
             (lora_dict_len,) = struct.unpack_from(ENDIAN_FORMAT + UINT32, data, offset)
             offset += 4
@@ -177,11 +195,6 @@ class ConfigPacket(Packet):
             self.lora_dict = None
 
         if offset < len(data):
-            self.similar_image_filter_config, offset = self.parse_similar_image_filter(
-                data, offset
-            )
-
-        if offset < len(data):
             self.controlnet_config.controlnet, offset = self.parse_controlnet_config(
                 data, offset
             )
@@ -194,6 +207,9 @@ class ConfigPacket(Packet):
 
         if offset < len(data):
             self.controlnet_config.openpose, offset = self.parse_openpose_config(data, offset)
+
+        if offset < len(data):
+            offset = self.parse_pipeline_settings(data, offset)
 
         return self
 
@@ -239,10 +255,10 @@ class ConfigPacket(Packet):
         )
         return (
             CNConfig(
-                enabled=bool(enabled),
-                preview_mode=preview_mode,
-                guidance_strength=guidance_strength,
-                skip_frames=skip_frames,
+                controlnet_enabled=bool(enabled),
+                preview_mode=PREVIEW_MODE_MAP.get(preview_mode, "normal"),
+                controlnet_guidance_strength=guidance_strength,
+                controlnet_skip_frames=skip_frames,
             ),
             offset + SIZE,
         )
@@ -295,8 +311,6 @@ class ConfigPacket(Packet):
         (
             enabled,
             scale,
-            method,
-            model_size,
             resolution,
             blur_kernel,
             contrast,
@@ -304,15 +318,17 @@ class ConfigPacket(Packet):
             near_threshold,
             far_threshold,
             invert,
+            method,
+            model_size,
         ) = struct.unpack_from(
             ENDIAN_FORMAT
             + UINT32
             + FLOAT32
             + UINT32
             + UINT32
-            + UINT32
-            + UINT32
             + FLOAT32
+            + INT32
+            + INT32
             + UINT32
             + UINT32
             + UINT32
@@ -325,8 +341,8 @@ class ConfigPacket(Packet):
             DepthConfig(
                 enabled=bool(enabled),
                 scale=scale,
-                method=str(method),
-                model_size=str(model_size),
+                method=DEPTH_METHOD_MAP.get(method, "grayscale"),
+                model_size=DEPTH_MODEL_SIZE_MAP.get(model_size, "small"),
                 resolution=resolution,
                 blur_kernel=blur_kernel,
                 contrast=contrast,
@@ -361,6 +377,24 @@ class ConfigPacket(Packet):
             ),
             offset + SIZE,
         )
+
+    def parse_pipeline_settings(self, data: bytes, offset: int):
+        SIZE = 12
+        if offset + SIZE > len(data):
+            raise ValueError("Insufficient data for pipeline settings")
+        (
+            latent_feedback_strength,
+            motion_aware_noise,
+            motion_aware_noise_sensitivity,
+        ) = struct.unpack_from(
+            ENDIAN_FORMAT + FLOAT32 + UINT32 + FLOAT32,
+            data,
+            offset,
+        )
+        self.controlnet_config.latent_feedback_strength = latent_feedback_strength
+        self.controlnet_config.motion_aware_noise = bool(motion_aware_noise)
+        self.controlnet_config.motion_aware_noise_sensitivity = motion_aware_noise_sensitivity
+        return offset + SIZE
 
 
 class UuidPacket(Packet):

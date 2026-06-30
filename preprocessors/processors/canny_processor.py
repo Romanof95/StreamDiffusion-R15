@@ -53,6 +53,9 @@ class CannyProcessor(BasePreprocessor):
             l2_gradient = config.get('canny_l2_gradient', False)
             canny_resolution = config.get('canny_resolution', 384)
 
+        # cv2.Canny requires an odd aperture in {3, 5, 7}.
+        aperture_size = min(7, max(3, int(aperture_size) | 1))
+
         original_h, original_w = image_tensor.shape[1], image_tensor.shape[2]
 
         if canny_resolution < original_h:

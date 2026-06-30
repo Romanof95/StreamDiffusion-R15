@@ -481,7 +481,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         """SDXL-specific torch.compile with resolution-keyed cache directories."""
         if not self.torch_compile_enabled:
             return
-        if acceleration == "tensorrt":
+        if acceleration != "torchcompile":
             return
         if not hasattr(torch, 'compile') or torch.__version__ < '2.0':
             return

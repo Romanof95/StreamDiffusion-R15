@@ -416,10 +416,39 @@ class App:
             config.openpose.detect_resolution
         )
 
+        if self.stream is not None:
+            self.controlnet_manager.load_models()
         self.controlnet_manager.update_active_list()
 
-        # Pre-build ControlNet active list (avoid list construction in hot path).
-        self.controlnet_manager.update_active_list()
+    def _apply_live_config(self):
+        if not (self.stream and hasattr(self.stream, 'stream')):
+            return
+        inner = self.stream.stream
+
+        sif = getattr(self, 'similar_image_filter', None)
+        if sif is not None:
+            if sif.enabled:
+                inner.enable_similar_image_filter(sif.threshold, sif.max_skip)
+            else:
+                inner.disable_similar_image_filter()
+            self._ssf_enabled_cached = (
+                getattr(inner, "similar_image_filter", False)
+                and getattr(inner, "similar_filter", None) is not None
+            )
+
+        if self.preprocessor_orchestrator is not None:
+            self.preprocessor_orchestrator.update_models(self.controlnet_config)
+
+        new_fb = self.controlnet_config.latent_feedback_strength
+        inner.latent_feedback_strength = new_fb
+        if new_fb == 0.0:
+            inner._prev_latent = None
+
+        new_strength = self._cached_controlnet_guidance_strength
+        if getattr(inner, '_cached_controlnet_guidance_strength', None) != new_strength:
+            inner._cached_controlnet_guidance_strength = new_strength
+            if hasattr(inner, '_guidance_strength_logged'):
+                delattr(inner, '_guidance_strength_logged')
 
     def _receive_pending_messages(self) -> dict:
         """Drain any pending control messages from the Smode socket (non-blocking)."""
@@ -427,6 +456,7 @@ class App:
         ready_to_read, _, in_error = select.select(
             [self.socket], [], [], 0
         )
+        logging.debug(f"socket ready = {bool(ready_to_read)}")
         if ready_to_read:
             while True:
                 try:
@@ -472,6 +502,8 @@ class App:
                     # self.apply_controlnet_config(config_packet.controlnet_config)
                     self._cache_config_values(self.controlnet_config)
                     self._create_stream()
+                    self.controlnet_manager.load_models()
+                    self.controlnet_manager.update_active_list()
                 else:
                     model_has_changed = self.model_name != config_packet.model_name
                     lora_dict_has_changed = self.lora_dict != config_packet.lora_dict
@@ -489,8 +521,8 @@ class App:
                     )
                     update_t_index_list = self.t_index_list != config_packet.t_index_list
                     previous_acceleration = self.acceleration
-                    self._cache_config_values(self.controlnet_config)
                     update_parameters(self, config_packet)
+                    self._cache_config_values(self.controlnet_config)
 
                     if model_has_changed or lora_dict_has_changed:
                         self._create_stream()
@@ -536,6 +568,8 @@ class App:
                         delta=self.current_delta,
                         seed=self.seed,
                     )
+
+                    self._apply_live_config()
 
                     # StreamV2V: reset attention cache only on prompt change.
                     if getattr(self, '_streamv2v_active', False):
@@ -658,7 +692,8 @@ class App:
                             self.warmup_completed = True
 
                         except Exception as e:
-                            logging.warning(f"Warmup failed (non-critical): {e}")
+                            self.warmup_completed = True
+                            logging.warning(f"Warmup failed (non-critical): {type(e).__name__}: {e}")
                         finally:
                             if 'dummy_input' in locals():
                                 del dummy_input

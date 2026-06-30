@@ -688,7 +688,8 @@ class App:
                             self.warmup_completed = True
 
                         except Exception as e:
-                            logging.warning(f"Warmup failed (non-critical): {e}")
+                            self.warmup_completed = True
+                            logging.warning(f"Warmup failed (non-critical): {type(e).__name__}: {e}")
                         finally:
                             if 'dummy_input' in locals():
                                 del dummy_input

@@ -423,7 +423,7 @@ class App:
         ready_to_read, _, in_error = select.select(
             [self.socket], [], [], 0
         )
-        logging.info(f"socket ready = {bool(ready_to_read)}")
+        logging.debug(f"socket ready = {bool(ready_to_read)}")
         if ready_to_read:
             while True:
                 try:

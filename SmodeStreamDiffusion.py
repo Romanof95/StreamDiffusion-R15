@@ -511,8 +511,8 @@ class App:
                     )
                     update_t_index_list = self.t_index_list != config_packet.t_index_list
                     previous_acceleration = self.acceleration
-                    self._cache_config_values(self.controlnet_config)
                     update_parameters(self, config_packet)
+                    self._cache_config_values(self.controlnet_config)
 
                     if model_has_changed or lora_dict_has_changed:
                         self._create_stream()

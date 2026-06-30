@@ -173,6 +173,11 @@ class ConfigPacket(Packet):
         )
         self.cfg_type = config_type_to_str(ConfigType(cfg_type))
         offset += 16
+        if offset < len(data):
+            self.similar_image_filter_config, offset = self.parse_similar_image_filter(
+                data, offset
+            )
+
         if offset + 4 <= len(data):
             (lora_dict_len,) = struct.unpack_from(ENDIAN_FORMAT + UINT32, data, offset)
             offset += 4
@@ -188,11 +193,6 @@ class ConfigPacket(Packet):
                 offset += 4
         else:
             self.lora_dict = None
-
-        if offset < len(data):
-            self.similar_image_filter_config, offset = self.parse_similar_image_filter(
-                data, offset
-            )
 
         if offset < len(data):
             self.controlnet_config.controlnet, offset = self.parse_controlnet_config(

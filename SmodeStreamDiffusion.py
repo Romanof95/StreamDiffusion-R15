@@ -440,6 +440,12 @@ class App:
         if new_fb == 0.0:
             inner._prev_latent = None
 
+        new_strength = self._cached_controlnet_guidance_strength
+        if getattr(inner, '_cached_controlnet_guidance_strength', None) != new_strength:
+            inner._cached_controlnet_guidance_strength = new_strength
+            if hasattr(inner, '_guidance_strength_logged'):
+                delattr(inner, '_guidance_strength_logged')
+
     def _receive_pending_messages(self) -> dict:
         """Drain any pending control messages from the Smode socket (non-blocking)."""
         messages = {}

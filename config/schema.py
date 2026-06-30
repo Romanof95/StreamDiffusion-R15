@@ -105,10 +105,9 @@ class ControlNetConfig:
         if hasattr(self, key):
             return getattr(self, key)
         
-        # Nested controlnet settings
-        if key.startswith("faceid_"):
-            return getattr(self.controlnet, key.removeprefix("controlnet_"), default)
-
+        # Nested controlnet settings (CNConfig keeps full field names)
+        if hasattr(self.controlnet, key):
+            return getattr(self.controlnet, key)
 
         # Nested FaceID settings
         if key.startswith("faceid_"):
@@ -129,3 +128,21 @@ class ControlNetConfig:
             return getattr(self.openpose, key.removeprefix("openpose_"), default)
 
         return default
+
+    def __setitem__(self, key, value):
+        if hasattr(self, key):
+            setattr(self, key, value)
+            return
+        if hasattr(self.controlnet, key):
+            setattr(self.controlnet, key, value)
+            return
+        for prefix, sub in (
+            ("canny_", self.canny),
+            ("depth_", self.depth),
+            ("openpose_", self.openpose),
+            ("faceid_", self.faceid),
+            ("streamv2v_", self.streamv2v),
+        ):
+            if key.startswith(prefix):
+                setattr(sub, key.removeprefix(prefix), value)
+                return

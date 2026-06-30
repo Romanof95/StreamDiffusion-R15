@@ -412,9 +412,8 @@ class App:
             config.openpose.detect_resolution
         )
 
-        self.controlnet_manager.update_active_list()
-
-        # Pre-build ControlNet active list (avoid list construction in hot path).
+        if self.stream is not None:
+            self.controlnet_manager.load_models()
         self.controlnet_manager.update_active_list()
 
     def _receive_pending_messages(self) -> dict:
@@ -469,6 +468,8 @@ class App:
                     update_parameters(self, config_packet)
                     self._cache_config_values(self.controlnet_config)
                     self._create_stream()
+                    self.controlnet_manager.load_models()
+                    self.controlnet_manager.update_active_list()
                 else:
                     model_has_changed = self.model_name != config_packet.model_name
                     lora_dict_has_changed = self.lora_dict != config_packet.lora_dict

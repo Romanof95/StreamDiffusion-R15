@@ -722,7 +722,7 @@ class StreamDiffusion:
 
     def _build_per_slot_cond(self, cn_index: int, current_cond: torch.Tensor) -> torch.Tensor:
         if self.denoising_steps_num <= 1:
-            return current_cond
+            return current_cond.unsqueeze(0) if current_cond.dim() == 3 else current_cond
         ring = self._ensure_cn_ring(cn_index, current_cond)
         if current_cond.dim() == 3:
             cur4d = current_cond.unsqueeze(0)

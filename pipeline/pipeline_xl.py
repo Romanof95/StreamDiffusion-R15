@@ -832,7 +832,10 @@ class StreamDiffusionXL:
 
     def _build_per_slot_cond(self, cn_index: int, cn_image):
         if self.denoising_steps_num <= 1:
-            return cn_image
+            if isinstance(cn_image, list):
+                return [c.unsqueeze(0) if torch.is_tensor(c) and c.dim() == 3 else c
+                        for c in cn_image]
+            return cn_image.unsqueeze(0) if cn_image.dim() == 3 else cn_image
         if isinstance(cn_image, list):
             return [self._build_per_slot_cond_one((cn_index, j), c) for j, c in enumerate(cn_image)]
         return self._build_per_slot_cond_one((cn_index, 0), cn_image)

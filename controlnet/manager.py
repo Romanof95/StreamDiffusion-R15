@@ -243,7 +243,7 @@ class ControlNetManager:
         """Accelerate a ControlNet (or depth) model per ``app.acceleration``.
 
         TENSORRT → build/load engine via ``ControlNetEngine`` or
-        ``DepthAnythingEngine``. NONE → torch.compile (reduce-overhead).
+        ``DepthAnythingEngine``. TORCHCOMPILE → torch.compile (reduce-overhead).
         Other accelerations → unchanged. Returns the (possibly wrapped) model.
         """
         app = self._app
@@ -258,7 +258,7 @@ class ControlNetManager:
                 return model
             return self._compile_tensorrt(model, controlnet_name)
 
-        if app.acceleration != Acceleration.NONE:
+        if app.acceleration != Acceleration.TORCHCOMPILE:
             return model
 
         try:

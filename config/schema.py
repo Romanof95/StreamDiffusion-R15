@@ -61,7 +61,7 @@ class FaceIDConfig:
 
 @dataclass
 class StreamV2VConfig:
-    enabled: bool = True
+    enabled: bool = False
     cache_maxframes: int = 4
     cache_interval: int = 1
 

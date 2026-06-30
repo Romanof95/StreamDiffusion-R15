@@ -211,6 +211,9 @@ class ConfigPacket(Packet):
         if offset < len(data):
             offset = self.parse_pipeline_settings(data, offset)
 
+        if offset < len(data):
+            offset = self.parse_streamv2v_settings(data, offset)
+
         return self
 
     def parse_similar_image_filter(self, data: bytes, offset: int):
@@ -394,6 +397,20 @@ class ConfigPacket(Packet):
         self.controlnet_config.latent_feedback_strength = latent_feedback_strength
         self.controlnet_config.motion_aware_noise = bool(motion_aware_noise)
         self.controlnet_config.motion_aware_noise_sensitivity = motion_aware_noise_sensitivity
+        return offset + SIZE
+
+    def parse_streamv2v_settings(self, data: bytes, offset: int):
+        SIZE = 12
+        if offset + SIZE > len(data):
+            raise ValueError("Insufficient data for StreamV2V settings")
+        (enabled, cache_maxframes, cache_interval) = struct.unpack_from(
+            ENDIAN_FORMAT + UINT32 + UINT32 + UINT32,
+            data,
+            offset,
+        )
+        self.controlnet_config.streamv2v.enabled = bool(enabled)
+        self.controlnet_config.streamv2v.cache_maxframes = cache_maxframes
+        self.controlnet_config.streamv2v.cache_interval = cache_interval
         return offset + SIZE
 
 

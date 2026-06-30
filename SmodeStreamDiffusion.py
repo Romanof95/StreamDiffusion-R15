@@ -416,6 +416,30 @@ class App:
             self.controlnet_manager.load_models()
         self.controlnet_manager.update_active_list()
 
+    def _apply_live_config(self):
+        if not (self.stream and hasattr(self.stream, 'stream')):
+            return
+        inner = self.stream.stream
+
+        sif = getattr(self, 'similar_image_filter', None)
+        if sif is not None:
+            if sif.enabled:
+                inner.enable_similar_image_filter(sif.threshold, sif.max_skip)
+            else:
+                inner.disable_similar_image_filter()
+            self._ssf_enabled_cached = (
+                getattr(inner, "similar_image_filter", False)
+                and getattr(inner, "similar_filter", None) is not None
+            )
+
+        if self.preprocessor_orchestrator is not None:
+            self.preprocessor_orchestrator.update_models(self.controlnet_config)
+
+        new_fb = self.controlnet_config.latent_feedback_strength
+        inner.latent_feedback_strength = new_fb
+        if new_fb == 0.0:
+            inner._prev_latent = None
+
     def _receive_pending_messages(self) -> dict:
         """Drain any pending control messages from the Smode socket (non-blocking)."""
         messages = {}
@@ -534,6 +558,8 @@ class App:
                         delta=self.current_delta,
                         seed=self.seed,
                     )
+
+                    self._apply_live_config()
 
                     # StreamV2V: reset attention cache only on prompt change.
                     if getattr(self, '_streamv2v_active', False):

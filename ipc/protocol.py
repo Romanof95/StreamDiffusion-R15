@@ -9,6 +9,7 @@ MAGIC_NUMBER = 0xE280A0
 ENDIAN_FORMAT: str = "<"
 
 UINT32 = "I"
+INT32 = "i"
 UINT64 = "Q"
 FLOAT32 = "f"
 

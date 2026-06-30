@@ -54,12 +54,6 @@ class StreamDiffusion:
         self.latent_feedback_strength = 0.0  # 0.0 = disabled, 0.1-0.4 recommended
         self._prev_latent = None
 
-        # Motion-aware noise: adapt denoising strength based on input motion.
-        self.motion_aware_noise = False
-        self.motion_aware_noise_sensitivity = 0.5
-        self._prev_input_latent = None
-        self._motion_noise_scale = 1.0
-
         if use_denoising_batch:
             self.batch_size = self.denoising_steps_num * frame_buffer_size
             if self.cfg_type == "initialize":
@@ -879,17 +873,6 @@ class StreamDiffusion:
             )
             if self.enable_profiling:
                 internal_timings['vae_encode'] = 0.0
-
-        # Motion-aware noise: scale stock_noise down on fast motion to reduce flicker.
-        if self.motion_aware_noise and x_t_latent is not None:
-            if self._prev_input_latent is not None:
-                motion = torch.sqrt(torch.mean((x_t_latent - self._prev_input_latent) ** 2)).item()
-                s = self.motion_aware_noise_sensitivity
-                target_scale = max(0.3, 1.0 - motion * s * 5.0)
-                self._motion_noise_scale = 0.7 * self._motion_noise_scale + 0.3 * target_scale
-                if hasattr(self, 'stock_noise') and self.stock_noise is not None:
-                    self.stock_noise = self.stock_noise * self._motion_noise_scale
-            self._prev_input_latent = x_t_latent.detach()
 
         if self.enable_profiling:
             unet_start = time.time()

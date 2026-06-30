@@ -66,11 +66,6 @@ class StreamDiffusionXL:
         self.latent_feedback_strength = 0.0
         self._prev_latent = None
 
-        self.motion_aware_noise = False
-        self.motion_aware_noise_sensitivity = 0.5
-        self._prev_input_latent = None
-        self._motion_noise_scale = 1.0
-
         if use_denoising_batch:
             self.batch_size = self.denoising_steps_num * frame_buffer_size
             if self.cfg_type == "initialize":
@@ -1004,16 +999,6 @@ class StreamDiffusionXL:
             if self.enable_profiling:
                 events['preprocess_end'].record()
                 events['vae_encode_end'].record()
-
-        if self.motion_aware_noise and x_t_latent is not None:
-            if self._prev_input_latent is not None:
-                motion = torch.sqrt(torch.mean((x_t_latent - self._prev_input_latent) ** 2)).item()
-                s = self.motion_aware_noise_sensitivity
-                target_scale = max(0.3, 1.0 - motion * s * 5.0)
-                self._motion_noise_scale = 0.7 * self._motion_noise_scale + 0.3 * target_scale
-                if hasattr(self, 'stock_noise') and self.stock_noise is not None:
-                    self.stock_noise = self.stock_noise * self._motion_noise_scale
-            self._prev_input_latent = x_t_latent.detach()
 
         x_0_pred_out = self.predict_x0_batch(
             x_t_latent,

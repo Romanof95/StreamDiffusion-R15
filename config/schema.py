@@ -88,8 +88,6 @@ class ControlNetConfig:
     # Temporal consistency
     streamv2v: StreamV2VConfig = field(default_factory=StreamV2VConfig)
     latent_feedback_strength: float = 0.0
-    motion_aware_noise: bool = True
-    motion_aware_noise_sensitivity: float = 1.0
 
     # Acceleration
     use_tiny_vae: bool = True

@@ -38,9 +38,7 @@ PREVIEW_MODE_MAP = {
     1: "canny_preview",
     2: "depth_preview",
     3: "openpose_preview",
-    4: "mask_preview",
 }
-DEPTH_METHOD_MAP = {0: "grayscale", 1: "sobel", 2: "laplacian"}
 DEPTH_MODEL_SIZE_MAP = {0: "small", 1: "base", 2: "large"}
 
 
@@ -209,9 +207,6 @@ class ConfigPacket(Packet):
             self.controlnet_config.openpose, offset = self.parse_openpose_config(data, offset)
 
         if offset < len(data):
-            offset = self.parse_pipeline_settings(data, offset)
-
-        if offset < len(data):
             offset = self.parse_streamv2v_settings(data, offset)
 
         return self
@@ -307,7 +302,7 @@ class ConfigPacket(Packet):
         )
 
     def parse_depth_config(self, data: bytes, offset: int):
-        SIZE = 44
+        SIZE = 40
 
         if offset + SIZE > len(data):
             raise ValueError("Insufficient data for DepthConfig")
@@ -321,7 +316,6 @@ class ConfigPacket(Packet):
             near_threshold,
             far_threshold,
             invert,
-            method,
             model_size,
         ) = struct.unpack_from(
             ENDIAN_FORMAT
@@ -334,7 +328,6 @@ class ConfigPacket(Packet):
             + INT32
             + UINT32
             + UINT32
-            + UINT32
             + UINT32,
             data,
             offset,
@@ -344,7 +337,7 @@ class ConfigPacket(Packet):
             DepthConfig(
                 enabled=bool(enabled),
                 scale=scale,
-                method=DEPTH_METHOD_MAP.get(method, "grayscale"),
+                method="grayscale",
                 model_size=DEPTH_MODEL_SIZE_MAP.get(model_size, "small"),
                 resolution=resolution,
                 blur_kernel=blur_kernel,
@@ -380,24 +373,6 @@ class ConfigPacket(Packet):
             ),
             offset + SIZE,
         )
-
-    def parse_pipeline_settings(self, data: bytes, offset: int):
-        SIZE = 12
-        if offset + SIZE > len(data):
-            raise ValueError("Insufficient data for pipeline settings")
-        (
-            latent_feedback_strength,
-            motion_aware_noise,
-            motion_aware_noise_sensitivity,
-        ) = struct.unpack_from(
-            ENDIAN_FORMAT + FLOAT32 + UINT32 + FLOAT32,
-            data,
-            offset,
-        )
-        self.controlnet_config.latent_feedback_strength = latent_feedback_strength
-        self.controlnet_config.motion_aware_noise = bool(motion_aware_noise)
-        self.controlnet_config.motion_aware_noise_sensitivity = motion_aware_noise_sensitivity
-        return offset + SIZE
 
     def parse_streamv2v_settings(self, data: bytes, offset: int):
         SIZE = 12

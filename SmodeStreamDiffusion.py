@@ -439,11 +439,6 @@ class App:
         if self.preprocessor_orchestrator is not None:
             self.preprocessor_orchestrator.update_models(self.controlnet_config)
 
-        new_fb = self.controlnet_config.latent_feedback_strength
-        inner.latent_feedback_strength = new_fb
-        if new_fb == 0.0:
-            inner._prev_latent = None
-
         new_strength = self._cached_controlnet_guidance_strength
         if getattr(inner, '_cached_controlnet_guidance_strength', None) != new_strength:
             inner._cached_controlnet_guidance_strength = new_strength

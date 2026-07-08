@@ -210,8 +210,9 @@ class DepthProcessor(BasePreprocessor):
             mode='bilinear', align_corners=False
         ).squeeze(0)
 
-        if downscaled.max() > 1.0:
-            downscaled = downscaled / 255.0
+        # Clamp HDR highlights to [0,1]: the old >1 -> /255 heuristic blacked out
+        # HDR frames, yielding a radial-gradient depth.
+        downscaled = downscaled.clamp(0.0, 1.0)
 
         normalized = (downscaled - self._depth_mean) / self._depth_std
         inputs = {"pixel_values": normalized.unsqueeze(0)}

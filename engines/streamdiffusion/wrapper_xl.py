@@ -32,7 +32,7 @@ def _compute_trt_unet_batch_size_xl(t_index_list, frame_buffer_size, cfg_type, u
 
 def _derive_engine_paths_sdxl(
     model_id_or_path, use_lcm_lora, use_tiny_vae, lora_dict, engine_dir,
-    trt_unet_batch_size, vae_batch_size, mode,
+    trt_unet_batch_size, vae_batch_size, mode, height, width,
     streamv2v_on=False, streamv2v_maxframes=1,
 ):
     """Derive on-disk paths for the SDXL TRT engines.
@@ -48,7 +48,7 @@ def _derive_engine_paths_sdxl(
         return (
             f"{stem}--lcm_lora-{use_lcm_lora}--tiny_vae-{use_tiny_vae}"
             f"--max_batch-{max_batch_size}--min_batch-{min_batch_size}"
-            f"--mode-{mode}{lora_sig}"
+            f"--mode-{mode}--res-{height}x{width}{lora_sig}"
         )
 
     engine_dir = Path(engine_dir)
@@ -202,6 +202,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                     trt_unet_batch_size=trt_unet_bs,
                     vae_batch_size=vae_bs,
                     mode=self.mode,
+                    height=self.height, width=self.width,
                 )
                 if (os.path.exists(unet_path) and os.path.exists(vae_enc_path)
                         and os.path.exists(vae_dec_path)):
@@ -550,7 +551,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             return (
                 f"{stem}--lcm_lora-{use_lcm_lora}--tiny_vae-{use_tiny_vae}"
                 f"--max_batch-{max_batch_size}--min_batch-{min_batch_size}"
-                f"--mode-{self.mode}{lora_sig}"
+                f"--mode-{self.mode}--res-{self.height}x{self.width}{lora_sig}"
             )
 
         engine_dir = Path(engine_dir)

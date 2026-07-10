@@ -31,9 +31,14 @@ def _compute_trt_unet_batch_size(t_index_list, frame_buffer_size, cfg_type, use_
 
 def _derive_engine_paths_sd15(
     model_id_or_path, use_lcm_lora, use_tiny_vae, lora_dict, engine_dir,
-    trt_unet_batch_size, vae_batch_size, mode, streamv2v_on, streamv2v_maxframes,
+    trt_unet_batch_size, vae_batch_size, mode, height, width,
+    streamv2v_on, streamv2v_maxframes,
 ):
-    """Derive on-disk paths for the three TRT engines (unet, vae enc, vae dec)."""
+    """Derive on-disk paths for the three TRT engines (unet, vae enc, vae dec).
+
+    Height/width are folded into the prefix: static-shape TRT engines can't
+    serve another resolution, so each resolution needs its own cache path.
+    """
     lora_sig = lora_signature(lora_dict)
 
     def create_prefix(max_batch_size, min_batch_size):
@@ -42,7 +47,7 @@ def _derive_engine_paths_sd15(
         return (
             f"{stem}--lcm_lora-{use_lcm_lora}--tiny_vae-{use_tiny_vae}"
             f"--max_batch-{max_batch_size}--min_batch-{min_batch_size}"
-            f"--mode-{mode}{lora_sig}"
+            f"--mode-{mode}--res-{height}x{width}{lora_sig}"
         )
 
     engine_dir = Path(engine_dir)
@@ -181,6 +186,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                     trt_unet_batch_size=trt_unet_bs,
                     vae_batch_size=vae_bs,
                     mode=self.mode,
+                    height=self.height, width=self.width,
                     streamv2v_on=v2v_on,
                     streamv2v_maxframes=v2v_maxframes,
                 )
@@ -432,7 +438,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             return (
                 f"{stem}--lcm_lora-{use_lcm_lora}--tiny_vae-{use_tiny_vae}"
                 f"--max_batch-{max_batch_size}--min_batch-{min_batch_size}"
-                f"--mode-{self.mode}{lora_sig}"
+                f"--mode-{self.mode}--res-{self.height}x{self.width}{lora_sig}"
             )
 
         engine_dir = Path(engine_dir)
@@ -503,7 +509,8 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                 )
                 compile_unet(stream.unet, unet_model, unet_path + ".onnx",
                              unet_path + ".opt.onnx", unet_path,
-                             opt_batch_size=stream.trt_unet_batch_size)
+                             opt_batch_size=stream.trt_unet_batch_size,
+                             opt_image_height=self.height, opt_image_width=self.width)
             # Move PyTorch UNet off-GPU as soon as TRT engine is built so the
             # VAE builds don't pay the ~1.7 GB peak.
             try:
@@ -519,7 +526,8 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             batch = self.batch_size if self.mode == "txt2img" else stream.frame_bff_size
             vae_decoder_model = VAE(device=stream.device, max_batch_size=batch, min_batch_size=batch)
             compile_vae_decoder(stream.vae, vae_decoder_model, vae_decoder_path + ".onnx",
-                                vae_decoder_path + ".opt.onnx", vae_decoder_path, opt_batch_size=batch)
+                                vae_decoder_path + ".opt.onnx", vae_decoder_path, opt_batch_size=batch,
+                                opt_image_height=self.height, opt_image_width=self.width)
             delattr(stream.vae, "forward")
 
         if not os.path.exists(vae_encoder_path):
@@ -528,7 +536,8 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             batch = self.batch_size if self.mode == "txt2img" else stream.frame_bff_size
             vae_encoder_model = VAEEncoder(device=stream.device, max_batch_size=batch, min_batch_size=batch)
             compile_vae_encoder(vae_encoder, vae_encoder_model, vae_encoder_path + ".onnx",
-                                vae_encoder_path + ".opt.onnx", vae_encoder_path, opt_batch_size=batch)
+                                vae_encoder_path + ".opt.onnx", vae_encoder_path, opt_batch_size=batch,
+                                opt_image_height=self.height, opt_image_width=self.width)
 
         cuda_stream = cuda.Stream()
         vae_scale_factor = stream.pipe.vae_scale_factor

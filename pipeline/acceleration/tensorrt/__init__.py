@@ -367,9 +367,16 @@ def compile_controlnet(
     onnx_opt_path: str,
     engine_path: str,
     opt_batch_size: int = 1,
+    opt_image_height: int = 512,
+    opt_image_width: int = 512,
     engine_build_options: dict = {},
 ):
-    """Compile a ControlNet to a TRT engine (tuple output unpacked to named tensors)."""
+    """Compile a ControlNet to a TRT engine (tuple output unpacked to named tensors).
+
+    opt_image_height/width bake the static shape profile (build_dynamic_shape is
+    off), so they MUST match the stream resolution — a 512-baked engine cannot
+    serve a 1024 session. Mirrors compile_unet.
+    """
     controlnet_wrapper = TorchControlNetWrapper(controlnet).to(torch.device("cuda"), dtype=torch.float16)
 
     builder = EngineBuilder(model_data, controlnet_wrapper, device=torch.device("cuda"))
@@ -378,6 +385,8 @@ def compile_controlnet(
         onnx_opt_path,
         engine_path,
         opt_batch_size=opt_batch_size,
+        opt_image_height=opt_image_height,
+        opt_image_width=opt_image_width,
         **engine_build_options,
     )
 

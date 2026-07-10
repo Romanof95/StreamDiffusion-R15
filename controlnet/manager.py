@@ -354,9 +354,15 @@ class ControlNetManager:
             return None
         batch = stream_obj.trt_unet_batch_size
         model_id = (app.model_name or "unknown").replace("/", "_").replace("\\", "_")
+        # Resolution must be part of the cache key: static-shape TRT engines
+        # (build_dynamic_shape=False) bake a min=opt=max profile, so a 512-baked
+        # engine cannot serve a 1024 session — without --res it would cache-hit and
+        # fail per-frame on the shape mismatch. Match the UNet prefix order (h x w).
+        res_h = getattr(app, "height", 512)
+        res_w = getattr(app, "width", 512)
         engine_dir = (
             PACKAGE_DIR / "tensorrt_cache" / "sd" / "controlnet"
-            / controlnet_name / f"{model_id}--bs-{batch}"
+            / controlnet_name / f"{model_id}--bs-{batch}--res-{res_h}x{res_w}"
         )
         return str(engine_dir / "controlnet.engine")
 
@@ -476,6 +482,8 @@ class ControlNetManager:
                 engine_path + ".opt.onnx",
                 engine_path,
                 opt_batch_size=batch,
+                opt_image_height=getattr(app, "height", 512),
+                opt_image_width=getattr(app, "width", 512),
             )
             logging.info(f"{controlnet_name} ControlNet TRT engine built")
 

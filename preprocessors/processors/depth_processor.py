@@ -276,9 +276,12 @@ class DepthProcessor(BasePreprocessor):
         if self._temp_cpu_buffer is None or self._temp_cpu_buffer.shape != (h, w, 3):
             self._temp_cpu_buffer = np.empty((h, w, 3), dtype=np.uint8)
 
-        image_cpu = image_tensor.permute(1, 2, 0).contiguous()
-        np.copyto(self._temp_cpu_buffer, (image_cpu.cpu().numpy() * 255).astype(np.uint8))
-        del image_cpu
+        # Scale+cast on the GPU and do one uint8 D2H into the pre-allocated
+        # buffer (blocking: the cv2 path reads it right after), instead of
+        # copying floats down then doing a full-res CPU multiply + astype.
+        gpu_u8 = (image_tensor.permute(1, 2, 0) * 255).clamp_(0, 255).to(torch.uint8)
+        torch.from_numpy(self._temp_cpu_buffer).copy_(gpu_u8)
+        del gpu_u8
 
         image_np = self._temp_cpu_buffer
 

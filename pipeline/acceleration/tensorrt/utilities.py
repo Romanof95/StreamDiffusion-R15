@@ -93,6 +93,10 @@ class Engine:
         # execute_async_v3 for this engine. Replay failures are NOT caught
         # (they indicate corrupted graph state and must surface).
         self._cuda_graph_disabled = False
+        # Reusable CUDA event (no timing) used to order downstream torch work
+        # after a CUDA-Graph replay WITHOUT a host-blocking stream sync.
+        # Lazily created on first replay.
+        self._replay_event = None
 
     def __del__(self):
         [buf.free() for buf in self.buffers.values() if isinstance(buf, cuda.DeviceArray)]
@@ -322,19 +326,41 @@ class Engine:
                 except Exception:
                     pass
                 self.graph = None
+            # Rebind engine I/O addresses ONCE, on (re)allocation only. The
+            # entries in self.tensors are only ever copy_'d into (never
+            # reassigned) by infer(), so data_ptr() is stable between
+            # reallocations; the context is created once in activate() and
+            # never recreated. Doing this here instead of every infer() saves
+            # ~160 set_tensor_address FFI calls/frame on the SDXL v2v engine.
+            for name, tensor in self.tensors.items():
+                self.context.set_tensor_address(name, tensor.data_ptr())
 
     def infer(self, feed_dict, stream, use_cuda_graph=False):
         for name, buf in feed_dict.items():
             self.tensors[name].copy_(buf)
 
-        for name, tensor in self.tensors.items():
-            self.context.set_tensor_address(name, tensor.data_ptr())
-
         if use_cuda_graph and not self._cuda_graph_disabled:
             if self.cuda_graph_instance is not None:
                 # Replay path — uncaught: failure here is a hard bug.
                 CUASSERT(cudart.cudaGraphLaunch(self.cuda_graph_instance, stream.ptr))
-                CUASSERT(cudart.cudaStreamSynchronize(stream.ptr))
+                # Order downstream torch work after the replay WITHOUT a
+                # host-blocking sync: record an event on the TRT stream and
+                # make the current torch stream wait on it. The host returns
+                # immediately, so CPU prep of the next stage (scheduler math,
+                # postprocess, IPC) overlaps GPU execution — a real win on
+                # WDDM where the old cudaStreamSynchronize stalled per engine
+                # per frame. GPU-side ordering (e.g. the kvo copy_ and VAE
+                # clamp that read TRT outputs) is preserved.
+                if self._replay_event is None:
+                    self._replay_event = CUASSERT(
+                        cudart.cudaEventCreateWithFlags(cudart.cudaEventDisableTiming)
+                    )
+                CUASSERT(cudart.cudaEventRecord(self._replay_event, stream.ptr))
+                CUASSERT(
+                    cudart.cudaStreamWaitEvent(
+                        torch.cuda.current_stream().cuda_stream, self._replay_event, 0
+                    )
+                )
             else:
                 # Capture path — guarded: some engines do unsafe syncs that
                 # block stream capture; we latch the disable flag and fall

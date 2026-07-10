@@ -13,6 +13,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 )
 
 from .image_filter import SimilarImageFilter
+from .attention_processors import update_cache_after_unet
 from functools import lru_cache
 
 
@@ -410,6 +411,17 @@ class StreamDiffusion:
             dim=0,
         )
 
+        # PERFORMANCE: Pre-compute the constant beta*init_noise tail used by the
+        # multi-step buffer update in predict_x0_batch. init_noise is fixed after
+        # prepare() in the denoising-batch path, so this product is constant for
+        # the session and must not be recomputed every frame.
+        if self.denoising_steps_num > 1 and self.do_add_noise:
+            self._beta_noise_tail = (
+                self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
+            ).contiguous()
+        else:
+            self._beta_noise_tail = None
+
         # Pre-compute CFG concat tensors that are stable across frames (init_noise isn't).
         if self.use_denoising_batch and (self.cfg_type == "self" or self.cfg_type == "initialize"):
             self.alpha_next = torch.concat(
@@ -439,6 +451,11 @@ class StreamDiffusion:
             do_classifier_free_guidance=False,
         )
         self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
+
+        # Reset RCFG rolling noise on prompt change: it carries residual from the
+        # old prompt across frames, causing a flash on swap (multi-step only).
+        if self.stock_noise is not None:
+            self.stock_noise.zero_()
 
         self._needs_buffer_refill = True
         self.prev_image_result = None
@@ -632,7 +649,6 @@ class StreamDiffusion:
             )[0]
 
             # StreamV2V cache update runs outside the CUDA graph.
-            from .attention_processors import update_cache_after_unet
             update_cache_after_unet(self.unet)
         finally:
             if down_block_res_samples is not None:
@@ -794,15 +810,32 @@ class StreamDiffusion:
 
             if self.denoising_steps_num > 1:
                 x_0_pred_out = x_0_pred_batch[-1].unsqueeze(0)
-                if self.do_add_noise:
-                    self.x_t_latent_buffer = (
-                        self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-                        + self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
+                # In-place update of the prepare()-time buffer keeps its pointer
+                # stable and avoids a per-frame allocation. beta*init_noise tail
+                # is the precomputed constant self._beta_noise_tail.
+                if (
+                    self.x_t_latent_buffer is not None
+                    and self.x_t_latent_buffer.shape[0] == x_0_pred_batch.shape[0] - 1
+                ):
+                    torch.mul(
+                        self.alpha_prod_t_sqrt[1:],
+                        x_0_pred_batch[:-1],
+                        out=self.x_t_latent_buffer,
                     )
+                    if self._beta_noise_tail is not None:
+                        self.x_t_latent_buffer.add_(self._beta_noise_tail)
                 else:
-                    self.x_t_latent_buffer = (
-                        self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-                    )
+                    # Fallback for shape quirks (e.g. frame_buffer_size > 1):
+                    # preserve the original reassigning behavior exactly.
+                    if self.do_add_noise:
+                        self.x_t_latent_buffer = (
+                            self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
+                            + self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
+                        )
+                    else:
+                        self.x_t_latent_buffer = (
+                            self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
+                        )
             else:
                 x_0_pred_out = x_0_pred_batch
                 self.x_t_latent_buffer = None

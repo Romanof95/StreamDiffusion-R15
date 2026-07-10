@@ -77,9 +77,13 @@ class CannyProcessor(BasePreprocessor):
 
         input_buffer = self._input_buffer_max[:process_h, :process_w, :]
 
-        image_cpu = downscaled.permute(1, 2, 0).contiguous()
-        np.copyto(input_buffer, (image_cpu.cpu().numpy() * 255).astype(np.uint8))
-        del image_cpu
+        # Convert GPU tensor to numpy for OpenCV. Scale+cast on the GPU and do
+        # one uint8 D2H into the pre-allocated buffer (blocking: cv2.Canny
+        # reads it right after), instead of copying floats down then doing a
+        # full-res CPU multiply + astype per frame.
+        gpu_u8 = (downscaled.permute(1, 2, 0) * 255).clamp_(0, 255).to(torch.uint8)
+        torch.from_numpy(input_buffer).copy_(gpu_u8)
+        del gpu_u8
 
         edges = cv2.Canny(
             input_buffer, low_threshold, high_threshold,

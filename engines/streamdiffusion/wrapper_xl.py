@@ -393,6 +393,25 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             traceback.print_exc()
             logging.warning("Acceleration failed. Falling back to normal mode.")
 
+        # Free the orphaned original SDXL KL VAE on the PyTorch paths. After
+        # _configure_vae swapped stream.vae to TinyVAE, the full KL VAE
+        # (~160-320 MB fp16) stays resident via stream.pipe.vae but is never
+        # used at runtime. The TRT path already drops it inside
+        # enable_tensorrt_acceleration; the sfast path re-binds
+        # stream.vae = stream.pipe.vae and still needs it — so gate to
+        # none/xformers. Keep .to('cpu') (not del) so pipe.vae_scale_factor /
+        # config stay readable; pipe.device stays cuda (vae is last in the
+        # sorted signature keys, text_encoder determines device).
+        if acceleration in ("none", "xformers"):
+            orphan_vae = getattr(stream.pipe, "vae", None)
+            if orphan_vae is not None and orphan_vae is not stream.vae:
+                try:
+                    orphan_vae.to("cpu")
+                    torch.cuda.empty_cache()
+                    logging.info("[VAE] Moved orphaned original KL VAE to CPU (TinyVAE active)")
+                except Exception:
+                    pass
+
         self._setup_torch_compile_sdxl(stream, acceleration)
 
         if seed < 0:

@@ -18,6 +18,18 @@ class SimilarImageFilter:
         # a subsequent __call__ on the same frame doesn't re-roll the RNG.
         self._pending_decision = None  # None | 'skip' | 'process'
 
+    def _commit(self, x: torch.Tensor) -> None:
+        """Store ``x`` as the new prev_tensor, reusing the existing buffer when
+        shapes match (the common case between resolution changes) to avoid a
+        full-frame GPU alloc + free on every processed frame. The flattened
+        view shares storage with prev_tensor, so it stays valid after copy_
+        and only needs rebuilding when we allocate a fresh tensor."""
+        if self.prev_tensor is not None and self.prev_tensor.shape == x.shape:
+            self.prev_tensor.copy_(x)
+        else:
+            self.prev_tensor = x.detach().clone()
+            self._prev_flat = self.prev_tensor.view(-1)
+
     def decide_skip(self, x: torch.Tensor) -> bool:
         """Probe + commit the skip decision for the current frame."""
         if self.prev_tensor is None:
@@ -35,19 +47,13 @@ class SimilarImageFilter:
             skip_prob = max(0, 1 - (1 - cos_sim) / (1 - self.threshold))
 
         if skip_prob < sample:
-            old_tensor = self.prev_tensor
-            self.prev_tensor = x.detach().clone()
-            self._prev_flat = self.prev_tensor.view(-1)
-            del old_tensor
+            self._commit(x)
             self._pending_decision = 'process'
             return False
 
         if self.skip_count > self.max_skip_frame:
             self.skip_count = 0
-            old_tensor = self.prev_tensor
-            self.prev_tensor = x.detach().clone()
-            self._prev_flat = self.prev_tensor.view(-1)
-            del old_tensor
+            self._commit(x)
             self._pending_decision = 'process'
             return False
 
@@ -77,18 +83,12 @@ class SimilarImageFilter:
             skip_prob = max(0, 1 - (1 - cos_sim) / (1 - self.threshold))
 
         if skip_prob < sample:
-            old_tensor = self.prev_tensor
-            self.prev_tensor = x.detach().clone()
-            self._prev_flat = self.prev_tensor.view(-1)
-            del old_tensor
+            self._commit(x)
             return x
 
         if self.skip_count > self.max_skip_frame:
             self.skip_count = 0
-            old_tensor = self.prev_tensor
-            self.prev_tensor = x.detach().clone()
-            self._prev_flat = self.prev_tensor.view(-1)
-            del old_tensor
+            self._commit(x)
             return x
 
         self.skip_count += 1

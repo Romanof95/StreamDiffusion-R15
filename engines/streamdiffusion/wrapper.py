@@ -387,6 +387,20 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             traceback.print_exc()
             logging.warning("Acceleration failed. Falling back to normal mode.")
 
+        # Free the orphaned original SD 1.5 KL VAE on the PyTorch paths (~160 MB
+        # fp16) after the TinyVAE swap — same rationale as the SDXL wrapper. TRT
+        # drops it inside enable_tensorrt_acceleration; gate to none/xformers and
+        # skip when no swap happened (stream.vae IS pipe.vae, e.g. built-in VAE).
+        if acceleration in ("none", "xformers"):
+            orphan_vae = getattr(stream.pipe, "vae", None)
+            if orphan_vae is not None and orphan_vae is not stream.vae:
+                try:
+                    orphan_vae.to("cpu")
+                    torch.cuda.empty_cache()
+                    logging.info("[VAE] Moved orphaned original KL VAE to CPU (TinyVAE active)")
+                except Exception:
+                    pass
+
         if seed < 0:
             seed = np.random.randint(0, 1000000)
 

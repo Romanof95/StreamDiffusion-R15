@@ -232,7 +232,17 @@ class ControlNetManager:
         if getattr(app, "is_sdxl", False) and self._union_wrapper is not None:
             self._union_wrapper.set_active(self.active_keys)
             self.models_cache = [self._union_wrapper]
-            self.scales_cache = [per_name_scales]
+            # Pre-build the per-name scales as a 1-D tensor ONCE here instead
+            # of letting pipeline_xl rebuild it (torch.tensor(...) = fresh
+            # alloc + H2D copy) every frame. update_active_list re-runs on
+            # every config poll, so live slider changes still propagate within
+            # ~2 s. The pipeline's isinstance(cn_scale, torch.Tensor) branch
+            # then reuses this with zero per-frame allocation. (Union already
+            # received a tensor before — the pipeline converted the list each
+            # frame — so the wrapper sees no change.)
+            self.scales_cache = [
+                torch.tensor(per_name_scales, device=app.device, dtype=app.torch_dtype)
+            ]
         else:
             self.models_cache = [self.models[k] for k in self.active_keys]
             self.scales_cache = per_name_scales

@@ -174,12 +174,14 @@ class OpenPoseProcessor(BasePreprocessor):
 
             output_buffer = self._output_buffer_max[:, :h, :w].contiguous()
 
-            image_cpu = image_tensor.permute(1, 2, 0).contiguous()
-            image_np_temp = image_cpu.cpu().numpy()
-            np.multiply(image_np_temp, 255, out=image_np_temp)
-            image_np_uint8 = image_np_temp.astype(np.uint8)
-            np.copyto(input_buffer, image_np_uint8)
-            del image_cpu, image_np_temp, image_np_uint8
+            # Convert GPU tensor to numpy for DWPose. Scale+cast on the GPU and
+            # do a single uint8 D2H into the pre-allocated buffer, instead of
+            # copying fp16/fp32 down then doing two full-res CPU passes
+            # (multiply + astype) per frame. Blocking copy: the CPU detector
+            # reads input_buffer immediately after.
+            gpu_u8 = (image_tensor.permute(1, 2, 0) * 255).clamp_(0, 255).to(torch.uint8)
+            torch.from_numpy(input_buffer).copy_(gpu_u8)
+            del gpu_u8
 
             # Body-only for real-time performance.
             openpose_np = self._detector(

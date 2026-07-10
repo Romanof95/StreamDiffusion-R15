@@ -31,14 +31,17 @@ def _get_nn_feats(x, y, threshold=0.95):
 @torch.compiler.disable
 def _write_cache(dst, src):
     """Write to registered buffer outside the compiled graph (avoids CUDA graph errors)."""
-    dst.copy_(src.clone())
+    # copy_ alone is sufficient: it executes in the same stream order a clone
+    # would, so the .clone() added no safety — only a redundant alloc + D2D copy
+    # (~140-190 extra kernels/frame on SDXL) in the per-frame hot path.
+    dst.copy_(src)
 
 
 class StreamV2VAttnProcessor2_0:
     """Stateless attention processor; cache lives in registered buffers on the Attention module."""
 
     def __init__(self, cache_enabled=True, is_decoder_block=False,
-                 use_feature_fusion=True, ff_strength=0.95, ff_threshold=0.95):
+                 use_feature_fusion=True, ff_strength=0.8, ff_threshold=0.98):
         self._cache_enabled = cache_enabled
         self.is_decoder_block = is_decoder_block
         self.use_feature_fusion = use_feature_fusion
@@ -171,7 +174,7 @@ def _get_seq_len_for_module(unet, module_name, latent_h, latent_w):
 
 
 def enable_cached_attention(unet, cache_maxframes=1, cache_interval=1,
-                            use_feature_fusion=True, ff_strength=0.95, ff_threshold=0.95,
+                            use_feature_fusion=True, ff_strength=0.8, ff_threshold=0.98,
                             height=512, width=512, batch_size=1, device='cuda', dtype=torch.float16):
     """Install StreamV2V on a UNet with pre-allocated buffers (must run before torch.compile)."""
     attn1_modules = _get_attn1_modules(unet)
@@ -393,8 +396,8 @@ class KvoPassthroughAttnProcessor2_0:
 
     def __init__(self, name=None, is_decoder_block=False,
                  use_feature_injection=True,
-                 feature_injection_strength=0.95,
-                 feature_similarity_threshold=0.95,
+                 feature_injection_strength=0.8,
+                 feature_similarity_threshold=0.98,
                  max_frames=1):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("KvoPassthroughAttnProcessor2_0 requires PyTorch 2.0+.")
@@ -527,7 +530,7 @@ def _get_unet_attn1_modules_in_order(unet):
 
 
 def install_kvo_processors(unet, max_frames=1, use_feature_injection=True,
-                           fi_strength=0.95, fi_threshold=0.95):
+                           fi_strength=0.8, fi_threshold=0.98):
     """Install a KvoPassthroughAttnProcessor2_0 on each attn1; return the ordered list."""
     attn1_modules = _get_unet_attn1_modules_in_order(unet)
     processors = []

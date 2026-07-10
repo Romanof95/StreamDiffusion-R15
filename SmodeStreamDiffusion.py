@@ -157,8 +157,13 @@ class App:
         self.warmup_completed = False
         self.canny_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
+        # NOTE: torch.cuda.set_per_process_memory_fraction(0.95) was REMOVED.
+        # It hard-capped the caching allocator at ~15.2 GB on the 16 GB card and
+        # raised a PyTorch OOM BEFORE WDDM could oversubscribe/page — turning
+        # survivable pressure (SDXL+V2V at 1024) into a hard crash. Its comment
+        # ("reserve 5% for pinned memory") was also wrong (pinned memory is host
+        # RAM). Allocator caps stay OFF under WDDM; the driver handles fragmentation.
         if torch.cuda.is_available():
-            torch.cuda.set_per_process_memory_fraction(0.95)
             if hasattr(torch.backends.cuda, 'matmul'):
                 torch.backends.cuda.matmul.allow_tf32 = True
             if hasattr(torch.backends.cudnn, 'allow_tf32'):
@@ -179,9 +184,15 @@ class App:
                     logging.warning(f"[Engine] cleanup() raised: {e}")
                 self.engine = None
             self.stream = None
-            torch.cuda.empty_cache()
+            # gc.collect() BEFORE empty_cache(): the diffusers pipe<->components
+            # <->attn-processor graph (and _faceid_pipe_ref back-refs) holds
+            # reference cycles that only gc breaks; flushing the cache first
+            # leaves cycle-held tensors alive so their blocks aren't released
+            # before the next engine's (TRT) allocations. Matches the rest of
+            # the codebase's teardown order.
             import gc
             gc.collect()
+            torch.cuda.empty_cache()
 
         if self.acceleration == Acceleration.TENSORRT:
             acceleration_str = "tensorrt"
@@ -262,6 +273,20 @@ class App:
         elif faceid_enabled and not faceid_wrapper_loaded:
             logging.warning("[FaceID] Enabled in config but IP-Adapter failed to load in wrapper")
 
+        # Initialize modular preprocessor orchestrator (only preprocessing path).
+        # Free the PREVIOUS orchestrator first (mirrors __del__ and the FaceID
+        # cleanup above): on a recreation it owns Depth-Anything (~0.4-1.5 GB),
+        # DWPose, YOLO/SAM2 on GPU, and was previously left to deferred GC —
+        # double-resident with the freshly loaded models at the peak-VRAM moment
+        # of _create_stream.
+        if self.preprocessor_orchestrator is not None:
+            try:
+                self.preprocessor_orchestrator.cleanup()
+            except Exception as e:
+                logging.debug(f"Orchestrator cleanup error (non-critical): {e}")
+            self.preprocessor_orchestrator = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         logging.info("[Orchestrator] Initializing modular preprocessors...")
         self.preprocessor_orchestrator = PreprocessorOrchestrator(self.device, self.torch_dtype)
 
@@ -736,8 +761,21 @@ class App:
             if preview_mode == 'normal' and getattr(self, '_ssf_enabled_cached', False):
                 inner_stream = self.stream.stream
                 # Match the pipeline's normalization: (C,H,W)[0,1] -> (1,C,H,W)[-1,1].
-                ssf_input = permuted_input_texture.unsqueeze(0) * 2.0 - 1.0
-                if inner_stream.similar_filter.decide_skip(ssf_input):
+                # Reuse a persistent buffer (realloc only on resolution
+                # change) to avoid a fresh full-frame fp16 alloc + two
+                # elementwise kernels every gated frame. decide_skip copies
+                # into its own prev_tensor, so reusing this buffer is safe.
+                ssf_buf = getattr(self, '_ssf_probe_buf', None)
+                if ssf_buf is None or ssf_buf.shape[1:] != permuted_input_texture.shape:
+                    ssf_buf = torch.empty(
+                        (1,) + tuple(permuted_input_texture.shape),
+                        dtype=permuted_input_texture.dtype,
+                        device=permuted_input_texture.device,
+                    )
+                    self._ssf_probe_buf = ssf_buf
+                torch.mul(permuted_input_texture, 2.0, out=ssf_buf[0])
+                ssf_buf.sub_(1.0)
+                if inner_stream.similar_filter.decide_skip(ssf_buf):
                     self.streamDiffusionToSmodeInterProcessEvent.signal()
                     return
 

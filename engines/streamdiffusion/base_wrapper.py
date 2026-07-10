@@ -457,8 +457,22 @@ class BaseStreamDiffusionWrapper(ABC):
                 del self.feature_extractor
                 self.feature_extractor = None
 
-            torch.cuda.empty_cache()
+            # Release the FaceID pipe. FaceID forces acceleration='none', so this
+            # ref holds the FULL PyTorch UNet/VAE/TEs (~5 GB) on GPU; without
+            # nulling it here, `del self.stream` cannot break the chain and the
+            # VRAM survives cleanup() — OOM risk across wrapper recreation on a
+            # 16 GB card. image_encoder is freed transitively with the pipe.
+            if getattr(self, '_faceid_pipe_ref', None) is not None:
+                del self._faceid_pipe_ref
+            self._faceid_pipe_ref = None
+            self._faceid_loaded = False
+
+            # gc.collect() BEFORE empty_cache(): cyclic refs (pipe<->components,
+            # KvoCacheWrapper<->unet, faceid back-refs) must be collected first
+            # or their tensors stay alive through the flush. Matches the rest of
+            # the codebase's teardown order.
             gc.collect()
+            torch.cuda.empty_cache()
 
         except Exception as e:
             logging.warning(f"Error during cleanup: {e}")

@@ -19,6 +19,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 )
 
 from .image_filter import SimilarImageFilter
+from .attention_processors import update_cache_after_unet
 
 
 _SHAPE_CACHE = {}  # (height, width, scale_factor) -> (latent_h, latent_w)
@@ -477,6 +478,17 @@ class StreamDiffusionXL:
             dim=0,
         )
 
+        # PERFORMANCE: Pre-compute the constant beta*init_noise tail used by the
+        # multi-step buffer update in predict_x0_batch. init_noise is fixed after
+        # prepare() in the denoising-batch path, so this product is constant for
+        # the session and must not be recomputed every frame.
+        if self.denoising_steps_num > 1 and self.do_add_noise:
+            self._beta_noise_tail = (
+                self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
+            ).contiguous()
+        else:
+            self._beta_noise_tail = None
+
         if self.use_denoising_batch and (self.cfg_type == "self" or self.cfg_type == "initialize"):
             self.alpha_next = torch.concat(
                 [
@@ -524,6 +536,10 @@ class StreamDiffusionXL:
                     "text_embeds": pooled_prompt_embeds,
                     "time_ids": add_time_ids,
                 }
+
+        # Reset RCFG rolling noise on prompt change (flash fix, multi-step only).
+        if hasattr(self, 'stock_noise') and self.stock_noise is not None:
+            self.stock_noise.zero_()
 
         self._needs_buffer_refill = True
         if hasattr(self, 'prev_image_result'):
@@ -729,7 +745,6 @@ class StreamDiffusionXL:
                 **unet_kwargs,
             )[0]
 
-            from .attention_processors import update_cache_after_unet
             update_cache_after_unet(self.unet)
         finally:
             if down_block_res_samples is not None:
@@ -892,11 +907,12 @@ class StreamDiffusionXL:
                 self._x_t_latent_concat_buf[fb:].copy_(prev_latent_batch)
                 x_t_latent = self._x_t_latent_concat_buf
 
-                for _k in range(self.stock_noise.shape[0] // fb - 1, 0, -1):
-                    self.stock_noise[_k * fb:(_k + 1) * fb].copy_(
-                        self.stock_noise[(_k - 1) * fb:_k * fb]
-                    )
-                self.stock_noise[:fb].copy_(self.init_noise[:fb])
+                if self.cfg_type in ("self", "initialize"):
+                    for _k in range(self.stock_noise.shape[0] // fb - 1, 0, -1):
+                        self.stock_noise[_k * fb:(_k + 1) * fb].copy_(
+                            self.stock_noise[(_k - 1) * fb:_k * fb]
+                        )
+                    self.stock_noise[:fb].copy_(self.init_noise[:fb])
             x_0_pred_batch, model_pred = self.unet_step(
                 x_t_latent,
                 t_list,
@@ -908,15 +924,27 @@ class StreamDiffusionXL:
 
             if self.denoising_steps_num > 1:
                 x_0_pred_out = x_0_pred_batch[-1].unsqueeze(0)
-                if self.do_add_noise:
-                    self.x_t_latent_buffer = (
-                        self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-                        + self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
+                if (
+                    self.x_t_latent_buffer is not None
+                    and self.x_t_latent_buffer.shape[0] == x_0_pred_batch.shape[0] - 1
+                ):
+                    torch.mul(
+                        self.alpha_prod_t_sqrt[1:],
+                        x_0_pred_batch[:-1],
+                        out=self.x_t_latent_buffer,
                     )
+                    if self._beta_noise_tail is not None:
+                        self.x_t_latent_buffer.add_(self._beta_noise_tail)
                 else:
-                    self.x_t_latent_buffer = (
-                        self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-                    )
+                    if self.do_add_noise:
+                        self.x_t_latent_buffer = (
+                            self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
+                            + self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
+                        )
+                    else:
+                        self.x_t_latent_buffer = (
+                            self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
+                        )
             else:
                 x_0_pred_out = x_0_pred_batch
                 self.x_t_latent_buffer = None

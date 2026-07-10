@@ -28,6 +28,13 @@ class UNet2DConditionModelEngine:
         # Graph replay on the CN-enabled path.
         self._zero_residuals_cache = None
         self._zero_residuals_key = None
+        # Latch: once the zero DOWN residuals are copied into the engine's
+        # input buffers, they persist there between calls (the buffers are
+        # only reallocated on shape change). So on steady-state CN-disabled
+        # frames we can skip re-copying ~10 MB of zero->zero down residuals.
+        # Reset whenever the buffers/cache are (re)built or a real-residual
+        # frame overwrites the down buffers (see __call__).
+        self._zeros_staged = False
 
         # StreamV2V auto-detection. ``self.engine.tensors`` is empty until
         # ``allocate_buffers()`` runs, so probe binding names off the
@@ -56,6 +63,33 @@ class UNet2DConditionModelEngine:
                 f"cache_maxframes={self._cache_maxframes}, "
                 f"kvo_shapes={self._kvo_shapes_baked}"
             )
+
+        # Variant detection + per-variant CN residual layout tables, computed
+        # ONCE from the engine bindings (constants of the loaded engine)
+        # instead of every __call__. binding_names is already probed above and
+        # is equivalent to self.engine.tensors for membership of these ports.
+        self._has_controlnet = "down_block_0" in binding_names
+        self._is_sdxl_engine = "text_embeds" in binding_names
+        if self._has_controlnet:
+            if self._is_sdxl_engine:
+                from .models import (
+                    SDXL_CN_DOWN_CHANNELS,
+                    SDXL_CN_DOWN_SPATIAL_DIVS,
+                    SDXL_CN_NUM_DOWN,
+                    SDXL_CN_MID_CHANNELS,
+                    SDXL_CN_MID_SPATIAL_DIV,
+                )
+                self._cn_down_channels = SDXL_CN_DOWN_CHANNELS
+                self._cn_down_spatial_divs = SDXL_CN_DOWN_SPATIAL_DIVS
+                self._cn_num_down = SDXL_CN_NUM_DOWN
+                self._cn_mid_channels = SDXL_CN_MID_CHANNELS
+                self._cn_mid_div = SDXL_CN_MID_SPATIAL_DIV
+            else:
+                self._cn_down_channels = [320, 320, 320, 320, 640, 640, 640, 1280, 1280, 1280, 1280, 1280]
+                self._cn_down_spatial_divs = [1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8]
+                self._cn_num_down = 12
+                self._cn_mid_channels = 1280
+                self._cn_mid_div = 8
 
     def __call__(
         self,
@@ -94,6 +128,8 @@ class UNet2DConditionModelEngine:
             )
             self._buffers_allocated = True
             self._cached_shapes_sig = sig
+            # Fresh buffers → previously-staged zero residuals are gone.
+            self._zeros_staged = False
             # Batch changed → drop kvo cache so it re-inits at the new shape.
             if self._is_v2v:
                 self._kvo_cache = None
@@ -105,24 +141,16 @@ class UNet2DConditionModelEngine:
         }
 
         # Detect engine variant from actual binding names.
-        engine_has_controlnet = "down_block_0" in self.engine.tensors
-        engine_is_sdxl = "text_embeds" in self.engine.tensors
+        engine_has_controlnet = self._has_controlnet
+        engine_is_sdxl = self._is_sdxl_engine
 
         if engine_has_controlnet:
-            if engine_is_sdxl:
-                from .models import (
-                    SDXL_CN_DOWN_CHANNELS as down_block_channels,
-                    SDXL_CN_DOWN_SPATIAL_DIVS as down_block_spatial_divs,
-                    SDXL_CN_NUM_DOWN as num_down_blocks,
-                    SDXL_CN_MID_CHANNELS as mid_channels,
-                    SDXL_CN_MID_SPATIAL_DIV as mid_div,
-                )
-            else:
-                down_block_channels = [320, 320, 320, 320, 640, 640, 640, 1280, 1280, 1280, 1280, 1280]
-                down_block_spatial_divs = [1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8]
-                num_down_blocks = 12
-                mid_channels = 1280
-                mid_div = 8
+            # Residual layout (constants of the loaded engine) cached in __init__.
+            down_block_channels = self._cn_down_channels
+            down_block_spatial_divs = self._cn_down_spatial_divs
+            num_down_blocks = self._cn_num_down
+            mid_channels = self._cn_mid_channels
+            mid_div = self._cn_mid_div
 
             batch_size = latent_model_input.shape[0]
             latent_h = latent_model_input.shape[2]
@@ -139,6 +167,9 @@ class UNet2DConditionModelEngine:
                         dtype=latent_model_input.dtype,
                         device=latent_model_input.device
                     )
+                # Real residuals overwrote the engine's down buffers — the
+                # next CN-disabled frame must re-stage zeros into them.
+                self._zeros_staged = False
             else:
                 zero_key = (
                     batch_size, latent_h, latent_w,
@@ -162,9 +193,19 @@ class UNet2DConditionModelEngine:
                     )
                     self._zero_residuals_cache = cache
                     self._zero_residuals_key = zero_key
+                    # New zero tensors → not yet copied into engine buffers.
+                    self._zeros_staged = False
 
-                for i in range(num_down_blocks):
-                    inputs[f"down_block_{i}"] = self._zero_residuals_cache[f"down_block_{i}"]
+                # The zero DOWN residuals are identical every frame; once
+                # copied into the engine buffers they persist, so re-feed them
+                # only when not already staged (saves ~10 MB of zero->zero D2D
+                # copies/frame on steady-state CN-disabled frames). The MID
+                # port is a single cheap tensor and may occasionally carry a
+                # real residual, so always feed it for correctness.
+                if not self._zeros_staged:
+                    for i in range(num_down_blocks):
+                        inputs[f"down_block_{i}"] = self._zero_residuals_cache[f"down_block_{i}"]
+                    self._zeros_staged = True
 
                 if mid_block_additional_residual is not None:
                     inputs["mid_block"] = mid_block_additional_residual
@@ -270,7 +311,14 @@ class ControlNetEngine:
         down_block_res_samples = tuple(outputs[f"down_block_{i}"] for i in range(12))
         mid_block_res_sample = outputs["mid_block"]
 
-        if conditioning_scale != 1.0:
+        # Apply conditioning scale. The pipeline passes the scale as a cached
+        # 0-d CUDA tensor (to avoid torch.compile recompiles); evaluating
+        # `tensor != 1.0` inside an `if` would force a per-CN/frame GPU->CPU
+        # sync. Short-circuit on isinstance so a tensor scale never hits
+        # bool() — when it's a tensor we always scale (a redundant *1.0 is
+        # harmless and far cheaper than a host stall). Multiply stays
+        # out-of-place: the engine outputs are graph-owned buffers.
+        if isinstance(conditioning_scale, torch.Tensor) or conditioning_scale != 1.0:
             down_block_res_samples = tuple(sample * conditioning_scale for sample in down_block_res_samples)
             mid_block_res_sample = mid_block_res_sample * conditioning_scale
 
@@ -441,7 +489,10 @@ class AutoencoderKLEngine:
         # TRT VAE decoder does NOT clamp to [-1, 1] like torch's tanh head.
         # Without this, denormalize() in downstream image_utils produces
         # oversaturated / corrupted output.
-        images = images.clamp(-1.0, 1.0)
+        # In-place: `images` is the engine's own output buffer, consumed by
+        # denormalize() before the next decode overwrites it — equivalent to
+        # the existing buffer-reuse semantics, minus a full-image alloc/frame.
+        images.clamp_(-1.0, 1.0)
 
         return DecoderOutput(sample=images)
 

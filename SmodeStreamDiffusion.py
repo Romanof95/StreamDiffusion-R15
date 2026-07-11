@@ -518,6 +518,7 @@ class App:
                     app.controlnet_config = config_packet.controlnet_config
 
                 if not self.stream:
+                    prepare_needed = True
                     update_parameters(self, config_packet)
                     # self.apply_controlnet_config(config_packet.controlnet_config)
                     self._cache_config_values(self.controlnet_config)
@@ -540,6 +541,16 @@ class App:
                         or self.lora_dict != config_packet.lora_dict
                     )
                     update_t_index_list = self.t_index_list != config_packet.t_index_list
+                    prepare_needed = (
+                        model_has_changed
+                        or lora_dict_has_changed
+                        or update_stream
+                        or update_t_index_list
+                        or self.current_prompt != config_packet.prompt
+                        or self.negative_prompt != config_packet.negative_prompt
+                        or self.seed != config_packet.seed
+                        or self.guidance_scale != config_packet.guidance_scale
+                    )
                     previous_acceleration = self.acceleration
                     update_parameters(self, config_packet)
                     self._cache_config_values(self.controlnet_config)
@@ -580,14 +591,15 @@ class App:
 
                 if self.stream and hasattr(self.stream, 'stream'):
 
-                    self.stream.stream.prepare(
-                        self.current_prompt,
-                        self.negative_prompt,
-                        num_inference_steps=self.num_inference_steps,
-                        guidance_scale=config_packet.guidance_scale,
-                        delta=self.current_delta,
-                        seed=self.seed,
-                    )
+                    if prepare_needed:
+                        self.stream.stream.prepare(
+                            self.current_prompt,
+                            self.negative_prompt,
+                            num_inference_steps=self.num_inference_steps,
+                            guidance_scale=config_packet.guidance_scale,
+                            delta=self.current_delta,
+                            seed=self.seed,
+                        )
 
                     self._apply_live_config()
 

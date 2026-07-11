@@ -28,6 +28,8 @@ class CannyProcessor(BasePreprocessor):
 
     def load_model(self, config) -> None:
         """Canny uses OpenCV — no model to load."""
+        if self._loaded:
+            return
         self._loaded = True
         logging.info("[CannyProcessor] Ready (OpenCV Canny, no model required)")
 

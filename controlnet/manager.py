@@ -974,7 +974,7 @@ class ControlNetManager:
                 openpose_config = "thibaud/controlnet-sd21-openpose-diffusers"
                 cn_label = "SD 2.1"
             else:
-                openpose_repo, openpose_filename, openpose_config = "lllyasviel/sd-controlnet-openpose", None, None
+                openpose_repo, openpose_filename, openpose_config = "lllyasviel/control_v11p_sd15_openpose", None, None
                 cn_label = "SD 1.5"
             logging.info(f"Loading OpenPose ControlNet model ({cn_label})...")
             if openpose_filename:

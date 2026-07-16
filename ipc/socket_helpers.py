@@ -1,9 +1,12 @@
 """Socket helpers for the Smode <-> Python wire protocol."""
 from __future__ import annotations
 
+import errno
 import logging
+import select
 import socket
 import struct
+import time
 
 from .protocol import (
     ENDIAN_FORMAT,
@@ -11,12 +14,34 @@ from .protocol import (
     CommandType,
 )
 
+_WOULD_BLOCK = (getattr(errno, "EWOULDBLOCK", 11), getattr(errno, "EAGAIN", 11), 10035)
 
-def recv_all(sock: socket.socket, n: int) -> bytes:
-    """Receive exactly n bytes from the socket."""
+
+def recv_all(sock: socket.socket, n: int, must_complete: bool = False, timeout: float = 2.0) -> bytes:
+    """Receive exactly n bytes from the socket.
+
+    On a non-blocking socket, once at least one byte of a message has been
+    read (or must_complete is set), a would-block is NOT fatal: the rest is
+    in flight, so wait for it instead of dropping already-consumed bytes
+    (which would desynchronize the stream permanently)."""
     data = b""
+    deadline = None
     while len(data) < n:
-        chunk = sock.recv(n - len(data))
+        try:
+            chunk = sock.recv(n - len(data))
+        except socket.error as e:
+            if getattr(e, "errno", None) not in _WOULD_BLOCK:
+                raise
+            if not data and not must_complete:
+                raise
+            if deadline is None:
+                deadline = time.monotonic() + timeout
+            elif time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"Socket read timed out mid-message ({len(data)}/{n} bytes)"
+                )
+            select.select([sock], [], [], 0.05)
+            continue
         if not chunk:
             raise RuntimeError("Socket connection broken")
         data += chunk
@@ -32,7 +57,7 @@ def recv_message(sock: socket.socket):
             f"Invalid magic number received: {hex(magic)} (expected {hex(MAGIC_NUMBER)})"
         )
         return None, None
-    payload = recv_all(sock, size)
+    payload = recv_all(sock, size, must_complete=True)
     if len(payload) < 4:
         logging.error("Payload too short to contain command code")
         return None, None

@@ -155,6 +155,8 @@ class App:
 
         # torch.compile warmup runs once at startup, not on every prepare() call.
         self.warmup_completed = False
+        # Frame trig consumed (auto-reset event) while the stream was still loading.
+        self._pending_frame = False
         self.canny_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         # NOTE: torch.cuda.set_per_process_memory_fraction(0.95) was REMOVED.
@@ -174,6 +176,10 @@ class App:
 
     def _create_stream(self):
         send_message(self.socket, StreamCreationPacket(False))
+
+        # New stream = new UNet: warmup (and StreamV2V install) must rerun.
+        self.warmup_completed = False
+        self._streamv2v_active = False
 
         if self.stream is not None:
             logging.info(f"[Engine] Freeing previous engine...")
@@ -490,8 +496,9 @@ class App:
                         logging.warning(f"Socket receive error: {e}")
                     break
         if in_error:
-            logging.error("Socket error detected; cleaning up and exiting")
-            exit(0)
+            # Transient select() error: don't kill the process; the periodic
+            # is_socket_connected health check handles a truly dead socket.
+            logging.error("Socket reported an exceptional condition")
         return messages
 
     def _handle_pending_commands(self, messages: dict) -> bool:
@@ -670,6 +677,7 @@ class App:
                                 )]
 
                             for i in range(2):
+                                torch.compiler.cudagraph_mark_step_begin()
                                 _ = self.stream(
                                     image=dummy_input,
                                     controlnet_image=None,
@@ -709,6 +717,7 @@ class App:
                                         cn_scales.append(1.0)
 
                                 for i in range(2):
+                                    torch.compiler.cudagraph_mark_step_begin()
                                     _ = self.stream(
                                         image=dummy_input,
                                         controlnet_image=cn_images if cn_images else None,
@@ -723,9 +732,10 @@ class App:
 
                             self.warmup_completed = True
 
-                        except Exception as e:
+                        except Exception:
                             self.warmup_completed = True
-                            logging.warning(f"Warmup failed (non-critical): {type(e).__name__}: {e}")
+                            import traceback
+                            logging.error(f"Warmup failed:\n{traceback.format_exc()}")
                         finally:
                             if 'dummy_input' in locals():
                                 del dummy_input
@@ -740,6 +750,28 @@ class App:
             else:
                 logging.warning(f"Received unexpected command: {cmd}")
         return False
+
+    def _recover_from_failed_command(self):
+        # Survive a failed CONFIG (parse or load error): log it, release the host
+        # spinner, reset to a clean state so the next CONFIG can retry.
+        import traceback
+        logging.error(f"Command handling failed:\n{traceback.format_exc()}")
+        engine = getattr(self, 'engine', None)
+        if engine is not None:
+            try:
+                engine.cleanup()
+            except Exception:
+                pass
+            self.engine = None
+        self.stream = None
+        self.warmup_completed = False
+        self._streamv2v_active = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            send_message(self.socket, StreamCreationPacket(True))
+        except Exception:
+            pass
 
     def _process_frame(self, timings: dict) -> None:
         """Per-frame compute: input -> preprocess -> inference -> output -> signal."""
@@ -891,6 +923,8 @@ class App:
                 timings['generation'] = 0.0
         else:
             logging.error(f"Unknown mode: {self.mode}")
+            # Signal anyway so the host never waits forever on this frame.
+            self.streamDiffusionToSmodeInterProcessEvent.signal()
             return
 
         if x_output is not None:
@@ -939,7 +973,13 @@ class App:
                 messages = self._receive_pending_messages()
 
                 wait_result = self.smodeToStreamDiffusionInterProcessEvent.wait(EVENT_WAIT_MS)
-                if wait_result == win32event.WAIT_OBJECT_0 and self.stream:
+                frame_signaled = wait_result == win32event.WAIT_OBJECT_0
+                if frame_signaled and not self.stream:
+                    # Auto-reset event: the trig is consumed here. Remember it and
+                    # replay once the stream exists (manual/atPreload trig only once).
+                    self._pending_frame = True
+                if (frame_signaled or self._pending_frame) and self.stream:
+                    self._pending_frame = False
                     frames_received += 1
 
                     frame_start = time.time()
@@ -1020,8 +1060,11 @@ class App:
                                 smode_idle = timings['wall_clock'] - timings['total_frame']
                                 logging.info(f"  {'wall_clock':25s}: {timings['wall_clock']:6.2f}ms (frame-to-frame interval)")
                                 logging.info(f"  {'smode_idle':25s}: {smode_idle:6.2f}ms (Smode + idle time)")
-                if self._handle_pending_commands(messages):
-                    return
+                try:
+                    if self._handle_pending_commands(messages):
+                        return
+                except Exception:
+                    self._recover_from_failed_command()
         except socket.error as e:
             logging.error(f"Socket error during processing: {e}")
         except Exception as e:

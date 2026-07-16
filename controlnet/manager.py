@@ -754,6 +754,9 @@ class ControlNetManager:
             )
 
             for _ in range(2):
+                # New CUDA Graphs iteration, else iteration 2 overwrites iteration 1's
+                # graph-owned outputs (corrupts cudagraph trees; fullgraph=False/V2V).
+                torch.compiler.cudagraph_mark_step_begin()
                 _ = app.stream(
                     image=dummy_input,
                     controlnet_image=[dummy_input],

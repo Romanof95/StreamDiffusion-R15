@@ -21,3 +21,6 @@ checkpoints/
 
 # Logs
 *.log
+
+# Install status marker (runtime artifact, polled by Smode Engine)
+install_status.json

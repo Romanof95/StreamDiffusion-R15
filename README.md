@@ -72,6 +72,26 @@ python setup_venv.py
 python verify_install.py
 ```
 
+**Install status marker (for Smode Engine)**
+
+While it runs, `install.bat` writes `install_status.json` next to itself (package root) after every phase transition, so Smode Engine can poll the file and drive a status icon without parsing console output:
+
+```json
+{
+  "status": "installing",
+  "step": 2,
+  "totalSteps": 4,
+  "message": "Installing dependencies from requirements.txt"
+}
+```
+
+- `status` is one of `installing`, `success`, `failed`.
+- `step` / `totalSteps` track progress through the 5 phases (0-4: prerequisites, venv, dependencies, CUDA/Triton config, verification).
+- `message` is a short human-readable string (no quotes or parentheses).
+- The file is absent before the first install run, and is overwritten (not deleted) on every subsequent run — the last state (`success` or `failed`) persists until the next install starts.
+
+Smode Engine should treat `status == "installing"` as "show the install warning/progress icon" and `success`/`failed` as "clear it" (with `failed` optionally surfacing `message`).
+
 ## Usage
 
 This package is launched by Smode's StreamDiffusion R15 engine and communicates with it over an IPC channel (shared CUDA textures for frames, a command channel for parameters, signaling events for sync). End users do not run it directly.

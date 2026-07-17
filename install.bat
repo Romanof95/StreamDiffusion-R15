@@ -20,6 +20,11 @@ REM ============================================================================
 setlocal enabledelayedexpansion
 color 0A
 
+REM Status marker polled by Smode Engine to drive the install status icon.
+REM See :write_status at the end of this file for the JSON schema.
+set "STATUS_FILE=%~dp0install_status.json"
+call :write_status installing 0 4 "Starting installation"
+
 echo.
 echo ============================================================================
 echo  StreamDiffusion-R15 - Automatic Installation
@@ -38,6 +43,7 @@ set "PYTHON_EXE=%CD%\..\python-3_11_9\python.exe"
 
 if not exist "%PYTHON_EXE%" (
     color 0C
+    call :write_status failed 0 4 "Python 3.11.9 not found"
     echo [ERREUR] Python 3.11.9 not found:
     echo    %PYTHON_EXE%
     echo.
@@ -80,6 +86,8 @@ if "%CUDA_FOUND%"=="0" (
 )
 echo [INFO] Verification GPU detailed report will be generated at step 2 (PyTorch CUDA check).
 
+call :write_status installing 1 4 "Creating Python virtual environment"
+
 echo.
 echo ============================================================================
 echo [Etape 1/4] Creation of the Python virtual environment
@@ -104,6 +112,7 @@ echo [INFO] Creation of the virtual environment in .venv...
 "%PYTHON_EXE%" -m virtualenv --copies .venv
 if %errorlevel% neq 0 (
     color 0C
+    call :write_status failed 1 4 "Virtual environment creation failed"
     echo [ERREUR] Impossible to create the virtual environment.
     echo.
     pause
@@ -118,6 +127,7 @@ echo [INFO] Activation of the virtual environment...
 call .venv\Scripts\activate.bat
 if %errorlevel% neq 0 (
     color 0C
+    call :write_status failed 1 4 "Virtual environment activation failed"
     echo [ERREUR] Impossible to activate the virtual environment.
     echo.
     pause
@@ -131,6 +141,8 @@ echo [INFO] Mise a jour de pip...
 python -m pip install --upgrade pip --quiet
 echo [OK] pip mis a jour.
 
+call :write_status installing 2 4 "Installing dependencies from requirements.txt"
+
 echo.
 echo ============================================================================
 echo [Step 2/4] Installation of dependencies (requirements.txt)
@@ -139,6 +151,7 @@ echo.
 
 if not exist "requirements.txt" (
     color 0C
+    call :write_status failed 2 4 "requirements.txt not found"
     echo [ERREUR] The requirements.txt file is not found.
     echo Make sure you are in the correct directory.
     echo.
@@ -165,6 +178,7 @@ python -m pip install -r requirements.txt --verbose
 
 if %errorlevel% neq 0 (
     color 0C
+    call :write_status failed 2 4 "Dependency installation failed - pip install -r requirements.txt"
     echo.
     echo [ERREUR] Dependencies installation failed.
     echo.
@@ -205,6 +219,8 @@ if %errorlevel% neq 0 (
     echo [OK] PyTorch and CUDA are working correctly.
 )
 
+call :write_status installing 3 4 "Configuring CUDA binaries and Python headers"
+
 echo.
 echo ============================================================================
 echo [Step 3/4] Configuration of CUDA binaries and Python headers
@@ -227,6 +243,8 @@ if %errorlevel% neq 0 (
     echo [OK] Binaires CUDA et headers Python configures.
 )
 
+call :write_status installing 4 4 "Verifying installation"
+
 echo.
 echo ============================================================================
 echo [Step 4/4] Verification of the installation
@@ -240,6 +258,7 @@ python verify_install.py
 
 if %errorlevel% neq 0 (
     color 0C
+    call :write_status failed 4 4 "Installation verification failed"
     echo.
     echo [ERREUR] The installation test has failed.
     echo Verify the error messages above.
@@ -247,6 +266,8 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
+
+call :write_status success 4 4 "Installation completed successfully"
 
 echo.
 echo ============================================================================
@@ -276,3 +297,22 @@ color 0A
 echo.
 
 endlocal
+exit /b 0
+
+REM ============================================================================
+REM Helper: write install_status.json for Smode Engine to poll.
+REM   %1 = status  (installing / success / failed)
+REM   %2 = step    (current step index)
+REM   %3 = totalSteps
+REM   %4 = message (human-readable, must not contain " or parentheses)
+REM ============================================================================
+:write_status
+> "%STATUS_FILE%" (
+    echo {
+    echo   "status": "%~1",
+    echo   "step": %~2,
+    echo   "totalSteps": %~3,
+    echo   "message": "%~4"
+    echo }
+)
+exit /b 0

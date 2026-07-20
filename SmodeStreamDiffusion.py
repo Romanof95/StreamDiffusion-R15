@@ -57,7 +57,7 @@ import win32event
 from ipc import (
     InterProcessEvent,
     CommandType, Mode, Acceleration, ConfigType, config_type_to_str, Args,
-    Packet, FrameDataPacket, ConfigPacket, UuidPacket, StreamCreationPacket,
+    Packet, FrameDataPacket, ConfigPacket, UuidPacket, StreamCreationPacket, WarningPacket,
     _parse_config_with_cache,
     StreamDiffusionSmodeTexture,
     recv_all, recv_message, send_message, read_string, is_socket_connected,
@@ -174,6 +174,12 @@ class App:
         self._init_connection()
         self._create_tensors(3, self.width, self.height)
 
+    def _send_warning(self, active: bool, message: str = "") -> None:
+        try:
+            send_message(self.socket, WarningPacket(active, message))
+        except Exception as e:
+            logging.warning(f"[Warning] Failed to send warning packet: {e}")
+
     def _create_stream(self):
         send_message(self.socket, StreamCreationPacket(False))
 
@@ -222,6 +228,7 @@ class App:
             device=self.device,
             cache_dir=self.cache_dir,
             acceleration_str=acceleration_str,
+            warning_callback=self._send_warning,
         )
 
         self.stream = self.engine.wrapper
@@ -659,6 +666,9 @@ class App:
                                 self._streamv2v_active = True
                                 logging.info(f"[StreamV2V] Pre-installed on {count} layers before warmup")
 
+                        is_torch_compile_warmup = self.acceleration == Acceleration.TORCHCOMPILE
+                        if is_torch_compile_warmup:
+                            self._send_warning(True, "Warming up torch.compile - first frame(s) can take 1-2 minutes")
                         logging.info("Warming up torch.compile cache (U-Net + VAE)...")
                         warmup_start = time.time()
                         try:
@@ -739,6 +749,8 @@ class App:
                         finally:
                             if 'dummy_input' in locals():
                                 del dummy_input
+                            if is_torch_compile_warmup:
+                                self._send_warning(False)
                                 torch.cuda.empty_cache()
 
             elif cmd == CommandType.STOP:

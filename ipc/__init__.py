@@ -26,6 +26,7 @@ from .packets import (
     ConfigPacket,
     UuidPacket,
     StreamCreationPacket,
+    WarningPacket,
     _parse_config_with_cache,
 )
 from .texture import StreamDiffusionSmodeTexture
@@ -43,7 +44,7 @@ __all__ = [
     "config_type_to_str", "Args",
     "InterProcessEvent",
     "Packet", "FrameDataPacket", "ConfigPacket",
-    "UuidPacket", "StreamCreationPacket",
+    "UuidPacket", "StreamCreationPacket", "WarningPacket",
     "_parse_config_with_cache",
     "StreamDiffusionSmodeTexture",
     "recv_all", "recv_message", "send_message",

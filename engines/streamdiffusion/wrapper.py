@@ -386,6 +386,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         except Exception:
             traceback.print_exc()
             logging.warning("Acceleration failed. Falling back to normal mode.")
+            self._emit_warning(False)
 
         # Free the orphaned original SD 1.5 KL VAE on the PyTorch paths (~160 MB
         # fp16) after the TinyVAE swap — same rationale as the SDXL wrapper. TRT
@@ -479,7 +480,13 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             "vae_decoder.engine",
         )
 
+        needs_build = not (
+            os.path.exists(unet_path) and os.path.exists(vae_decoder_path)
+            and os.path.exists(vae_encoder_path)
+        )
+
         if not os.path.exists(unet_path):
+            self._emit_warning(True, "Building TensorRT engine (UNet) - first run can take several minutes")
             os.makedirs(os.path.dirname(unet_path), exist_ok=True)
             if v2v_on:
                 # Install kvo passthrough processors BEFORE export so the ONNX
@@ -535,6 +542,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             torch.cuda.empty_cache()
 
         if not os.path.exists(vae_decoder_path):
+            self._emit_warning(True, "Building TensorRT engine (VAE decoder) - first run can take a few minutes")
             os.makedirs(os.path.dirname(vae_decoder_path), exist_ok=True)
             stream.vae.forward = stream.vae.decode
             batch = self.batch_size if self.mode == "txt2img" else stream.frame_bff_size
@@ -545,6 +553,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             delattr(stream.vae, "forward")
 
         if not os.path.exists(vae_encoder_path):
+            self._emit_warning(True, "Building TensorRT engine (VAE encoder) - first run can take a few minutes")
             os.makedirs(os.path.dirname(vae_encoder_path), exist_ok=True)
             vae_encoder = TorchVAEEncoder(stream.vae).to(torch.device("cuda"))
             batch = self.batch_size if self.mode == "txt2img" else stream.frame_bff_size
@@ -611,3 +620,6 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             )
         except Exception:
             pass
+
+        if needs_build:
+            self._emit_warning(False)

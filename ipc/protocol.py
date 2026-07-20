@@ -21,6 +21,7 @@ class CommandType(enum.Enum):
     UUID = 5
     INPUT = 6
     STREAM_CREATION = 7
+    WARNING = 8
 
 
 class Mode(enum.IntEnum):

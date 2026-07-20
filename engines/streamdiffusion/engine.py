@@ -100,6 +100,7 @@ class StreamDiffusionEngine(BaseEngine):
             faceid_config=faceid_config,
             streamv2v_enabled=config.get("streamv2v_enabled", False),
             streamv2v_cache_maxframes=config.get("streamv2v_cache_maxframes", 1),
+            warning_callback=runtime.get("warning_callback"),
         )
 
         self._loaded = True

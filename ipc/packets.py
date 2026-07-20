@@ -399,3 +399,11 @@ class StreamCreationPacket(Packet):
     def __init__(self, finished: bool):
         payload = struct.pack(ENDIAN_FORMAT + UINT32, int(finished))
         super().__init__(CommandType.STREAM_CREATION, payload)
+
+
+class WarningPacket(Packet):
+    def __init__(self, active: bool, message: str = ""):
+        message_bytes = message.encode("utf-8")
+        payload = struct.pack(ENDIAN_FORMAT + UINT32, int(active))
+        payload += struct.pack(ENDIAN_FORMAT + UINT32, len(message_bytes)) + message_bytes
+        super().__init__(CommandType.WARNING, payload)

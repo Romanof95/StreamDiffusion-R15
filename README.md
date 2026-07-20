@@ -92,6 +92,18 @@ While it runs, `install.bat` writes `install_status.json` next to itself (packag
 
 Smode Engine should treat `status == "installing"` as "show the install warning/progress icon" and `success`/`failed` as "clear it" (with `failed` optionally surfacing `message`).
 
+**Runtime warning packet (for Smode Engine / StreamDiffusionTextureModifier)**
+
+There is no live socket connection during `install.bat`, so it uses the polled JSON file above. At runtime the Python process already holds an open socket to Smode for the duration of the node (frame data, config, `STREAM_CREATION`), so the equivalent "this is going to take a while" signal for `torch.compile()` warmup and TensorRT engine builds is pushed as a packet instead of polled.
+
+- New `CommandType.WARNING = 8`.
+- Payload: `uint32 active` (0/1) + length-prefixed UTF-8 `message` (`uint32 length` + bytes) — same layout convention as the other string fields on this wire (see `UuidPacket`).
+- Sent with `active = 1` and a human-readable message right before a slow one-time prep step starts, and with `active = 0` as soon as that step finishes or fails. It is never sent at all when the relevant engine/compile cache already exists on disk (warm start).
+- One packet per checkpoint, mirroring `install.bat`'s per-phase `write_status` calls rather than one blanket "loading" flag: e.g. `"Building TensorRT engine (UNet) - ..."`, then `"Building TensorRT engine (VAE decoder) - ..."`, then `"Building TensorRT engine (VAE encoder) - ..."` as each is actually built (skipped individually if already cached). Same idea for `torch.compile()`: U-Net, VAE encoder, VAE decoder are separate messages.
+- Multiple `WARNING` packets can arrive in sequence within one stream (re)load; treat each `active = 1` as replacing the previous message (still "busy"), not as toggling/counting independent warnings.
+- **Timing relative to `STREAM_CREATION`:** TensorRT engine builds and the `torch.compile()` wrap itself happen inside `_create_stream()`, so those `WARNING` packets land between `STREAM_CREATION(False)` and `STREAM_CREATION(True)`. But `torch.compile()` compiles lazily — the actual JIT compilation only happens on the first real forward pass, which runs in the warmup step *after* `STREAM_CREATION(True)` has already been sent. So a `WARNING(active=1, "Warming up torch.compile...")` can arrive after the node is already marked "ready." Do not assume `STREAM_CREATION(True)` implies no more `WARNING` packets are coming.
+- Smode Engine should treat `active = 1` as "show the node's warning icon" with `message` as the tooltip, and `active = 0` as "clear it" — same semantics as the install status icon, just delivered over the socket instead of a polled file.
+
 ## Usage
 
 This package is launched by Smode's StreamDiffusion R15 engine and communicates with it over an IPC channel (shared CUDA textures for frames, a command channel for parameters, signaling events for sync). End users do not run it directly.

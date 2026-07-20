@@ -4,7 +4,7 @@ import hashlib
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import logging
 import numpy as np
@@ -76,8 +76,10 @@ class BaseStreamDiffusionWrapper(ABC):
         faceid_config: Optional[Dict] = None,
         streamv2v_enabled: bool = False,
         streamv2v_cache_maxframes: int = 1,
+        warning_callback: Optional[Callable[[bool, str], None]] = None,
     ):
         self.sd_turbo = "turbo" in model_id_or_path or "sdxs" in model_id_or_path.lower()
+        self.warning_callback = warning_callback
 
         if mode == "txt2img":
             if cfg_type != "none":
@@ -366,6 +368,14 @@ class BaseStreamDiffusionWrapper(ABC):
         )
         return self.nsfw_fallback_img if has_nsfw_concept[0] else image
 
+    def _emit_warning(self, active: bool, message: str = "") -> None:
+        if self.warning_callback is None:
+            return
+        try:
+            self.warning_callback(active, message)
+        except Exception as e:
+            logging.warning(f"[Warning] warning_callback failed: {e}")
+
     def setup_torch_compile(self, stream, acceleration: str, cache_subdir: str):
         """Apply torch.compile() to UNet and VAE (shared SD/SDXL logic)."""
         if not self.torch_compile_enabled:
@@ -384,6 +394,7 @@ class BaseStreamDiffusionWrapper(ABC):
             os.environ['TORCHINDUCTOR_CACHE_DIR'] = str(cache_dir)
             logging.info(f"Compiling U-Net with torch.compile() (cache: {cache_dir})...")
 
+            self._emit_warning(True, "Compiling U-Net with torch.compile() - first run can take 1-2 minutes")
             stream.unet = torch.compile(
                 stream.unet,
                 mode=self.torch_compile_mode,
@@ -392,6 +403,7 @@ class BaseStreamDiffusionWrapper(ABC):
             )
 
             if hasattr(stream.vae, 'encoder'):
+                self._emit_warning(True, "Compiling VAE encoder with torch.compile()")
                 self._compile_vae_component(
                     stream.vae, 'encoder',
                     PACKAGE_DIR / f"torch_compile_cache/{cache_subdir}_vae_encoder",
@@ -399,6 +411,7 @@ class BaseStreamDiffusionWrapper(ABC):
                 )
 
             if hasattr(stream.vae, 'decoder'):
+                self._emit_warning(True, "Compiling VAE decoder with torch.compile()")
                 self._compile_vae_component(
                     stream.vae, 'decoder',
                     PACKAGE_DIR / f"torch_compile_cache/{cache_subdir}_vae_decoder",
@@ -407,6 +420,8 @@ class BaseStreamDiffusionWrapper(ABC):
 
         except Exception as e:
             logging.warning(f"torch.compile() failed: {e}. Continuing without compilation.")
+        finally:
+            self._emit_warning(False)
 
     def _compile_vae_component(self, vae, component_name: str, cache_dir: Path, dummy_shape: tuple):
         """Compile and warmup a VAE component (encoder or decoder)."""

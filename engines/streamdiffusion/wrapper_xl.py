@@ -392,6 +392,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         except Exception:
             traceback.print_exc()
             logging.warning("Acceleration failed. Falling back to normal mode.")
+            self._emit_warning(False)
 
         # Free the orphaned original SDXL KL VAE on the PyTorch paths. After
         # _configure_vae swapped stream.vae to TinyVAE, the full KL VAE
@@ -506,6 +507,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         if not hasattr(torch, 'compile') or torch.__version__ < '2.0':
             return
 
+        self._emit_warning(True, "Compiling with torch.compile() - first run can take 1-2 minutes")
         try:
             resolution_str = f"{self.width}x{self.height}"
             cache_dir = PACKAGE_DIR / f"torch_compile_cache/sdxl_{resolution_str}"
@@ -539,6 +541,8 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
 
         except Exception as e:
             logging.warning(f"torch.compile() failed: {e}. Continuing without compilation.")
+        finally:
+            self._emit_warning(False)
 
     def enable_tensorrt_acceleration(
         self, stream: StreamDiffusionXL, model_id_or_path: str,
@@ -592,7 +596,13 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             engine_dir, create_prefix(model_id_or_path, batch, batch), "vae_decoder.engine",
         )
 
+        needs_build = not (
+            os.path.exists(unet_path) and os.path.exists(vae_decoder_path)
+            and os.path.exists(vae_encoder_path)
+        )
+
         if not os.path.exists(unet_path):
+            self._emit_warning(True, "Building TensorRT engine (UNet) - first run can take several minutes")
             os.makedirs(os.path.dirname(unet_path), exist_ok=True)
             if v2v_on:
                 from pipeline.attention_processors import (
@@ -651,6 +661,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             torch.cuda.empty_cache()
 
         if not os.path.exists(vae_decoder_path):
+            self._emit_warning(True, "Building TensorRT engine (VAE decoder) - first run can take a few minutes")
             os.makedirs(os.path.dirname(vae_decoder_path), exist_ok=True)
             stream.vae.forward = stream.vae.decode
             vae_decoder_model = VAE(device=stream.device, max_batch_size=batch, min_batch_size=batch)
@@ -662,6 +673,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             delattr(stream.vae, "forward")
 
         if not os.path.exists(vae_encoder_path):
+            self._emit_warning(True, "Building TensorRT engine (VAE encoder) - first run can take a few minutes")
             os.makedirs(os.path.dirname(vae_encoder_path), exist_ok=True)
             vae_encoder = TorchVAEEncoder(stream.vae).to(torch.device("cuda"))
             vae_encoder_model = VAEEncoder(device=stream.device, max_batch_size=batch, min_batch_size=batch)
@@ -730,3 +742,6 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             )
         except Exception:
             pass
+
+        if needs_build:
+            self._emit_warning(False)

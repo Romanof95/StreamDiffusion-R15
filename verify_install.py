@@ -80,9 +80,9 @@ def main():
 
     print("=" * 70)
     if all_ok:
-        print("Installation completee avec succes!")
+        print("Installation completed successfully!")
     else:
-        print("Installation incomplete - verifiez les erreurs ci-dessus")
+        print("Installation incomplete - verify the errors above")
     print("=" * 70)
 
     return 0 if all_ok else 1

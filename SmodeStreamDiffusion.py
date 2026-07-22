@@ -303,9 +303,12 @@ class App:
         logging.info("[Orchestrator] Initializing modular preprocessors...")
         self.preprocessor_orchestrator = PreprocessorOrchestrator(self.device, self.torch_dtype)
 
-        self.preprocessor_orchestrator.register('canny', CannyProcessor(self.device, self.torch_dtype))
-        self.preprocessor_orchestrator.register('depth', DepthProcessor(self.device, self.torch_dtype))
-        self.preprocessor_orchestrator.register('openpose', OpenPoseProcessor(self.device, self.torch_dtype))
+        self.preprocessor_orchestrator.register('canny', CannyProcessor(
+            self.device, self.torch_dtype, warning_callback=self._send_warning))
+        self.preprocessor_orchestrator.register('depth', DepthProcessor(
+            self.device, self.torch_dtype, warning_callback=self._send_warning))
+        self.preprocessor_orchestrator.register('openpose', OpenPoseProcessor(
+            self.device, self.torch_dtype, warning_callback=self._send_warning))
 
         depth_proc = self.preprocessor_orchestrator._processors.get('depth')
         if depth_proc:

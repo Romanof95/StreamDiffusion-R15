@@ -1,7 +1,7 @@
 """Base class for preprocessors (Canny, Depth, OpenPose, FaceID)."""
 import logging
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -14,10 +14,17 @@ class BasePreprocessor(ABC):
     last result for frame-skip reuse, and handles cleanup.
     """
 
-    def __init__(self, device: torch.device, torch_dtype: torch.dtype, max_buffer_size: int = 1024):
+    def __init__(
+        self,
+        device: torch.device,
+        torch_dtype: torch.dtype,
+        max_buffer_size: int = 1024,
+        warning_callback: Optional[Callable[[bool, str], None]] = None,
+    ):
         self.device = device
         self.torch_dtype = torch_dtype
         self.max_buffer_size = max_buffer_size
+        self.warning_callback = warning_callback
         self._loaded = False
         self._cached_result: Optional[torch.Tensor] = None
 
@@ -45,6 +52,14 @@ class BasePreprocessor(ABC):
     @property
     def is_loaded(self) -> bool:
         return self._loaded
+
+    def _emit_warning(self, active: bool, message: str = "") -> None:
+        if self.warning_callback is None:
+            return
+        try:
+            self.warning_callback(active, message)
+        except Exception as e:
+            logging.warning(f"[{self.name}] warning_callback failed: {e}")
 
     def get_cached_result(self) -> Optional[torch.Tensor]:
         return self._cached_result

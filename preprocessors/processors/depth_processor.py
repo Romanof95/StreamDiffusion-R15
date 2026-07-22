@@ -23,8 +23,9 @@ class DepthProcessor(BasePreprocessor):
         'large': 'depth-anything/Depth-Anything-V2-Large-hf',
     }
 
-    def __init__(self, device: torch.device, torch_dtype: torch.dtype, max_buffer_size: int = 1024):
-        super().__init__(device, torch_dtype, max_buffer_size)
+    def __init__(self, device: torch.device, torch_dtype: torch.dtype, max_buffer_size: int = 1024,
+                 warning_callback=None):
+        super().__init__(device, torch_dtype, max_buffer_size, warning_callback)
         self._model = None
         self._processor = None
         self._current_model_size: Optional[str] = None
@@ -83,6 +84,7 @@ class DepthProcessor(BasePreprocessor):
                 f"reloading TRT engine."
             )
 
+        self._emit_warning(True, f"Loading Depth-Anything V2 {model_size.upper()} model - first run can take a while (downloading + loading weights)...")
         try:
             from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
@@ -134,6 +136,8 @@ class DepthProcessor(BasePreprocessor):
             self._current_model_size = None
             self._loaded = False
             torch.cuda.empty_cache()
+        finally:
+            self._emit_warning(False)
 
     def unload_model(self) -> None:
         if self._model is not None:

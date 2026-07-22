@@ -194,6 +194,16 @@ class ControlNetManager:
         self._union_model = None
         self._union_wrapper: "UnionControlNetWrapper" = None
 
+    def _emit_warning(self, active: bool, message: str = "") -> None:
+        app = self._app
+        send_warning = getattr(app, "_send_warning", None) if app is not None else None
+        if send_warning is None:
+            return
+        try:
+            send_warning(active, message)
+        except Exception as e:
+            logging.warning(f"[ControlNet] warning_callback failed: {e}")
+
     # ---- Hot-path cache rebuild -----------------------------------------
 
     def is_union_mode(self) -> bool:
@@ -284,6 +294,11 @@ class ControlNetManager:
 
             logging.info(f"Compiling {controlnet_name} ControlNet with torch.compile()...")
             logging.info(f"  Cache directory: {controlnet_cache_dir}")
+            self._emit_warning(
+                True,
+                f"Compiling {controlnet_name} ControlNet with torch.compile() "
+                f"- first run can take 1-2 minutes",
+            )
 
             try:
                 compiled_model = torch.compile(
@@ -464,6 +479,11 @@ class ControlNetManager:
             )
             return model
 
+        self._emit_warning(
+            True,
+            f"Building TensorRT engine for {controlnet_name} ControlNet "
+            f"- one-time, ~1-3 min",
+        )
         try:
             engine_path = self._trt_engine_path(controlnet_name)
             os.makedirs(os.path.dirname(engine_path), exist_ok=True)
@@ -674,9 +694,14 @@ class ControlNetManager:
             )
             return model
 
+        model_size = self._depth_anything_model_size(model)
+        image_size = self._depth_anything_image_size()
+        self._emit_warning(
+            True,
+            f"Building TensorRT engine for Depth-Anything V2 {model_size.upper()} "
+            f"@ {image_size}x{image_size} - one-time, ~3-5 min",
+        )
         try:
-            model_size = self._depth_anything_model_size(model)
-            image_size = self._depth_anything_image_size()
             engine_path = self._depth_anything_trt_engine_path(model_size, image_size)
             os.makedirs(os.path.dirname(engine_path), exist_ok=True)
 
@@ -743,6 +768,11 @@ class ControlNetManager:
             return
 
         dummy_input = None
+        self._emit_warning(
+            True,
+            f"Warming up U-Net+{controlnet_name} integration "
+            f"- first run can take 1-2 minutes",
+        )
         try:
             logging.info(f"Warming up U-Net+{controlnet_name} integration...")
             warmup_start = time.time()
@@ -781,6 +811,11 @@ class ControlNetManager:
         """Ensure SDXL Union model is loaded and registered for this preprocessor."""
         app = self._app
         if self._union_model is None:
+            self._emit_warning(
+                True,
+                "Loading SDXL Union ControlNet (xinsir/controlnet-union-sdxl-1.0, "
+                "~2.5 GB) - first run can take a while (downloading + loading weights)...",
+            )
             try:
                 from diffusers import ControlNetUnionModel
                 logging.info(
@@ -845,6 +880,8 @@ class ControlNetManager:
                 self._union_wrapper = None
                 app.controlnet_config[f'{preprocessor_name}_enabled'] = False
                 return
+            finally:
+                self._emit_warning(False)
 
         # Multiple preprocessor names point to the same wrapper — intentional;
         # load_models() uses ``name in self.models`` for tracking.
@@ -879,6 +916,7 @@ class ControlNetManager:
                 canny_config = "lllyasviel/sd-controlnet-canny"
                 cn_label = "SD 1.5 ControlNet++"
             logging.info(f"Loading Canny ControlNet model ({cn_label})...")
+            self._emit_warning(True, f"Loading Canny ControlNet model ({cn_label})...")
             if canny_filename:
                 from huggingface_hub import hf_hub_download
                 canny_path = hf_hub_download(repo_id=canny_repo, filename=canny_filename)
@@ -902,6 +940,8 @@ class ControlNetManager:
                 del self.models['canny']
             torch.cuda.empty_cache()
             app.controlnet_config['canny_enabled'] = False
+        finally:
+            self._emit_warning(False)
 
     def _load_depth(self) -> None:
         app = self._app
@@ -930,6 +970,7 @@ class ControlNetManager:
                 depth_config = "lllyasviel/sd-controlnet-depth"
                 cn_label = "SD 1.5 ControlNet++"
             logging.info(f"Loading Depth ControlNet model ({cn_label})...")
+            self._emit_warning(True, f"Loading Depth ControlNet model ({cn_label})...")
             if depth_filename:
                 from huggingface_hub import hf_hub_download
                 depth_path = hf_hub_download(repo_id=depth_repo, filename=depth_filename)
@@ -953,6 +994,8 @@ class ControlNetManager:
                 del self.models['depth']
             torch.cuda.empty_cache()
             app.controlnet_config['depth_enabled'] = False
+        finally:
+            self._emit_warning(False)
 
     def _load_openpose(self) -> None:
         app = self._app
@@ -977,6 +1020,7 @@ class ControlNetManager:
                 openpose_repo, openpose_filename, openpose_config = "lllyasviel/control_v11p_sd15_openpose", None, None
                 cn_label = "SD 1.5"
             logging.info(f"Loading OpenPose ControlNet model ({cn_label})...")
+            self._emit_warning(True, f"Loading OpenPose ControlNet model ({cn_label})...")
             if openpose_filename:
                 from huggingface_hub import hf_hub_download
                 openpose_path = hf_hub_download(repo_id=openpose_repo, filename=openpose_filename)
@@ -1000,6 +1044,8 @@ class ControlNetManager:
                 del self.models['openpose']
             torch.cuda.empty_cache()
             app.controlnet_config['openpose_enabled'] = False
+        finally:
+            self._emit_warning(False)
 
     # ---- Load / unload models per config --------------------------------
 

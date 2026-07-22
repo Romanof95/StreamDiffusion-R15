@@ -16,8 +16,9 @@ class CannyProcessor(BasePreprocessor):
     NEAREST to preserve sharp binary edges. Uses OpenCV — no ML model.
     """
 
-    def __init__(self, device: torch.device, torch_dtype: torch.dtype, max_buffer_size: int = 1024):
-        super().__init__(device, torch_dtype, max_buffer_size)
+    def __init__(self, device: torch.device, torch_dtype: torch.dtype, max_buffer_size: int = 1024,
+                 warning_callback=None):
+        super().__init__(device, torch_dtype, max_buffer_size, warning_callback)
         self._input_buffer_max: Optional[np.ndarray] = None
         self._output_buffer: Optional[torch.Tensor] = None
         self._output_buffer_shape: Optional[tuple] = None
@@ -30,8 +31,12 @@ class CannyProcessor(BasePreprocessor):
         """Canny uses OpenCV — no model to load."""
         if self._loaded:
             return
-        self._loaded = True
-        logging.info("[CannyProcessor] Ready (OpenCV Canny, no model required)")
+        self._emit_warning(True, "Preparing Canny preprocessor...")
+        try:
+            self._loaded = True
+            logging.info("[CannyProcessor] Ready (OpenCV Canny, no model required)")
+        finally:
+            self._emit_warning(False)
 
     def unload_model(self) -> None:
         self._input_buffer_max = None

@@ -189,8 +189,9 @@ class OptimizedDWposeDetector:
 class OpenPoseProcessor(BasePreprocessor):
     """DWPose human pose detection preprocessor (YOLOX-S + DWPose-M)."""
 
-    def __init__(self, device: torch.device, torch_dtype: torch.dtype, max_buffer_size: int = 1024):
-        super().__init__(device, torch_dtype, max_buffer_size)
+    def __init__(self, device: torch.device, torch_dtype: torch.dtype, max_buffer_size: int = 1024,
+                 warning_callback=None):
+        super().__init__(device, torch_dtype, max_buffer_size, warning_callback)
         self._detector: Optional[OptimizedDWposeDetector] = None
         self._input_buffer_max: Optional[np.ndarray] = None
         self._output_buffer_max: Optional[torch.Tensor] = None
@@ -205,6 +206,7 @@ class OpenPoseProcessor(BasePreprocessor):
         if self._detector is not None:
             return
 
+        self._emit_warning(True, "Loading DWPose preprocessor (YOLOX-S + DWPose-LL-384) - first run can take a while (downloading + loading weights)...")
         try:
             from huggingface_hub import hf_hub_download
             from easy_dwpose.body_estimation import Wholebody
@@ -234,6 +236,8 @@ class OpenPoseProcessor(BasePreprocessor):
             self._detector = None
             self._loaded = False
             torch.cuda.empty_cache()
+        finally:
+            self._emit_warning(False)
 
     def unload_model(self) -> None:
         if self._detector is not None:

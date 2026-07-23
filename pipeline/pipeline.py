@@ -952,19 +952,13 @@ class StreamDiffusion:
 
     @torch.no_grad()
     def txt2img(self, batch_size: int = 1) -> torch.Tensor:
-        x_0_pred_out = self.predict_x0_batch(
-            torch.randn((batch_size, 4, self.latent_height, self.latent_width)).to(
-                device=self.device, dtype=self.dtype
-            )
-        )
+        # Reuse seeded init_noise -> stable reproducible image (no per-frame flicker).
+        x_0_pred_out = self.predict_x0_batch(self.init_noise[:batch_size].clone())
         return self.decode_image(x_0_pred_out).detach()
 
     def txt2img_sd_turbo(self, batch_size: int = 1) -> torch.Tensor:
-        x_t_latent = torch.randn(
-            (batch_size, 4, self.latent_height, self.latent_width),
-            device=self.device,
-            dtype=self.dtype,
-        )
+        # Reuse seeded init_noise -> stable reproducible image (no per-frame flicker).
+        x_t_latent = self.init_noise[:batch_size]
         model_pred = self.unet(
             x_t_latent,
             self.sub_timesteps_tensor,

@@ -524,7 +524,8 @@ class App:
                     app.seed = config_packet.seed
                     app.width = config_packet.width
                     app.height = config_packet.height
-                    app.t_index_list = config_packet.t_index_list
+                    # Guard against an empty / out-of-range timestep list (host bug) so the scheduler can't crash.
+                    app.t_index_list = [t for t in config_packet.t_index_list if 0 <= t < 50] or [1]
                     app.guidance_scale = config_packet.guidance_scale
                     app.mode = config_packet.mode
                     app.cfg_type = config_packet.cfg_type

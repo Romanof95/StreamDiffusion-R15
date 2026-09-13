@@ -10,12 +10,14 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, TYPE_CHECKING
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 import torch
 from diffusers import ControlNetModel
 
 from ipc import Acceleration
+from pipeline.acceleration.engine_cache import engine_ready
+from pipeline.acceleration.quantization import normalize_precision, precision_suffix, quantization_available
 
 # xinsir/controlnet-union-sdxl-1.0 control-type indices. Order is fixed by
 # the model's training schedule; do not reorder. The control_add_embedding
@@ -55,6 +57,9 @@ class UnionControlNetWrapper:
     def __init__(self, union_model, active_names: List[str], app: "App"):
         self._model = union_model
         self._app = app
+        # TRT engines keyed by ordered control_type_idx tuple (see
+        # ControlNetManager._ensure_union_trt_engine). Empty = PyTorch path.
+        self._trt_engines = {}
         self.set_active(active_names)
         self._control_type_tensor = None
         self._control_type_tensor_key = None
@@ -156,6 +161,31 @@ class UnionControlNetWrapper:
                 list(conditioning_scale), device=sample.device, dtype=sample.dtype
             )
 
+        engine = self._trt_engines.get(tuple(self.control_type_idx)) if self._trt_engines else None
+        if engine is not None:
+            if added_cond_kwargs is None:
+                raise ValueError(
+                    "UnionControlNetWrapper (TRT): added_cond_kwargs with text_embeds/time_ids required"
+                )
+            down, mid = engine(
+                sample, timestep, encoder_hidden_states, controlnet_cond, ct,
+                conditioning_scale,
+                added_cond_kwargs["text_embeds"], added_cond_kwargs["time_ids"],
+            )
+            if not return_dict:
+                return (down, mid)
+            from diffusers.models.controlnets.controlnet import ControlNetOutput
+            return ControlNetOutput(down_block_res_samples=down, mid_block_res_sample=mid)
+        # PyTorch path -- bring the model back if it was offloaded after a TRT build.
+        try:
+            if next(self._model.parameters()).device != sample.device:
+                logging.info(
+                    "[Union CN] Moving PyTorch Union model back to GPU "
+                    "(no TRT engine for control types %s)", self.active_names,
+                )
+                self._model.to(sample.device)
+        except StopIteration:
+            pass
         result = self._model(
             sample=sample,
             timestep=timestep,
@@ -193,6 +223,8 @@ class ControlNetManager:
         # SDXL Union ProMax — lazy-loaded, shared across canny/depth/openpose.
         self._union_model = None
         self._union_wrapper: "UnionControlNetWrapper" = None
+        # Control-type tuples whose Union TRT build failed (stay on PyTorch).
+        self._union_trt_failed = set()
 
     def _emit_warning(self, active: bool, message: str = "") -> None:
         app = self._app
@@ -241,6 +273,7 @@ class ControlNetManager:
 
         if getattr(app, "is_sdxl", False) and self._union_wrapper is not None:
             self._union_wrapper.set_active(self.active_keys)
+            self._ensure_union_trt_engine()
             self.models_cache = [self._union_wrapper]
             # Pre-build the per-name scales as a 1-D tensor ONCE here instead
             # of letting pipeline_xl rebuild it (torch.tensor(...) = fresh
@@ -391,6 +424,248 @@ class ControlNetManager:
         )
         return str(engine_dir / "controlnet.engine")
 
+    # ---- SDXL Union ControlNet TensorRT path -----------------------------
+
+    def _union_trt_engine_path(self, control_type_idx, precision: Optional[str] = None):
+        """Engine path for the SDXL Union ControlNet, keyed by the ordered
+        control-type tuple (baked at export), batch, resolution and precision
+        (``precision`` overrides the configured one, e.g. the fp16 fallback).
+
+        Returns None when TRT is off, not SDXL, or the UNet TRT engine is not
+        ready. Layout:
+        tensorrt_cache/sdxl/controlnet/union/<model>--types-T--bs-N--res-HxW/controlnet.engine
+        """
+        app = self._app
+        if app.acceleration != Acceleration.TENSORRT:
+            return None
+        if not getattr(app, "is_sdxl", False):
+            return None
+        stream_obj = getattr(app.stream, "stream", None)
+        if (stream_obj is None
+                or not hasattr(stream_obj, "unet")
+                or not hasattr(stream_obj.unet, "stream")):
+            return None
+        batch = stream_obj.trt_unet_batch_size
+        res_h = getattr(app, "height", 1024)
+        res_w = getattr(app, "width", 1024)
+        types = "-".join(str(i) for i in control_type_idx)
+        engine_dir = (
+            PACKAGE_DIR / "tensorrt_cache" / "sdxl" / "controlnet" / "union"
+            / f"xinsir_controlnet-union-sdxl-1.0--types-{types}--bs-{batch}--res-{res_h}x{res_w}{precision_suffix(precision or self._union_precision())}"
+        )
+        return str(engine_dir / "controlnet.engine")
+
+    def _union_precision(self) -> str:
+        """Engine precision for the Union ControlNet: the pipeline's `precision` setting
+        (fp16 | mxfp8 | nvfp4); fp16 when the quantization tooling is unavailable."""
+        try:
+            prec = normalize_precision(self._app.controlnet_config.get("precision", "fp16"))
+        except Exception:
+            return "fp16"
+        if prec == "fp16" or not quantization_available():
+            return "fp16"
+        return prec
+
+    def _make_union_calibration_loop(self, names: List[str], control_type_idx, batch: int,
+                                     n_images: int = 12):
+        """NVFP4 calibration of the Union ControlNet on the production data path: frames
+        generated by the live pipeline (current prompt, varied noise) go through the real
+        preprocessors, and the ControlNet copy is fed those control maps together with the
+        pipeline's noisy latent, prompt embeddings and timestep. Runs under no_grad (not
+        inference_mode) like the UNet calibration: the pipeline allocates state during
+        these passes that it later updates in place."""
+        app = self._app
+        stream = app.stream.stream
+        orchestrator = app.preprocessor_orchestrator
+        cfg = app.controlnet_config
+        from pipeline.acceleration.tensorrt import TorchControlNetUnionWrapper
+
+        def forward_loop(model_q):
+            wrapper = TorchControlNetUnionWrapper(model_q, control_type_idx)
+            device, dtype = stream.device, stream.dtype
+            gen = torch.Generator(device=device).manual_seed(1234)
+            ct = torch.zeros(batch, UNION_NUM_TYPES, device=device, dtype=dtype)
+            for i in control_type_idx:
+                ct[:, int(i)] = 1
+            scale = torch.ones(len(control_type_idx), device=device, dtype=dtype)
+            procs = []
+            for name in names:
+                proc = orchestrator._processors.get(name) if orchestrator is not None else None
+                if proc is None:
+                    raise RuntimeError(f"no preprocessor registered for '{name}'")
+                sub = getattr(cfg, name, cfg)
+                if not proc.is_loaded:
+                    # update_active_list runs before the orchestrator loads the new processor.
+                    proc.load_model(sub)
+                procs.append((name, proc, sub))
+            n = 0
+            with torch.no_grad():
+                for _ in range(n_images):
+                    noise = torch.randn(stream.init_noise[:1].shape, generator=gen,
+                                        device=device, dtype=stream.init_noise.dtype)
+                    img = stream.decode_image(stream.predict_x0_batch(noise))  # (1,3,H,W) in [-1,1]
+                    frame = (img[0].to(dtype) / 2 + 0.5).clamp(0, 1)  # (3,H,W) [0,1]: the IPC frame format
+                    conds = []
+                    for name, proc, sub in procs:
+                        c = proc.process(frame, sub)
+                        if c is None:
+                            raise RuntimeError(f"preprocessor '{name}' returned no control map")
+                        c = c.detach().clone()  # processors reuse their output buffers
+                        if c.dim() == 3:
+                            c = c.unsqueeze(0)
+                        conds.append(c.to(device=device, dtype=dtype).expand(batch, -1, -1, -1).contiguous())
+                    x_t = stream.encode_image(img.to(dtype)).expand(batch, -1, -1, -1).contiguous()
+                    t = stream.sub_timesteps_tensor.reshape(-1)[:1].expand(batch)
+                    ehs = stream.prompt_embeds[:1].expand(batch, -1, -1)
+                    te = stream.added_cond_kwargs["text_embeds"][:1].expand(batch, -1)
+                    ti = stream.added_cond_kwargs["time_ids"][:1].expand(batch, -1)
+                    wrapper(x_t, t, ehs, te, ti, ct, scale, *conds)
+                    n += 1
+            logging.info(f"[Union TRT] NVFP4 calibration: {n} ControlNet passes on generated frames {names}")
+        return forward_loop
+
+    def _ensure_union_trt_engine(self) -> None:
+        """Load (cache hit) or build the TRT engine for the Union wrapper's
+        current control-type tuple. No-op when TRT is off, the engine is
+        already registered, or a previous attempt failed for this tuple
+        (PyTorch fallback stays active). Called from update_active_list, so
+        it must stay cheap once resolved (dict/set lookups only).
+        """
+        wrapper = self._union_wrapper
+        if wrapper is None or self._union_model is None:
+            return
+        idx = tuple(wrapper.control_type_idx)
+        if not idx or idx in wrapper._trt_engines or idx in self._union_trt_failed:
+            return
+        engine_path = self._union_trt_engine_path(idx)
+        if engine_path is None:
+            return
+        app = self._app
+        try:
+            from pipeline.acceleration.tensorrt import compile_controlnet_union
+            from pipeline.acceleration.tensorrt.engine import ControlNetUnionEngine
+            from pipeline.acceleration.tensorrt.models import ControlNetUnion as ControlNetUnionONNX
+        except Exception as e:
+            logging.warning(f"[Union TRT] TensorRT module unavailable ({e}); keeping PyTorch Union.")
+            self._union_trt_failed.add(idx)
+            return
+
+        stream_obj = app.stream.stream
+        cuda_stream = stream_obj.unet.stream
+        batch = stream_obj.trt_unet_batch_size
+        res_h = getattr(app, "height", 1024)
+        res_w = getattr(app, "width", 1024)
+        names = list(wrapper.active_names)
+
+        try:
+            if engine_ready(engine_path):
+                size_mb = os.path.getsize(engine_path) // (1024 * 1024)
+                logging.info(
+                    f"[Union TRT] Loading cached engine for {names} ({size_mb} MB): {engine_path}"
+                )
+            else:
+                self._emit_warning(
+                    True,
+                    f"Building TensorRT engine for SDXL Union ControlNet {names} "
+                    f"- one-time, ~5-10 min",
+                )
+                logging.info(
+                    f"[Union TRT] Building engine for {names} "
+                    f"(types={idx}, bs={batch}, res={res_h}x{res_w})"
+                )
+                logging.info(f"  Engine path: {engine_path}")
+                os.makedirs(os.path.dirname(engine_path), exist_ok=True)
+                model = self._union_model
+                # If the Union was torch.compile'd (acceleration switched to TRT
+                # after load), export the underlying eager module.
+                model = getattr(model, "_orig_mod", model)
+                if next(model.parameters()).device.type != "cuda":
+                    model.to(app.device)
+                onnx_model = ControlNetUnionONNX(
+                    idx, fp16=True, device=app.device,
+                    max_batch_size=batch, min_batch_size=batch,
+                    embedding_dim=model.config.cross_attention_dim,
+                    unet_dim=model.config.in_channels,
+                    num_control_types=UNION_NUM_TYPES,
+                )
+                t0 = time.time()
+                union_prec = self._union_precision()
+                if union_prec != "fp16":
+                    # Quantize a copy so the PyTorch fallback stays fast if the build fails.
+                    import copy, gc
+                    from pipeline.acceleration.quantization import quantize_model
+                    from pipeline.acceleration.tensorrt import compile_controlnet_union_quantized
+                    logging.info(f"[Union TRT] {union_prec} engine (Linear layers quantized)")
+                    model_q = copy.deepcopy(model)
+                    # Free VRAM for the TensorRT build: the original stays the PyTorch fallback
+                    # and comes back to the GPU only if the build fails.
+                    try:
+                        model.to("cpu")
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    try:
+                        calib = (self._make_union_calibration_loop(names, idx, batch)
+                                 if union_prec == "nvfp4" else None)
+                        quantize_model(model_q, union_prec, calib)
+                        compile_controlnet_union_quantized(
+                            model_q, onnx_model, engine_path + ".onnx", engine_path,
+                            opt_batch_size=batch, opt_image_height=res_h, opt_image_width=res_w,
+                            precision=union_prec,
+                        )
+                    except Exception as e:
+                        # Same policy as the UNet: a failed quantized build falls back to the
+                        # fp16 engine (built below if missing), never to the PyTorch Union.
+                        logging.error(f"[Union TRT] {union_prec} engine failed "
+                                      f"({type(e).__name__}: {e}); falling back to the fp16 engine")
+                        union_prec = "fp16"
+                        engine_path = self._union_trt_engine_path(idx, precision="fp16")
+                        os.makedirs(os.path.dirname(engine_path), exist_ok=True)
+                    finally:
+                        del model_q
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                if union_prec == "fp16" and not engine_ready(engine_path):
+                    if next(model.parameters()).device.type != "cuda":
+                        model.to(app.device)
+                    compile_controlnet_union(
+                        model, onnx_model,
+                        engine_path + ".onnx",
+                        engine_path + ".opt.onnx",
+                        engine_path,
+                        opt_batch_size=batch,
+                        opt_image_height=res_h,
+                        opt_image_width=res_w,
+                    )
+                logging.info(f"[Union TRT] Engine built for {names} in {time.time() - t0:.0f}s")
+
+            engine = ControlNetUnionEngine(engine_path, cuda_stream, idx, use_cuda_graph=True)
+            wrapper._trt_engines[idx] = engine
+            # Free the ~2.5 GB PyTorch Union from VRAM. The wrapper moves it
+            # back on demand (fallback) and the next tuple build re-uploads it.
+            try:
+                self._union_model.to("cpu")
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            logging.info(
+                f"[Union TRT] Engine active for {names} (CUDA graph); "
+                f"PyTorch Union offloaded to CPU."
+            )
+        except Exception as e:
+            logging.warning(
+                f"[Union TRT] Build/load failed for {names} ({e}); falling back to PyTorch Union."
+            )
+            import traceback
+            logging.debug(traceback.format_exc())
+            self._union_trt_failed.add(idx)
+            try:
+                self._union_model.to(app.device)
+            except Exception:
+                pass
+        finally:
+            self._emit_warning(False)
+
     def _try_load_cached_trt(self, controlnet_name: str):
         """Load a cached TRT engine for this ControlNet if it exists.
 
@@ -408,7 +683,7 @@ class ControlNetManager:
                 f"unet_has_stream={hasattr(getattr(stream_obj, 'unet', None), 'stream') if stream_obj else False})"
             )
             return None
-        if not os.path.exists(engine_path):
+        if not engine_ready(engine_path):
             logging.info(
                 f"[ControlNet TRT] No cached engine on disk for {controlnet_name} "
                 f"(expected at: {engine_path})"
@@ -554,7 +829,7 @@ class ControlNetManager:
         """
         image_size = round_to_vit_patch(int(target_resolution))
         engine_path = self._depth_anything_trt_engine_path(model_size, image_size)
-        if engine_path is None or not os.path.exists(engine_path):
+        if engine_path is None or not engine_ready(engine_path):
             return None
         try:
             from pipeline.acceleration.tensorrt.engine import DepthAnythingEngine
@@ -623,7 +898,7 @@ class ControlNetManager:
         engine_path = self._depth_anything_trt_engine_path(model_size, image_size)
         if engine_path is None:
             return None
-        if not os.path.exists(engine_path):
+        if not engine_ready(engine_path):
             return None
         try:
             from pipeline.acceleration.tensorrt.engine import DepthAnythingEngine
@@ -831,7 +1106,16 @@ class ControlNetManager:
                 ).to(app.device)
                 self._union_model.eval()
 
-                if (app.controlnet_config.get('torch_compile_enabled', True)
+                logging.info(f"[Union] acceleration at load: {app.acceleration!r}")
+                if app.acceleration == Acceleration.TENSORRT:
+                    # TRT path: the Union gets its own engine per control-type
+                    # tuple (see _ensure_union_trt_engine); keep the PyTorch
+                    # model eager as the build-time / fallback path.
+                    logging.info(
+                        "[Union] TensorRT acceleration active - skipping torch.compile, "
+                        "a TRT engine is built per control-type set."
+                    )
+                elif (app.controlnet_config.get('torch_compile_enabled', True)
                         and hasattr(torch, 'compile')):
                     # Save/restore env so other compile sites don't pollute
                     # the Union FX graph cache.
@@ -1012,10 +1296,12 @@ class ControlNetManager:
 
         try:
             if app.is_sd2:
+                # v2 weights: markedly better body fidelity than v1. Both are
+                # body-only trained — hand/face keypoints read as extra limbs.
                 openpose_repo = "thibaud/controlnet-sd21"
-                openpose_filename = "control_v11p_sd21_openpose.safetensors"
+                openpose_filename = "control_v11p_sd21_openposev2.safetensors"
                 openpose_config = "thibaud/controlnet-sd21-openpose-diffusers"
-                cn_label = "SD 2.1"
+                cn_label = "SD 2.1 (openpose v2)"
             else:
                 openpose_repo, openpose_filename, openpose_config = "lllyasviel/control_v11p_sd15_openpose", None, None
                 cn_label = "SD 1.5"

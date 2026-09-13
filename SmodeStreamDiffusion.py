@@ -54,6 +54,8 @@ from diffusers import ControlNetModel
 from controlnet import ControlNetManager
 import win32event
 
+import struct
+
 from ipc import (
     InterProcessEvent,
     CommandType, Mode, Acceleration, ConfigType, config_type_to_str, Args,
@@ -61,6 +63,7 @@ from ipc import (
     _parse_config_with_cache,
     StreamDiffusionSmodeTexture,
     recv_all, recv_message, send_message, read_string, is_socket_connected,
+    MAGIC_NUMBER, ENDIAN_FORMAT,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -72,6 +75,7 @@ class App:
         self.stream = None
         self.cache_dir = None
         self.socket = None
+        self._rx_buffer = b""
         self.streamDiffusionToSmodeInterProcessEvent = None
         self.smodeToStreamDiffusionInterProcessEvent = None
 
@@ -242,6 +246,9 @@ class App:
             hasattr(self.stream, "stream")
             and hasattr(self.stream.stream, "last_internal_timings")
         )
+        # Propagate the config's profiling flag to the pipeline (CUDA-event breakdown).
+        if self._stream_has_internal_timings:
+            self.stream.stream.enable_profiling = bool(getattr(self, "_cached_profiling_enabled", False))
         _inner = getattr(self.stream, "stream", None)
         self._ssf_enabled_cached = (
             _inner is not None
@@ -443,6 +450,9 @@ class App:
         self._cached_openpose_scale = config.openpose.scale
 
         self._cached_profiling_enabled = config.profiling_enabled
+        _inner = getattr(getattr(self, "stream", None), "stream", None)
+        if _inner is not None and hasattr(_inner, "enable_profiling"):
+            _inner.enable_profiling = bool(config.profiling_enabled)
         self._cached_preview_mode = config.controlnet.preview_mode
 
         self._cached_controlnet_enabled = config.controlnet.enabled
@@ -450,6 +460,13 @@ class App:
         self._cached_depth_enabled = config.depth.enabled
         self._cached_openpose_enabled = config.openpose.enabled
 
+        if config.controlnet.skip_frames != getattr(self, "_cached_controlnet_skip_frames", None):
+            logging.info(
+                f"[ControlNet] skip_frames={config.controlnet.skip_frames} "
+                f"(control maps + residual reuse every {config.controlnet.skip_frames} frames)"
+                if config.controlnet.skip_frames > 1 else
+                f"[ControlNet] skip_frames={config.controlnet.skip_frames} (ControlNet runs every frame)"
+            )
         self._cached_controlnet_skip_frames = config.controlnet.skip_frames
         self._cached_controlnet_guidance_strength = config.controlnet.guidance_strength
 
@@ -487,28 +504,47 @@ class App:
                 delattr(inner, '_guidance_strength_logged')
 
     def _receive_pending_messages(self) -> dict:
-        """Drain any pending control messages from the Smode socket (non-blocking)."""
+        """Drain pending control messages; never blocks, partial messages stay buffered."""
         messages = {}
-        ready_to_read, _, in_error = select.select(
-            [self.socket], [], [], 0
-        )
-        logging.debug(f"socket ready = {bool(ready_to_read)}")
-        if ready_to_read:
-            while True:
-                try:
-                    cmd, payload = recv_message(self.socket)
-                    if cmd is None:
-                        break
-                    messages[cmd] = payload
-                except socket.error as e:
-                    # WinError 10035 = non-blocking socket has no data (normal).
-                    if e.errno != 10035:
-                        logging.warning(f"Socket receive error: {e}")
-                    break
-        if in_error:
-            # Transient select() error: don't kill the process; the periodic
-            # is_socket_connected health check handles a truly dead socket.
-            logging.error("Socket reported an exceptional condition")
+        while True:
+            ready_to_read, _, in_error = select.select([self.socket], [], [], 0)
+            if in_error:
+                logging.error("Socket reported an exceptional condition")
+            if not ready_to_read:
+                break
+            try:
+                chunk = self.socket.recv(65536)
+            except socket.error as e:
+                # WinError 10035 = non-blocking socket has no data (normal).
+                if e.errno != 10035:
+                    logging.warning(f"Socket receive error: {e}")
+                break
+            if not chunk:
+                break
+            self._rx_buffer += chunk
+
+        buf = self._rx_buffer
+        offset = 0
+        while len(buf) - offset >= 8:
+            magic, size = struct.unpack_from(ENDIAN_FORMAT + "II", buf, offset)
+            if magic != MAGIC_NUMBER:
+                logging.error(f"Invalid magic number received: {hex(magic)}")
+                offset = len(buf)  # drop garbage to resync
+                break
+            if len(buf) - offset < 8 + size:
+                break  # incomplete message: keep buffered, frame loop goes on
+            payload = buf[offset + 8: offset + 8 + size]
+            offset += 8 + size
+            if len(payload) < 4:
+                continue
+            cmd_int, = struct.unpack(ENDIAN_FORMAT + "I", payload[:4])
+            try:
+                cmd = CommandType(cmd_int)
+            except ValueError:
+                logging.error(f"Unknown command code received: {cmd_int}")
+                continue
+            messages[cmd] = payload[4:]
+        self._rx_buffer = buf[offset:]
         return messages
 
     def _handle_pending_commands(self, messages: dict) -> bool:
@@ -537,6 +573,8 @@ class App:
 
                 if not self.stream:
                     prepare_needed = True
+                    prompt_only_change = False
+                    guidance_live_change = False
                     update_parameters(self, config_packet)
                     # self.apply_controlnet_config(config_packet.controlnet_config)
                     self._cache_config_values(self.controlnet_config)
@@ -558,16 +596,36 @@ class App:
                         or self.acceleration != config_packet.acceleration
                         or self.lora_dict != config_packet.lora_dict
                     )
-                    update_t_index_list = self.t_index_list != config_packet.t_index_list
-                    prepare_needed = (
+                    # Compare filtered vs filtered (raw out-of-range values = spurious change).
+                    _new_t_index_list = [t for t in config_packet.t_index_list if 0 <= t < 50] or [1]
+                    update_t_index_list = self.t_index_list != _new_t_index_list
+                    prompt_changed = self.current_prompt != config_packet.prompt
+                    negative_changed = self.negative_prompt != config_packet.negative_prompt
+                    guidance_changed = self.guidance_scale != config_packet.guidance_scale
+                    seed_changed = self.seed != config_packet.seed
+                    # Crossing 1.0 changes the embed layout -> prepare(); same-side = live scalar.
+                    guidance_threshold_crossed = (
+                        (self.guidance_scale > 1.0) != (config_packet.guidance_scale > 1.0)
+                    )
+                    structural_change = (
                         model_has_changed
                         or lora_dict_has_changed
                         or update_stream
                         or update_t_index_list
-                        or self.current_prompt != config_packet.prompt
-                        or self.negative_prompt != config_packet.negative_prompt
-                        or self.seed != config_packet.seed
-                        or self.guidance_scale != config_packet.guidance_scale
+                        or seed_changed
+                        or (guidance_changed and guidance_threshold_crossed)
+                    )
+                    # Prompt-only change -> lightweight update_prompt(); prepare() if CFG concat or negative changed.
+                    cfg_uses_concat = config_packet.cfg_type in ("full", "initialize")
+                    prepare_needed = (
+                        structural_change
+                        or negative_changed
+                        or (prompt_changed and cfg_uses_concat)
+                    )
+                    prompt_only_change = prompt_changed and not prepare_needed
+                    # guidance_scale is read live in unet_step -> applied in place.
+                    guidance_live_change = (
+                        guidance_changed and not guidance_threshold_crossed and not prepare_needed
                     )
                     previous_acceleration = self.acceleration
                     update_parameters(self, config_packet)
@@ -618,6 +676,10 @@ class App:
                             delta=self.current_delta,
                             seed=self.seed,
                         )
+                    elif prompt_only_change:
+                        self.stream.stream.update_prompt(self.current_prompt)
+                    if guidance_live_change:
+                        self.stream.stream.guidance_scale = self.guidance_scale
 
                     self._apply_live_config()
 
@@ -851,6 +913,13 @@ class App:
                     self.controlnet_config,
                     skip_frames=self._cached_controlnet_skip_frames,
                 )
+                # skip_frames > 1: cached control maps this frame -> the pipeline may reuse
+                # the previous ControlNet residuals instead of running the ControlNet again.
+                _inner = getattr(self.stream, "stream", None)
+                if _inner is not None:
+                    _inner._cn_residual_reuse_hint = bool(
+                        getattr(self.preprocessor_orchestrator, "last_used_cache", False)
+                    )
 
                 if controlnet_processed_dict and logging.getLogger().isEnabledFor(logging.DEBUG):
                     active_nets = []
@@ -922,6 +991,8 @@ class App:
                     internal = self.stream.stream.last_internal_timings
                     timings['gen_vae_encode'] = internal.get('vae_encode', 0.0)
                     timings['gen_unet_controlnet'] = internal.get('unet_controlnet', 0.0)
+                    timings['gen_controlnet'] = internal.get('controlnet', 0.0)
+                    timings['gen_unet_only'] = internal.get('unet_only', 0.0)
                     timings['gen_vae_decode'] = internal.get('vae_decode', 0.0)
                     timings['generation'] = timings['gen_vae_encode'] + timings['gen_unet_controlnet'] + timings['gen_vae_decode']
                 else:
@@ -933,6 +1004,8 @@ class App:
                 internal = self.stream.stream.last_internal_timings
                 timings['gen_vae_encode'] = internal.get('vae_encode', 0.0)
                 timings['gen_unet_controlnet'] = internal.get('unet_controlnet', 0.0)
+                timings['gen_controlnet'] = internal.get('controlnet', 0.0)
+                timings['gen_unet_only'] = internal.get('unet_only', 0.0)
                 timings['gen_vae_decode'] = internal.get('vae_decode', 0.0)
                 timings['generation'] = timings['gen_vae_encode'] + timings['gen_unet_controlnet'] + timings['gen_vae_decode']
             else:
@@ -954,6 +1027,10 @@ class App:
             timings['output_copy'] = (time.time() - output_copy_start) * 1000
         elif x_output is not None:
             self.output_tensors.write_chw_to_smode(x_output)
+            # Sync before "done": bounds the async GPU queue (deep queue = ~700ms
+            # stall on param edits) and guarantees the frame is fully written.
+            torch.cuda.synchronize()
+
 
         if profiling_enabled:
             signal_start = time.time()
@@ -1064,7 +1141,7 @@ class App:
                                 percentage = (timings['generation'] / timings['total_frame'] * 100) if timings['total_frame'] > 0 else 0
                                 logging.info(f"  {'generation':25s}: {timings['generation']:6.2f}ms ({percentage:5.1f}%) BREAKDOWN:")
                                 gen_total = timings['generation']
-                                for subkey in ['gen_vae_encode', 'gen_unet_controlnet', 'gen_vae_decode']:
+                                for subkey in ['gen_vae_encode', 'gen_unet_controlnet', 'gen_controlnet', 'gen_unet_only', 'gen_vae_decode']:
                                     if subkey in timings:
                                         sub_value = timings[subkey]
                                         sub_percentage = (sub_value / gen_total * 100) if gen_total > 0 else 0

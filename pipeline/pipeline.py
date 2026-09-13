@@ -274,6 +274,17 @@ class StreamDiffusion:
         adapter_name: Optional[Any] = None,
         **kwargs,
     ) -> None:
+        # The default LCM-LoRA repo dropped pytorch_lora_weights.bin; request the safetensors
+        # file explicitly (falling back to diffusers auto-resolution for other repo layouts).
+        if "weight_name" not in kwargs and isinstance(pretrained_model_name_or_path_or_dict, str):
+            try:
+                self.pipe.load_lora_weights(
+                    pretrained_model_name_or_path_or_dict, adapter_name,
+                    weight_name="pytorch_lora_weights.safetensors", **kwargs
+                )
+                return
+            except Exception:
+                pass
         self.pipe.load_lora_weights(
             pretrained_model_name_or_path_or_dict, adapter_name, **kwargs
         )
@@ -352,28 +363,33 @@ class StreamDiffusion:
         if self.guidance_scale > 1.0:
             do_classifier_free_guidance = True
 
-        encoder_output = self.pipe.encode_prompt(
-            prompt=prompt,
-            device=self.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=do_classifier_free_guidance,
-            negative_prompt=negative_prompt,
-        )
-        self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
-
-        if self.use_denoising_batch and self.cfg_type == "full":
-            if encoder_output[1] is not None:
-                uncond_prompt_embeds = encoder_output[1].repeat(self.batch_size, 1, 1)
-        elif self.cfg_type == "initialize":
-            if encoder_output[1] is not None:
-                uncond_prompt_embeds = encoder_output[1].repeat(self.frame_bff_size, 1, 1)
-
-        if self.guidance_scale > 1.0 and (
-            self.cfg_type == "initialize" or self.cfg_type == "full"
-        ):
-            self.prompt_embeds = torch.cat(
-                [uncond_prompt_embeds, self.prompt_embeds], dim=0
+        # Skip the eager text-encoder forward when prompt inputs are unchanged.
+        _embed_key = (prompt, negative_prompt, do_classifier_free_guidance,
+                      self.cfg_type, self.batch_size)
+        if getattr(self, "_embed_cache_key", None) != _embed_key or getattr(self, "prompt_embeds", None) is None:
+            encoder_output = self.pipe.encode_prompt(
+                prompt=prompt,
+                device=self.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                negative_prompt=negative_prompt,
             )
+            self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
+
+            if self.use_denoising_batch and self.cfg_type == "full":
+                if encoder_output[1] is not None:
+                    uncond_prompt_embeds = encoder_output[1].repeat(self.batch_size, 1, 1)
+            elif self.cfg_type == "initialize":
+                if encoder_output[1] is not None:
+                    uncond_prompt_embeds = encoder_output[1].repeat(self.frame_bff_size, 1, 1)
+
+            if self.guidance_scale > 1.0 and (
+                self.cfg_type == "initialize" or self.cfg_type == "full"
+            ):
+                self.prompt_embeds = torch.cat(
+                    [uncond_prompt_embeds, self.prompt_embeds], dim=0
+                )
+            self._embed_cache_key = _embed_key
 
         coeffs = self._compute_scheduler_coefficients(num_inference_steps)
 
@@ -451,6 +467,8 @@ class StreamDiffusion:
             do_classifier_free_guidance=False,
         )
         self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
+
+        self._embed_cache_key = None
 
         # Reset RCFG rolling noise on prompt change: it carries residual from the
         # old prompt across frames, causing a flash on swap (multi-step only).
@@ -533,7 +551,38 @@ class StreamDiffusion:
             if not isinstance(controlnet_conditioning_scale, list):
                 controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(controlnet_model)
 
-            for i, (cn_model, cn_image, cn_scale) in enumerate(zip(controlnet_model, controlnet_image, controlnet_conditioning_scale)):
+            # ControlNet residual reuse (controlnet.skip_frames > 1): when the app signals that
+            # the preprocessor returned its cached control maps for this frame, skip the whole
+            # ControlNet forward and feed the residuals computed on the last refreshed frame.
+            # Approximation (residuals also depend on the noisy latent), opt-in via skip_frames.
+            # Single-slot streams only: the multi-step per-slot ring would go stale.
+            reuse_key = (
+                tuple(id(m) for m in controlnet_model),
+                tuple(
+                    id(s) if isinstance(s, torch.Tensor)
+                    else (tuple(float(v) for v in s) if isinstance(s, (list, tuple)) else float(s))
+                    for s in controlnet_conditioning_scale
+                ),
+                float(getattr(self, '_cached_controlnet_guidance_strength', 1.0)),
+                tuple(x_t_latent_plus_uc.shape),
+            )
+            _cn_cache = getattr(self, '_cn_residual_cache', None)
+            cn_reused = (
+                getattr(self, '_cn_residual_reuse_hint', False)
+                and _cn_cache is not None and _cn_cache[0] == reuse_key
+                and self.denoising_steps_num * self.frame_bff_size == 1
+            )
+            if cn_reused:
+                down_block_res_samples, mid_block_res_sample = _cn_cache[1], _cn_cache[2]
+                self._cn_residual_reused_frames = getattr(self, '_cn_residual_reused_frames', 0) + 1
+                if self._cn_residual_reused_frames == 1:
+                    logging.info("[ControlNet] Residual reuse active on skipped frames (skip_frames > 1)")
+                cn_iter = []
+            else:
+                self._cn_residual_cache = None
+                cn_iter = list(zip(controlnet_model, controlnet_image, controlnet_conditioning_scale))
+
+            for i, (cn_model, cn_image, cn_scale) in enumerate(cn_iter):
                 # Granular guidance multiplier (0.0=prompt only, 1.0=balanced, 2.0=max structure).
                 residual_multiplier = getattr(self, '_cached_controlnet_guidance_strength', 1.0)
 
@@ -607,6 +656,12 @@ class StreamDiffusion:
 
             if getattr(self, '_cn_cond_ring_needs_init', False):
                 self._cn_cond_ring_needs_init = False
+
+            if not cn_reused and down_block_res_samples is not None:
+                # Keep references for reuse on the next skipped frames. TRT residual buffers
+                # are only rewritten when the ControlNet engine runs again (i.e. not while
+                # reused); PyTorch residuals are fresh tensors. Guidance strength already applied.
+                self._cn_residual_cache = (reuse_key, down_block_res_samples, mid_block_res_sample)
 
         try:
             unet_kwargs = {

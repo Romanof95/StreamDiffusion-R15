@@ -400,45 +400,50 @@ class StreamDiffusionXL:
         if self.guidance_scale > 1.0:
             do_classifier_free_guidance = True
 
-        encoder_output = self.pipe.encode_prompt(
-            prompt=prompt,
-            device=self.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=do_classifier_free_guidance,
-            negative_prompt=negative_prompt,
-        )
-        self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
-
-        # SDXL encode_prompt: (prompt_embeds, neg_prompt_embeds, pooled, neg_pooled).
-        if len(encoder_output) > 2:
-            pooled_prompt_embeds = encoder_output[2]
-            add_time_ids = self._get_add_time_ids(
-                (self.height, self.width),
-                (0, 0),
-                (self.height, self.width),
-                dtype=self.dtype,
+        # Skip the eager dual-CLIP encode when prompt inputs are unchanged.
+        _embed_key = (prompt, negative_prompt, do_classifier_free_guidance,
+                      self.cfg_type, self.batch_size)
+        if getattr(self, "_embed_cache_key", None) != _embed_key or getattr(self, "prompt_embeds", None) is None:
+            encoder_output = self.pipe.encode_prompt(
+                prompt=prompt,
                 device=self.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                negative_prompt=negative_prompt,
             )
-            self.added_cond_kwargs = {
-                "text_embeds": pooled_prompt_embeds,
-                "time_ids": add_time_ids,
-            }
-        else:
-            self.added_cond_kwargs = None
+            self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
 
-        if self.use_denoising_batch and self.cfg_type == "full":
-            if encoder_output[1] is not None:
-                uncond_prompt_embeds = encoder_output[1].repeat(self.batch_size, 1, 1)
-        elif self.cfg_type == "initialize":
-            if encoder_output[1] is not None:
-                uncond_prompt_embeds = encoder_output[1].repeat(self.frame_bff_size, 1, 1)
+            # SDXL encode_prompt: (prompt_embeds, neg_prompt_embeds, pooled, neg_pooled).
+            if len(encoder_output) > 2:
+                pooled_prompt_embeds = encoder_output[2]
+                add_time_ids = self._get_add_time_ids(
+                    (self.height, self.width),
+                    (0, 0),
+                    (self.height, self.width),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                self.added_cond_kwargs = {
+                    "text_embeds": pooled_prompt_embeds,
+                    "time_ids": add_time_ids,
+                }
+            else:
+                self.added_cond_kwargs = None
 
-        if self.guidance_scale > 1.0 and (
-            self.cfg_type == "initialize" or self.cfg_type == "full"
-        ):
-            self.prompt_embeds = torch.cat(
-                [uncond_prompt_embeds, self.prompt_embeds], dim=0
-            )
+            if self.use_denoising_batch and self.cfg_type == "full":
+                if encoder_output[1] is not None:
+                    uncond_prompt_embeds = encoder_output[1].repeat(self.batch_size, 1, 1)
+            elif self.cfg_type == "initialize":
+                if encoder_output[1] is not None:
+                    uncond_prompt_embeds = encoder_output[1].repeat(self.frame_bff_size, 1, 1)
+
+            if self.guidance_scale > 1.0 and (
+                self.cfg_type == "initialize" or self.cfg_type == "full"
+            ):
+                self.prompt_embeds = torch.cat(
+                    [uncond_prompt_embeds, self.prompt_embeds], dim=0
+                )
+            self._embed_cache_key = _embed_key
 
         coeffs = self._compute_scheduler_coefficients(num_inference_steps)
 
@@ -537,6 +542,8 @@ class StreamDiffusionXL:
                     "time_ids": add_time_ids,
                 }
 
+        self._embed_cache_key = None
+
         # Reset RCFG rolling noise on prompt change (flash fix, multi-step only).
         if hasattr(self, 'stock_noise') and self.stock_noise is not None:
             self.stock_noise.zero_()
@@ -616,7 +623,38 @@ class StreamDiffusionXL:
             if not isinstance(controlnet_conditioning_scale, list):
                 controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(controlnet_model)
 
-            for i, (cn_model, cn_image, cn_scale) in enumerate(zip(controlnet_model, controlnet_image, controlnet_conditioning_scale)):
+            # ControlNet residual reuse (controlnet.skip_frames > 1): when the app signals that
+            # the preprocessor returned its cached control maps for this frame, skip the whole
+            # ControlNet forward and feed the residuals computed on the last refreshed frame.
+            # Approximation (residuals also depend on the noisy latent), opt-in via skip_frames.
+            # Single-slot streams only: the multi-step per-slot ring would go stale.
+            reuse_key = (
+                tuple(id(m) for m in controlnet_model),
+                tuple(
+                    id(s) if isinstance(s, torch.Tensor)
+                    else (tuple(float(v) for v in s) if isinstance(s, (list, tuple)) else float(s))
+                    for s in controlnet_conditioning_scale
+                ),
+                float(getattr(self, '_cached_controlnet_guidance_strength', 1.0)),
+                tuple(x_t_latent_plus_uc.shape),
+            )
+            _cn_cache = getattr(self, '_cn_residual_cache', None)
+            cn_reused = (
+                getattr(self, '_cn_residual_reuse_hint', False)
+                and _cn_cache is not None and _cn_cache[0] == reuse_key
+                and self.denoising_steps_num * self.frame_bff_size == 1
+            )
+            if cn_reused:
+                down_block_res_samples, mid_block_res_sample = _cn_cache[1], _cn_cache[2]
+                self._cn_residual_reused_frames = getattr(self, '_cn_residual_reused_frames', 0) + 1
+                if self._cn_residual_reused_frames == 1:
+                    logging.info("[ControlNet] Residual reuse active on skipped frames (skip_frames > 1)")
+                cn_iter = []
+            else:
+                self._cn_residual_cache = None
+                cn_iter = list(zip(controlnet_model, controlnet_image, controlnet_conditioning_scale))
+
+            for i, (cn_model, cn_image, cn_scale) in enumerate(cn_iter):
                 residual_multiplier = getattr(self, '_cached_controlnet_guidance_strength', 1.0)
 
                 # Per-slot cond: align ControlNet conditioning with each multi-step
@@ -701,6 +739,17 @@ class StreamDiffusionXL:
 
             if getattr(self, '_cn_cond_ring_needs_init', False):
                 self._cn_cond_ring_needs_init = False
+
+            if not cn_reused and down_block_res_samples is not None:
+                # Keep references for reuse on the next skipped frames. TRT residual buffers
+                # are only rewritten when the ControlNet engine runs again (i.e. not while
+                # reused); PyTorch residuals are fresh tensors. Guidance strength already applied.
+                self._cn_residual_cache = (reuse_key, down_block_res_samples, mid_block_res_sample)
+
+        if self.enable_profiling:
+            # Split point for [PERF]: ControlNet residuals done, UNet starts.
+            self._cn_end_event = torch.cuda.Event(enable_timing=True)
+            self._cn_end_event.record()
 
         try:
             unet_kwargs = {
@@ -996,6 +1045,17 @@ class StreamDiffusionXL:
                 'frame_end': torch.cuda.Event(enable_timing=True),
             }
             events['frame_start'].record()
+            _ueng = getattr(self.unet, 'engine', None)
+            if _ueng is not None and hasattr(_ueng, 'profile_graph'):
+                _ueng.profile_graph = True
+            # Host-side interval between two frame starts: the part not covered by the GPU
+            # frame time is spent waiting for the caller (Smode handshake / input cadence).
+            _now = time.perf_counter()
+            _last = getattr(self, '_perf_last_call', None)
+            self._perf_last_call = _now
+            if _last is not None:
+                getattr(self, '_perf_intervals', None) or setattr(self, '_perf_intervals', [])
+                self._perf_intervals.append((_now - _last) * 1000.0)
 
         if x is not None:
             if x.dim() == 3:
@@ -1065,28 +1125,99 @@ class StreamDiffusionXL:
             overhead_ms = total_ms - (preprocess_ms + vae_encode_ms + unet_ms + vae_decode_ms)
             fps = 1000.0 / total_ms if total_ms > 0 else 0
 
+            # ControlNet vs UNet split (event recorded in unet_step after the CN loop).
+            cn_event = getattr(self, '_cn_end_event', None)
+            controlnet_ms = 0.0
+            if cn_event is not None:
+                try:
+                    controlnet_ms = max(0.0, events['vae_encode_end'].elapsed_time(cn_event))
+                except Exception:
+                    controlnet_ms = 0.0
+                self._cn_end_event = None
+            unet_only_ms = max(0.0, unet_ms - controlnet_ms)
+
+            # UNet engine graph time vs phase time: the gap is GPU idle inside the UNet phase.
+            _ueng = getattr(self.unet, 'engine', None)
+            graph_ms = _ueng.graph_ms() if _ueng is not None and hasattr(_ueng, 'graph_ms') else None
+            if graph_ms is not None:
+                lst = getattr(self, '_perf_graph', None)
+                if lst is None:
+                    lst = self._perf_graph = []
+                lst.append((graph_ms, unet_only_ms - graph_ms))
+            clk = self._perf_sm_clock_mhz()
+            if clk is not None:
+                lst = getattr(self, '_perf_clock', None)
+                if lst is None:
+                    lst = self._perf_clock = []
+                lst.append(clk)
+
             self.last_internal_timings = {
                 'preprocess': preprocess_ms,
                 'vae_encode': vae_encode_ms,
                 'unet_controlnet': unet_ms,
+                'controlnet': controlnet_ms,
+                'unet_only': unet_only_ms,
                 'vae_decode': vae_decode_ms,
                 'overhead': overhead_ms,
                 'total_frame': total_ms,
                 'fps': fps,
             }
 
-            logging.info(f"[PERF] Total: {total_ms:.1f}ms ({fps:.1f} FPS) | "
-                        f"Preprocess: {preprocess_ms:.1f}ms | "
-                        f"VAE Encode: {vae_encode_ms:.1f}ms | "
-                        f"UNet+ControlNet: {unet_ms:.1f}ms | "
-                        f"VAE Decode: {vae_decode_ms:.1f}ms | "
-                        f"Overhead: {overhead_ms:.1f}ms")
+            self._perf_log_counter = getattr(self, '_perf_log_counter', 0) + 1
+            window = getattr(self, '_perf_window', None)
+            if window is None:
+                window = self._perf_window = []
+            window.append(total_ms)
+            if self._perf_log_counter % 60 == 1:
+                # Frame-time spread over the window: hitches show up as max/p95 >> mean.
+                srt = sorted(window)
+                mean_ms = sum(srt) / len(srt)
+                p95_ms = srt[min(len(srt) - 1, int(0.95 * len(srt)))]
+                logging.info(f"[PERF] Total: {total_ms:.1f}ms ({fps:.1f} FPS) | "
+                            f"Preprocess: {preprocess_ms:.1f}ms | "
+                            f"VAE Encode: {vae_encode_ms:.1f}ms | "
+                            f"ControlNet: {controlnet_ms:.1f}ms | "
+                            f"UNet: {unet_only_ms:.1f}ms | "
+                            f"VAE Decode: {vae_decode_ms:.1f}ms | "
+                            f"Overhead: {overhead_ms:.1f}ms | "
+                            f"window({len(srt)}): mean {mean_ms:.1f} p95 {p95_ms:.1f} max {srt[-1]:.1f}ms"
+                            + (f" | UNet graph {sum(g for g, _ in gl) / len(gl):.1f}ms "
+                               f"(GPU idle in UNet phase {sum(d for _, d in gl) / len(gl):.1f}ms)"
+                               if (gl := getattr(self, '_perf_graph', None)) else "")
+                            + (f" | SM clock min {min(cl):.0f} mean {sum(cl) / len(cl):.0f} MHz"
+                               if (cl := getattr(self, '_perf_clock', None)) else "")
+                            + (f" | frame interval {sum(intervals) / len(intervals):.1f}ms "
+                               f"(waiting for caller {max(0.0, sum(intervals) / len(intervals) - mean_ms):.1f}ms)"
+                               if (intervals := getattr(self, '_perf_intervals', None)) else ""))
+                window.clear()
+                if intervals:
+                    intervals.clear()
+                if gl:
+                    gl.clear()
+                if cl:
+                    cl.clear()
         else:
             self.last_internal_timings = {}
 
         return x_output
 
     @torch.no_grad()
+    def _perf_sm_clock_mhz(self):
+        """Current SM clock (MHz) via NVML, sampled once per profiled frame; None if unavailable."""
+        h = getattr(self, '_nvml_handle', None)
+        if h is False:
+            return None
+        try:
+            import pynvml
+            if h is None:
+                pynvml.nvmlInit()
+                idx = self.device.index if getattr(self.device, 'index', None) is not None else 0
+                h = self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            return float(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
+        except Exception:
+            self._nvml_handle = False
+            return None
+
     def txt2img(self, batch_size: int = 1) -> torch.Tensor:
         # Reuse seeded init_noise -> stable reproducible image (no per-frame flicker).
         x_0_pred_out = self.predict_x0_batch(self.init_noise[:batch_size].clone())

@@ -5,6 +5,7 @@ from typing import *
 import torch
 
 from .models import BaseModel
+from ..engine_cache import engine_ready
 from .utilities import (
     build_engine,
     export_onnx,
@@ -74,7 +75,7 @@ class EngineBuilder:
             )
         self.model.min_latent_shape = min_image_resolution // 8
         self.model.max_latent_shape = max_image_resolution // 8
-        if not force_engine_build and os.path.exists(engine_path):
+        if not force_engine_build and engine_ready(engine_path):
             print(f"Found cached engine: {engine_path}")
         else:
             build_engine(

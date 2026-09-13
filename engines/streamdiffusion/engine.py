@@ -95,16 +95,44 @@ class StreamDiffusionEngine(BaseEngine):
             output_type="pt",
             cache_dir=runtime.get("cache_dir"),
             torch_compile_enabled=config.get("torch_compile_enabled", True),
+            precision=config.get("precision", "fp16"),
             torch_compile_mode="reduce-overhead",
             torch_compile_fullgraph=not config.get("streamv2v_enabled", False),
             faceid_config=faceid_config,
             streamv2v_enabled=config.get("streamv2v_enabled", False),
             streamv2v_cache_maxframes=config.get("streamv2v_cache_maxframes", 1),
+            streamv2v_options={
+                "attn_cache_pool": int(config.get("streamv2v_attn_cache_pool", 1) or 1),
+                "fi_last_frame_only": bool(config.get("streamv2v_fi_last_frame_only", False)),
+                "attn_decoder_only": bool(config.get("streamv2v_attn_decoder_only", False)),
+            },
             warning_callback=runtime.get("warning_callback"),
         )
 
+        # Correct is_sd2 from the ACTUAL architecture: name-based detection false-positives on
+        # version numbers (e.g. "kohaku-v2.1" is SD 1.5, not SD 2.1) -> wrong ControlNet -> crash.
+        _name_sd2 = self.is_sd2
+        self.is_sd2 = self._resolve_is_sd2(_name_sd2)
+        if self.is_sd2 != _name_sd2:
+            logging.info(f"[Pipeline] is_sd2 corrected by architecture: name={_name_sd2} -> arch={self.is_sd2}")
         self._loaded = True
         logging.info("[Engine] StreamDiffusion engine active")
+
+    def _resolve_is_sd2(self, name_based: bool) -> bool:
+        """Detect SD 2.x by architecture (text-encoder hidden size / unet cross_attention_dim == 1024),
+        not the model name which false-positives on version numbers like 'kohaku-v2.1' (an SD 1.5 model)."""
+        stream = getattr(self.wrapper, "stream", None)
+        probes = (
+            lambda: stream.text_encoder.config.hidden_size == 1024,
+            lambda: stream.unet.config.cross_attention_dim == 1024,
+            lambda: stream.pipe.text_encoder.config.hidden_size == 1024,
+        )
+        for probe in probes:
+            try:
+                return bool(probe())
+            except Exception:
+                continue
+        return name_based
 
     def run(
         self,

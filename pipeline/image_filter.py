@@ -24,7 +24,8 @@ class SimilarImageFilter:
         full-frame GPU alloc + free on every processed frame. The flattened
         view shares storage with prev_tensor, so it stays valid after copy_
         and only needs rebuilding when we allocate a fresh tensor."""
-        if self.prev_tensor is not None and self.prev_tensor.shape == x.shape:
+        if (self.prev_tensor is not None and self.prev_tensor.shape == x.shape
+                and not self.prev_tensor.is_inference()):
             self.prev_tensor.copy_(x)
         else:
             self.prev_tensor = x.detach().clone()

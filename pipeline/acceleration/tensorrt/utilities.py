@@ -31,6 +31,7 @@ from cuda import cudart
 from PIL import Image
 from polygraphy import cuda
 from polygraphy.backend.common import bytes_from_path
+from ..engine_cache import mark_engine
 from polygraphy.backend.trt import (
     CreateConfig,
     Profile,
@@ -77,6 +78,15 @@ def CUASSERT(cuda_ret):
     return None
 
 
+def onnx_input_names(onnx_path):
+    """Names of the graph inputs of an ONNX file (weights not loaded); None if unreadable."""
+    try:
+        m = onnx.load(onnx_path, load_external_data=False)
+        return {i.name for i in m.graph.input}
+    except Exception:
+        return None
+
+
 class Engine:
     def __init__(
         self,
@@ -89,6 +99,8 @@ class Engine:
         self.tensors = OrderedDict()
         self.cuda_graph_instance = None
         self.graph = None
+        # Captured CUDA graphs keyed by ``graph_key`` (None for the plain single graph).
+        self.graphs = {}
         # Latched on CUDA Graph capture failure; permanently falls back to
         # execute_async_v3 for this engine. Replay failures are NOT caught
         # (they indicate corrupted graph state and must surface).
@@ -97,6 +109,11 @@ class Engine:
         # after a CUDA-Graph replay WITHOUT a host-blocking stream sync.
         # Lazily created on first replay.
         self._replay_event = None
+        # Reusable event ordering the engine after the input copies (see infer()).
+        self._input_event = None
+        # Profiling: GPU time of the last replayed graph (events on the TRT stream), see graph_ms().
+        self.profile_graph = False
+        self._graph_events = None
 
     def __del__(self):
         [buf.free() for buf in self.buffers.values() if isinstance(buf, cuda.DeviceArray)]
@@ -216,8 +233,12 @@ class Engine:
 
         p = Profile()
         if input_profile:
+            present = onnx_input_names(onnx_path)
             for name, dims in input_profile.items():
                 assert len(dims) == 3
+                if present is not None and name not in present:
+                    # Spec input the export dropped (e.g. an unread StreamV2V cache port).
+                    continue
                 p.add(name, min=dims[0], opt=dims[1], max=dims[2])
                 logging.info(f"[TensorRT Engine.build] Profile '{name}': min={dims[0]}, opt={dims[1]}, max={dims[2]}")
 
@@ -272,6 +293,7 @@ class Engine:
             raise
 
         save_engine(engine, path=self.engine_path)
+        mark_engine(self.engine_path)
         logging.info(f"[TensorRT Engine.build] Engine saved: {os.path.basename(self.engine_path)}")
 
     def load(self):
@@ -285,8 +307,26 @@ class Engine:
         else:
             self.context = self.engine.create_execution_context()
 
-    def allocate_buffers(self, shape_dict=None, device="cuda"):
+    def _destroy_graphs(self):
+        for graph, instance in self.graphs.values():
+            try:
+                cudart.cudaGraphExecDestroy(instance)
+            except Exception:
+                pass
+            try:
+                cudart.cudaGraphDestroy(graph)
+            except Exception:
+                pass
+        self.graphs = {}
+        self.cuda_graph_instance = None
+        self.graph = None
+
+    def allocate_buffers(self, shape_dict=None, device="cuda", external=()):
+        """Allocate engine I/O buffers. Names in ``external`` are owned by the caller and
+        bound per run with ``bind_external`` (StreamV2V ring cache): only their input shape
+        is set here."""
         any_reallocated = False
+        external = set(external)
         for idx in range(self.engine.num_io_tensors):
             tensor_name = self.engine.get_tensor_name(idx)
             if shape_dict and tensor_name in shape_dict:
@@ -294,6 +334,14 @@ class Engine:
             else:
                 shape = self.engine.get_tensor_shape(tensor_name)
             is_input = self.engine.get_tensor_mode(tensor_name) == trt.TensorIOMode.INPUT
+
+            if tensor_name in external:
+                if is_input:
+                    self.context.set_input_shape(tensor_name, shape)
+                if tensor_name in self.tensors:
+                    del self.tensors[tensor_name]
+                    any_reallocated = True
+                continue
 
             existing = self.tensors.get(tensor_name)
             if existing is not None and tuple(existing.shape) == tuple(shape):
@@ -310,22 +358,11 @@ class Engine:
             self.tensors[tensor_name] = tensor
             any_reallocated = True
 
-        # Any fresh allocation invalidates the captured CUDA Graph — replaying
-        # it would touch deallocated memory. Drop the graph so the next infer()
+        # Any fresh allocation invalidates the captured CUDA Graphs — replaying
+        # one would touch deallocated memory. Drop them so the next infer()
         # recaptures against the new binding pointers.
         if any_reallocated:
-            if self.cuda_graph_instance is not None:
-                try:
-                    cudart.cudaGraphExecDestroy(self.cuda_graph_instance)
-                except Exception:
-                    pass
-                self.cuda_graph_instance = None
-            if self.graph is not None:
-                try:
-                    cudart.cudaGraphDestroy(self.graph)
-                except Exception:
-                    pass
-                self.graph = None
+            self._destroy_graphs()
             # Rebind engine I/O addresses ONCE, on (re)allocation only. The
             # entries in self.tensors are only ever copy_'d into (never
             # reassigned) by infer(), so data_ptr() is stable between
@@ -335,22 +372,61 @@ class Engine:
             for name, tensor in self.tensors.items():
                 self.context.set_tensor_address(name, tensor.data_ptr())
 
-    def infer(self, feed_dict, stream, use_cuda_graph=False):
+    def bind_external(self, name, tensor):
+        """Point an ``external`` I/O tensor at a caller-owned buffer (captured into the
+        CUDA graph of the current ``graph_key`` on the next capture)."""
+        self.context.set_tensor_address(name, tensor.data_ptr())
+
+    def graph_ms(self):
+        """GPU time (ms) of the last replayed CUDA graph, None when not profiled / not replayed.
+        Pure kernel time on the engine stream: the difference with the [PERF] phase time is GPU
+        idle (host launch latency, other processes)."""
+        ev = self._graph_events
+        if not self.profile_graph or ev is None:
+            return None
+        try:
+            ev[1].synchronize()
+            return float(ev[0].elapsed_time(ev[1]))
+        except Exception:
+            return None
+
+    def infer(self, feed_dict, stream, use_cuda_graph=False, graph_key=None):
         for name, buf in feed_dict.items():
             self.tensors[name].copy_(buf)
 
+        # Order the engine after the input copies just issued on the torch stream. When that
+        # stream is the legacy default stream the ordering is implicit, but the preprocessor
+        # orchestrator runs its processors (Depth-Anything engine included) on non-blocking
+        # side streams: without this event the engine could read a half-copied input, i.e. an
+        # occasional control map mixing two frames.
+        if self._input_event is None:
+            self._input_event = CUASSERT(
+                cudart.cudaEventCreateWithFlags(cudart.cudaEventDisableTiming)
+            )
+        CUASSERT(cudart.cudaEventRecord(self._input_event, torch.cuda.current_stream().cuda_stream))
+        CUASSERT(cudart.cudaStreamWaitEvent(stream.ptr, self._input_event, 0))
+
         if use_cuda_graph and not self._cuda_graph_disabled:
-            if self.cuda_graph_instance is not None:
+            entry = self.graphs.get(graph_key)
+            if entry is not None:
                 # Replay path — uncaught: failure here is a hard bug.
-                CUASSERT(cudart.cudaGraphLaunch(self.cuda_graph_instance, stream.ptr))
+                if self.profile_graph:
+                    if self._graph_events is None:
+                        self._graph_events = (torch.cuda.Event(enable_timing=True),
+                                              torch.cuda.Event(enable_timing=True))
+                    _trt_stream = torch.cuda.ExternalStream(int(stream.ptr))
+                    self._graph_events[0].record(_trt_stream)
+                CUASSERT(cudart.cudaGraphLaunch(entry[1], stream.ptr))
+                if self.profile_graph:
+                    self._graph_events[1].record(_trt_stream)
                 # Order downstream torch work after the replay WITHOUT a
                 # host-blocking sync: record an event on the TRT stream and
                 # make the current torch stream wait on it. The host returns
                 # immediately, so CPU prep of the next stage (scheduler math,
                 # postprocess, IPC) overlaps GPU execution — a real win on
                 # WDDM where the old cudaStreamSynchronize stalled per engine
-                # per frame. GPU-side ordering (e.g. the kvo copy_ and VAE
-                # clamp that read TRT outputs) is preserved.
+                # per frame. GPU-side ordering (e.g. the VAE clamp that reads
+                # TRT outputs) is preserved.
                 if self._replay_event is None:
                     self._replay_event = CUASSERT(
                         cudart.cudaEventCreateWithFlags(cudart.cudaEventDisableTiming)
@@ -364,7 +440,9 @@ class Engine:
             else:
                 # Capture path — guarded: some engines do unsafe syncs that
                 # block stream capture; we latch the disable flag and fall
-                # back to non-graph execution on failure.
+                # back to non-graph execution on failure. One graph per
+                # ``graph_key`` (the StreamV2V ring uses one key per phase,
+                # each with its own baked cache addresses).
                 try:
                     noerror = self.context.execute_async_v3(stream.ptr)
                     if not noerror:
@@ -373,13 +451,16 @@ class Engine:
                         cudart.cudaStreamBeginCapture(stream.ptr, cudart.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal)
                     )
                     self.context.execute_async_v3(stream.ptr)
-                    self.graph = CUASSERT(cudart.cudaStreamEndCapture(stream.ptr))
-                    self.cuda_graph_instance = CUASSERT(cudart.cudaGraphInstantiate(self.graph, 0))
+                    graph = CUASSERT(cudart.cudaStreamEndCapture(stream.ptr))
+                    instance = CUASSERT(cudart.cudaGraphInstantiate(graph, 0))
+                    self.graphs[graph_key] = (graph, instance)
+                    self.graph, self.cuda_graph_instance = graph, instance
                     import logging
                     import os as _os
                     logging.info(
                         f"[TensorRT Engine] CUDA Graph captured for "
                         f"{_os.path.basename(self.engine_path)}"
+                        + (f" (phase {graph_key})" if graph_key is not None else "")
                     )
                 except Exception as graph_err:
                     import logging
@@ -389,7 +470,7 @@ class Engine:
                         f"{_os.path.basename(self.engine_path)}: {graph_err!r} — "
                         f"falling back to non-graph execution."
                     )
-                    self.cuda_graph_instance = None
+                    self._destroy_graphs()
                     self._cuda_graph_disabled = True
                     # If capture started but didn't end, end it so the stream
                     # isn't left in capturing state.
@@ -406,7 +487,6 @@ class Engine:
                 raise ValueError("ERROR: inference failed.")
 
         return self.tensors
-
 
 def decode_images(images: torch.Tensor):
     images = (
@@ -639,6 +719,8 @@ def _cleanup_intermediate_onnx(onnx_path: str) -> None:
         if filename.endswith(".opt.onnx.data"):
             return True
         if filename.endswith(".cache"):
+            return True
+        if filename.endswith(".trtver"):
             return True
         return False
 

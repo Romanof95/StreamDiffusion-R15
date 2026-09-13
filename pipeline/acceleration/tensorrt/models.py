@@ -821,6 +821,67 @@ class UNetXLV2V(UNetXL):
         return tuple(base)
 
 
+class UNetXLV2VRing(UNetXL):
+    """SDXL UNet spec + StreamV2V ring cache as engine I/O.
+
+    Per attn1 ``i``: ``max_cache_frames`` inputs ``kvo_in_{i}_{j}`` (one per cached frame)
+    and one output ``kvo_out_{i}`` (the current frame), all (3, 2B, seq, dim) with the
+    leading 3 stacking [key, value, output]. See KvoRingAttnProcessor2_0.
+    """
+
+    def __init__(self, kvo_cache_shapes, max_cache_frames=1, **kwargs):
+        super().__init__(**kwargs)
+        self.kvo_cache_shapes = list(kvo_cache_shapes)
+        self.max_cache_frames = max_cache_frames
+        self.n_kvo = len(self.kvo_cache_shapes)
+        self.name = "UNetXLV2VRing"
+
+    def kvo_input_names(self):
+        return [f"kvo_in_{i}_{j}" for i in range(self.n_kvo) for j in range(self.max_cache_frames)]
+
+    def get_input_names(self):
+        return super().get_input_names() + self.kvo_input_names()
+
+    def get_output_names(self):
+        return super().get_output_names() + [f"kvo_out_{i}" for i in range(self.n_kvo)]
+
+    def get_dynamic_axes(self):
+        axes = super().get_dynamic_axes()
+        for name in self.kvo_input_names():
+            axes[name] = {1: "2B"}
+        for i in range(self.n_kvo):
+            axes[f"kvo_out_{i}"] = {1: "2B"}
+        return axes
+
+    def get_input_profile(self, batch_size, image_height, image_width, static_batch, static_shape):
+        profile = super().get_input_profile(batch_size, image_height, image_width, static_batch, static_shape)
+        min_batch, max_batch = self.get_minmax_dims(
+            batch_size, image_height, image_width, static_batch, static_shape
+        )[:2]
+        for i, (seq, dim) in enumerate(self.kvo_cache_shapes):
+            for j in range(self.max_cache_frames):
+                profile[f"kvo_in_{i}_{j}"] = [
+                    (3, min_batch, seq, dim), (3, batch_size, seq, dim), (3, max_batch, seq, dim),
+                ]
+        return profile
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        d = super().get_shape_dict(batch_size, image_height, image_width)
+        for i, (seq, dim) in enumerate(self.kvo_cache_shapes):
+            for j in range(self.max_cache_frames):
+                d[f"kvo_in_{i}_{j}"] = (3, 2 * batch_size, seq, dim)
+            d[f"kvo_out_{i}"] = (3, 2 * batch_size, seq, dim)
+        return d
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        base = list(super().get_sample_input(batch_size, image_height, image_width))
+        dtype = torch.float16 if self.fp16 else torch.float32
+        for seq, dim in self.kvo_cache_shapes:
+            for _ in range(self.max_cache_frames):
+                base.append(torch.zeros(3, 2 * batch_size, seq, dim, dtype=dtype, device=self.device))
+        return tuple(base)
+
+
 class ControlNet(BaseModel):
     """ControlNet spec: 4 inputs, 12 down + 1 mid named outputs."""
     def __init__(
@@ -918,6 +979,158 @@ class ControlNet(BaseModel):
             torch.randn(2 * batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=self.device),
             torch.randn(2 * batch_size, 3, latent_height * 8, latent_width * 8, dtype=dtype, device=self.device),
         )
+
+
+
+class ControlNetUnion(BaseModel):
+    """SDXL Union ControlNet (xinsir/controlnet-union-sdxl-1.0) spec.
+
+    One engine per ordered ``control_type_idx`` tuple: the task-embedding
+    gather and the N-way conditioning fuse are baked at export. Conditioning
+    scales stay a runtime input (``conditioning_scale``, shape (N,)) so live
+    slider changes never trigger a rebuild. Outputs: 9 down + 1 mid residuals,
+    matching the SDXL UNet engine's CN ports.
+    """
+    def __init__(
+        self,
+        control_type_idx,
+        fp16=False,
+        device="cuda",
+        max_batch_size=16,
+        min_batch_size=1,
+        embedding_dim=2048,
+        text_maxlen=77,
+        unet_dim=4,
+        num_control_types=6,
+        pooled_dim=1280,
+        time_ids_dim=6,
+    ):
+        super(ControlNetUnion, self).__init__(
+            fp16=fp16,
+            device=device,
+            max_batch_size=max_batch_size,
+            min_batch_size=min_batch_size,
+            embedding_dim=embedding_dim,
+            text_maxlen=text_maxlen,
+        )
+        self.control_type_idx = [int(i) for i in control_type_idx]
+        self.num_conds = len(self.control_type_idx)
+        if self.num_conds == 0:
+            raise ValueError("ControlNetUnion spec needs at least one control type")
+        self.num_control_types = num_control_types
+        self.pooled_dim = pooled_dim
+        self.time_ids_dim = time_ids_dim
+        self.unet_dim = unet_dim
+        self.name = "ControlNetUnion[" + ",".join(str(i) for i in self.control_type_idx) + "]"
+
+    def get_input_names(self):
+        return [
+            "sample", "timestep", "encoder_hidden_states",
+            "text_embeds", "time_ids", "control_type", "conditioning_scale",
+        ] + [f"cond_{i}" for i in range(self.num_conds)]
+
+    def get_output_names(self):
+        return [f"down_block_{i}" for i in range(SDXL_CN_NUM_DOWN)] + ["mid_block"]
+
+    def get_dynamic_axes(self):
+        # Image-space conds use distinct axis names ("IH"/"IW") -- see ControlNet.
+        axes = {
+            "sample": {0: "B", 2: "H", 3: "W"},
+            "timestep": {0: "B"},
+            "encoder_hidden_states": {0: "B"},
+            "text_embeds": {0: "B"},
+            "time_ids": {0: "B"},
+            "control_type": {0: "B"},
+        }
+        for i in range(self.num_conds):
+            axes[f"cond_{i}"] = {0: "B", 2: "IH", 3: "IW"}
+        for i in range(SDXL_CN_NUM_DOWN):
+            axes[f"down_block_{i}"] = {0: "B"}
+        axes["mid_block"] = {0: "B"}
+        return axes
+
+    def get_input_profile(self, batch_size, image_height, image_width, static_batch, static_shape):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        (
+            min_batch, max_batch, _, _, _, _,
+            min_latent_height, max_latent_height, min_latent_width, max_latent_width,
+        ) = self.get_minmax_dims(batch_size, image_height, image_width, static_batch, static_shape)
+        n = self.num_conds
+        profile = {
+            "sample": [
+                (min_batch, self.unet_dim, min_latent_height, min_latent_width),
+                (batch_size, self.unet_dim, latent_height, latent_width),
+                (max_batch, self.unet_dim, max_latent_height, max_latent_width),
+            ],
+            "timestep": [(min_batch,), (batch_size,), (max_batch,)],
+            "encoder_hidden_states": [
+                (min_batch, self.text_maxlen, self.embedding_dim),
+                (batch_size, self.text_maxlen, self.embedding_dim),
+                (max_batch, self.text_maxlen, self.embedding_dim),
+            ],
+            "text_embeds": [
+                (min_batch, self.pooled_dim), (batch_size, self.pooled_dim), (max_batch, self.pooled_dim),
+            ],
+            "time_ids": [
+                (min_batch, self.time_ids_dim), (batch_size, self.time_ids_dim), (max_batch, self.time_ids_dim),
+            ],
+            "control_type": [
+                (min_batch, self.num_control_types),
+                (batch_size, self.num_control_types),
+                (max_batch, self.num_control_types),
+            ],
+            "conditioning_scale": [(n,), (n,), (n,)],
+        }
+        for i in range(n):
+            profile[f"cond_{i}"] = [
+                (min_batch, 3, min_latent_height * 8, min_latent_width * 8),
+                (batch_size, 3, latent_height * 8, latent_width * 8),
+                (max_batch, 3, max_latent_height * 8, max_latent_width * 8),
+            ]
+        return profile
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        shapes = {
+            "sample": (batch_size, self.unet_dim, latent_height, latent_width),
+            "timestep": (batch_size,),
+            "encoder_hidden_states": (batch_size, self.text_maxlen, self.embedding_dim),
+            "text_embeds": (batch_size, self.pooled_dim),
+            "time_ids": (batch_size, self.time_ids_dim),
+            "control_type": (batch_size, self.num_control_types),
+            "conditioning_scale": (self.num_conds,),
+        }
+        for i in range(self.num_conds):
+            shapes[f"cond_{i}"] = (batch_size, 3, latent_height * 8, latent_width * 8)
+        return shapes
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
+        dtype = torch.float16 if self.fp16 else torch.float32
+        dev = self.device
+        control_type = torch.zeros(batch_size, self.num_control_types, dtype=dtype, device=dev)
+        for idx in self.control_type_idx:
+            control_type[:, idx] = 1
+        time_ids = torch.tensor(
+            [[image_height, image_width, 0, 0, image_height, image_width]] * batch_size,
+            dtype=dtype, device=dev,
+        )
+        inputs = [
+            torch.randn(
+                batch_size, self.unet_dim, latent_height, latent_width, dtype=torch.float32, device=dev
+            ),
+            torch.ones((batch_size,), dtype=torch.float32, device=dev),
+            torch.randn(batch_size, self.text_maxlen, self.embedding_dim, dtype=dtype, device=dev),
+            torch.randn(batch_size, self.pooled_dim, dtype=dtype, device=dev),
+            time_ids,
+            control_type,
+            torch.ones((self.num_conds,), dtype=dtype, device=dev),
+        ]
+        for _ in range(self.num_conds):
+            inputs.append(
+                torch.rand(batch_size, 3, latent_height * 8, latent_width * 8, dtype=dtype, device=dev)
+            )
+        return tuple(inputs)
 
 
 class DepthAnything(BaseModel):

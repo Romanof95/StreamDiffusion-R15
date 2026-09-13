@@ -10,6 +10,10 @@ import logging
 import numpy as np
 import torch
 from diffusers import AutoencoderTiny, LCMScheduler, StableDiffusionXLPipeline
+from pipeline.acceleration.engine_cache import engine_ready
+from pipeline.acceleration.quantization import (
+    normalize_precision, precision_suffix, quantization_available,
+)
 from PIL import Image
 
 from pipeline.pipeline_xl import StreamDiffusionXL
@@ -30,10 +34,57 @@ def _compute_trt_unet_batch_size_xl(t_index_list, frame_buffer_size, cfg_type, u
         return frame_buffer_size
 
 
+def _loras_touch_text_encoders(lora_dict) -> Optional[bool]:
+    """True if a LoRA of ``lora_dict`` carries text-encoder weights, False if they are all
+    UNet-only (a cached engine already has them baked in), None when a LoRA cannot be
+    inspected (not a local/hub safetensors file)."""
+    import json
+    import struct
+    for lora_name in lora_dict:
+        try:
+            if "::" in lora_name:
+                from huggingface_hub import hf_hub_download
+                repo_id, weight_name = lora_name.split("::", 1)
+                path = hf_hub_download(repo_id, weight_name)
+            elif os.path.isfile(lora_name):
+                path = lora_name
+            else:
+                return None
+            if not str(path).endswith(".safetensors"):
+                return None
+            with open(path, "rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(header_len))
+            for key in header:
+                k = key.lower()
+                if key != "__metadata__" and (
+                    k.startswith("lora_te") or "text_encoder" in k or k.startswith("te1") or k.startswith("te2")
+                ):
+                    return True
+        except Exception as e:
+            logging.info(f"[Cache hit] LoRA {lora_name} not inspectable ({type(e).__name__}: {e})")
+            return None
+    return False
+
+
+def _v2v_variant_suffix(options) -> str:
+    """Engine filename tag of the StreamV2V speed/quality options (empty when all off)."""
+    options = options or {}
+    tag = ""
+    pool = int(options.get("attn_cache_pool", 1) or 1)
+    if pool > 1:
+        tag += f"--pool{pool}"
+    if options.get("fi_last_frame_only"):
+        tag += "--filast"
+    if options.get("attn_decoder_only"):
+        tag += "--attndec"
+    return tag
+
+
 def _derive_engine_paths_sdxl(
     model_id_or_path, use_lcm_lora, use_tiny_vae, lora_dict, engine_dir,
     trt_unet_batch_size, vae_batch_size, mode, height, width,
-    streamv2v_on=False, streamv2v_maxframes=1,
+    streamv2v_on=False, streamv2v_maxframes=1, precision="fp16", streamv2v_variant="",
 ):
     """Derive on-disk paths for the SDXL TRT engines.
 
@@ -53,7 +104,8 @@ def _derive_engine_paths_sdxl(
 
     engine_dir = Path(engine_dir)
     unet_filename = (
-        f"unet_v2v_xl_mf{streamv2v_maxframes}.engine" if streamv2v_on else "unet_cn.engine"
+        f"unet_v2vr_xl_mf{streamv2v_maxframes}{streamv2v_variant}{precision_suffix(precision)}.engine"
+        if streamv2v_on else f"unet_cn{precision_suffix(precision)}.engine"
     )
     unet_path = os.path.join(
         engine_dir,
@@ -177,12 +229,12 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             gate_reason = None
             if faceid_enabled:
                 gate_reason = "FaceID enabled (forces torch.compile fallback)"
-            elif v2v_on:
-                gate_reason = "StreamV2V enabled (kvo processor install needs PyTorch UNet)"
             elif use_hyper_unet:
                 gate_reason = "Hyper-SDXL U-Net checkpoint mode (overwrites pipe.unet)"
-            elif lora_dict:
-                gate_reason = "custom lora_dict set"
+            elif lora_dict and _loras_touch_text_encoders(lora_dict) is not False:
+                # UNet-only LoRAs are baked into the cached engine (its directory carries the
+                # LoRA signature); only a LoRA with text-encoder weights needs the full pipeline.
+                gate_reason = "custom lora_dict with text-encoder weights (or unresolvable LoRA)"
             elif not use_tiny_vae:
                 gate_reason = "use_tiny_vae=False (heavy path needs original VAE config)"
             elif Path(base_model_path).exists() and Path(base_model_path).is_file():
@@ -203,9 +255,12 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                     vae_batch_size=vae_bs,
                     mode=self.mode,
                     height=self.height, width=self.width,
+                    streamv2v_on=v2v_on, streamv2v_maxframes=v2v_maxframes,
+                    precision=self._effective_precision(v2v_on),
+                    streamv2v_variant=_v2v_variant_suffix(getattr(self, "streamv2v_options", None)),
                 )
-                if (os.path.exists(unet_path) and os.path.exists(vae_enc_path)
-                        and os.path.exists(vae_dec_path)):
+                if (engine_ready(unet_path) and engine_ready(vae_enc_path)
+                        and engine_ready(vae_dec_path)):
                     try:
                         logging.info(
                             "[Cache hit] All TRT engines present (SDXL) — using fast load path"
@@ -544,6 +599,20 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         finally:
             self._emit_warning(False)
 
+    def _effective_precision(self, v2v_on: bool = False) -> str:
+        """Requested engine precision, downgraded to fp16 when it cannot apply."""
+        try:
+            prec = normalize_precision(getattr(self, "precision", "fp16"))
+        except ValueError as e:
+            logging.warning(f"[Quant] {e}; using fp16")
+            return "fp16"
+        if prec == "fp16":
+            return prec
+        if not quantization_available():
+            logging.warning(f"[Quant] precision={prec} ignored: nvidia-modelopt not available")
+            return "fp16"
+        return prec
+
     def enable_tensorrt_acceleration(
         self, stream: StreamDiffusionXL, model_id_or_path: str,
         use_lcm_lora: bool, use_tiny_vae: bool,
@@ -561,7 +630,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             AutoencoderKLEngine, UNet2DConditionModelEngine,
         )
         from pipeline.acceleration.tensorrt.models import (
-            VAE, UNetXL, UNetXLV2V, VAEEncoder,
+            VAE, UNetXL, UNetXLV2VRing, VAEEncoder,
         )
 
         lora_sig = lora_signature(lora_dict)
@@ -580,8 +649,14 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         engine_dir = Path(engine_dir)
         # Distinct filenames per variant — bindings are incompatible between
         # plain CN and v2v, so a stale engine must never be silently reused.
+        precision = self._effective_precision(v2v_on)
+        # ``v2vr`` = StreamV2V ring cache layout (see UNetXLV2VRing); the older
+        # ``unet_v2v_xl_mfN`` engines (shifted cache, copied every frame) are not reused.
+        v2v_opts = dict(getattr(self, "streamv2v_options", None) or {})
+        v2v_variant = _v2v_variant_suffix(v2v_opts)
         unet_filename = (
-            f"unet_v2v_xl_mf{v2v_maxframes}.engine" if v2v_on else "unet_cn.engine"
+            f"unet_v2vr_xl_mf{v2v_maxframes}{v2v_variant}{precision_suffix(precision)}.engine" if v2v_on
+            else f"unet_cn{precision_suffix(precision)}.engine"
         )
         unet_path = os.path.join(
             engine_dir,
@@ -597,30 +672,45 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         )
 
         needs_build = not (
-            os.path.exists(unet_path) and os.path.exists(vae_decoder_path)
-            and os.path.exists(vae_encoder_path)
+            engine_ready(unet_path) and engine_ready(vae_decoder_path)
+            and engine_ready(vae_encoder_path)
         )
 
-        if not os.path.exists(unet_path):
+        if not engine_ready(unet_path):
             self._emit_warning(True, "Building TensorRT engine (UNet) - first run can take several minutes")
             os.makedirs(os.path.dirname(unet_path), exist_ok=True)
+            if precision != "fp16":
+                # Block-scaled low precision (see pipeline/acceleration/quantization.py):
+                # bake the fused LoRA first (PEFT unload), before any attention processor
+                # is installed on the UNet.
+                from pipeline.acceleration.quantization import (
+                    bake_lora, quantize_model, make_stream_calibration_loop,
+                )
+                from pipeline.acceleration.tensorrt import compile_unet_quantized
+                bake_lora(stream.pipe)
+            kvo_procs = None
             if v2v_on:
                 from pipeline.attention_processors import (
-                    install_kvo_processors, get_kvo_cache_info,
+                    install_kvo_ring_processors, get_kvo_cache_info,
                 )
-                kvo_procs = install_kvo_processors(
+                kvo_procs = install_kvo_ring_processors(
                     stream.unet,
                     max_frames=v2v_maxframes,
                     use_feature_injection=True,
+                    attn_cache_pool=int(v2v_opts.get("attn_cache_pool", 1) or 1),
+                    fi_last_frame_only=bool(v2v_opts.get("fi_last_frame_only", False)),
+                    attn_decoder_only=bool(v2v_opts.get("attn_decoder_only", False)),
+                    height=self.height, width=self.width,
                 )
                 kvo_shapes, kvo_structure, _ = get_kvo_cache_info(
                     stream.unet, self.height, self.width,
                 )
                 logging.info(
-                    f"[StreamV2V TRT XL] Installed {len(kvo_procs)} kvo passthrough processors, "
-                    f"structure={kvo_structure}, max_cache_frames={v2v_maxframes}"
+                    f"[StreamV2V TRT XL] Installed {len(kvo_procs)} kvo ring processors, "
+                    f"structure={kvo_structure}, max_cache_frames={v2v_maxframes}, "
+                    f"options={v2v_variant or 'default'}"
                 )
-                unet_model = UNetXLV2V(
+                unet_model = UNetXLV2VRing(
                     kvo_cache_shapes=kvo_shapes,
                     max_cache_frames=v2v_maxframes,
                     fp16=True, device=stream.device,
@@ -628,13 +718,6 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                     min_batch_size=stream.trt_unet_batch_size,
                     embedding_dim=2048,
                     unet_dim=stream.unet.config.in_channels,
-                )
-                compile_unet(
-                    stream.unet, unet_model, unet_path + ".onnx",
-                    unet_path + ".opt.onnx", unet_path,
-                    opt_batch_size=stream.trt_unet_batch_size,
-                    opt_image_height=self.height, opt_image_width=self.width,
-                    is_sdxl=True, kvo_processors=kvo_procs,
                 )
             else:
                 # UNetXL = SDXL UNet with ControlNet residual ports (9 down + 1 mid).
@@ -646,13 +729,62 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                     embedding_dim=2048,
                     unet_dim=stream.unet.config.in_channels,
                 )
+
+            def _compile_fp16_unet(path):
                 compile_unet(
-                    stream.unet, unet_model, unet_path + ".onnx",
-                    unet_path + ".opt.onnx", unet_path,
+                    stream.unet, unet_model, path + ".onnx", path + ".opt.onnx", path,
                     opt_batch_size=stream.trt_unet_batch_size,
                     opt_image_height=self.height, opt_image_width=self.width,
-                    is_sdxl=True, use_simple_wrapper=False,
+                    is_sdxl=True, use_simple_wrapper=False, kvo_processors=kvo_procs,
+                    kvo_ring_frames=v2v_maxframes if kvo_procs is not None else None,
                 )
+
+            if precision != "fp16":
+                # Quantize the Linear layers in place, static export (kvo ports included for
+                # v2v), strongly-typed build. The PyTorch UNet is discarded right after anyway.
+                self._emit_warning(
+                    True,
+                    f"Quantizing UNet to {precision} + building TensorRT engine "
+                    f"- one-time, 5-15 min",
+                )
+                logging.info(f"[Quant] SDXL UNet{' (StreamV2V)' if v2v_on else ''} -> {precision} "
+                             f"(LoRA baked, Linear layers only)")
+                try:
+                    calib = make_stream_calibration_loop(stream) if precision == "nvfp4" else None
+                    quantize_model(stream.unet, precision, calib)
+                    compile_unet_quantized(
+                        stream.unet, unet_model, unet_path + ".onnx", unet_path,
+                        opt_batch_size=stream.trt_unet_batch_size,
+                        opt_image_height=self.height, opt_image_width=self.width,
+                        precision=precision, kvo_processors=kvo_procs,
+                        kvo_ring_frames=v2v_maxframes if kvo_procs is not None else None,
+                    )
+                except Exception as e:
+                    # Fall back to the fp16 engine: neutralize the quantizers (identity),
+                    # bring the UNet back on the GPU, build/load the plain fp16 engine.
+                    logging.error(f"[Quant] {precision} UNet engine failed ({type(e).__name__}: {e}); "
+                                  f"falling back to fp16")
+                    try:
+                        import modelopt.torch.quantization as _mtq
+                        _mtq.disable_quantizer(stream.unet, "*")
+                    except Exception:
+                        pass
+                    stream.unet.to(stream.device)
+                    precision = "fp16"
+                    unet_path = os.path.join(
+                        os.path.dirname(unet_path),
+                        f"unet_v2vr_xl_mf{v2v_maxframes}{v2v_variant}.engine" if v2v_on else "unet_cn.engine",
+                    )
+                    if not engine_ready(unet_path):
+                        _compile_fp16_unet(unet_path)
+            else:
+                _compile_fp16_unet(unet_path)
+            if kvo_procs is not None:
+                # The cache tensors captured during the export trace live on the GPU and are
+                # plain attributes: unet.to("cpu") does not move them (~2.5 GB at 1024).
+                for _p in kvo_procs:
+                    _p._cache_in = None
+                    _p._cache_out = None
             try:
                 stream.unet.to("cpu")
             except Exception:
@@ -660,7 +792,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             gc.collect()
             torch.cuda.empty_cache()
 
-        if not os.path.exists(vae_decoder_path):
+        if not engine_ready(vae_decoder_path):
             self._emit_warning(True, "Building TensorRT engine (VAE decoder) - first run can take a few minutes")
             os.makedirs(os.path.dirname(vae_decoder_path), exist_ok=True)
             stream.vae.forward = stream.vae.decode
@@ -672,7 +804,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             )
             delattr(stream.vae, "forward")
 
-        if not os.path.exists(vae_encoder_path):
+        if not engine_ready(vae_encoder_path):
             self._emit_warning(True, "Building TensorRT engine (VAE encoder) - first run can take a few minutes")
             os.makedirs(os.path.dirname(vae_encoder_path), exist_ok=True)
             vae_encoder = TorchVAEEncoder(stream.vae).to(torch.device("cuda"))

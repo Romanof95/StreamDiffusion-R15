@@ -26,6 +26,8 @@ class PreprocessorOrchestrator:
         self._cached_results: Dict[str, torch.Tensor] = {}
 
         self._frame_counter: int = 0
+        # True when the last preprocess() returned cached maps (skip_frames > 1).
+        self.last_used_cache: bool = False
 
         # Hot-path cache: list of names enabled at last preprocess() call.
         # Rebuilt only when the (enabled, is_loaded) signature changes.
@@ -116,10 +118,12 @@ class PreprocessorOrchestrator:
 
         if sig != self._active_signature:
             self._active_names_cache = []
+            # GPU-resident processors first: their async work then overlaps
+            # canny's blocking D2H copy + CPU chain instead of queuing after it.
             enabled_map = {
-                'canny': config.canny.enabled,
                 'depth': config.depth.enabled,
                 'openpose': config.openpose.enabled,
+                'canny': config.canny.enabled,
             }
             self._active_names_cache = [
                 name for name, enabled in enabled_map.items()
@@ -129,12 +133,14 @@ class PreprocessorOrchestrator:
             self._cached_results.clear()
 
         active_names = self._active_names_cache
+        self.last_used_cache = False
 
         if not active_names:
             return None
 
         self._frame_counter += 1
         use_cache = skip_frames > 1 and self._frame_counter % skip_frames != 0
+        self.last_used_cache = bool(use_cache)
 
         if use_cache:
             cached = {}
@@ -151,6 +157,9 @@ class PreprocessorOrchestrator:
             sub_config = sub_configs[name]
 
             if stream is not None:
+                # The input frame was produced on the caller's stream (IPC copy + permute):
+                # the side stream must see it complete before the processor reads it.
+                stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     result = processor.process(image_tensor, sub_config)
                     if result is not None:

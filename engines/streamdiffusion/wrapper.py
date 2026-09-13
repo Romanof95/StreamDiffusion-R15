@@ -9,6 +9,7 @@ from typing import Dict, List, Literal, Optional, Union
 import numpy as np
 import torch
 from diffusers import AutoencoderTiny, LCMScheduler, StableDiffusionPipeline
+from pipeline.acceleration.engine_cache import engine_ready
 from PIL import Image
 
 from pipeline import StreamDiffusion
@@ -190,8 +191,8 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                     streamv2v_on=v2v_on,
                     streamv2v_maxframes=v2v_maxframes,
                 )
-                if (os.path.exists(unet_path) and os.path.exists(vae_enc_path)
-                        and os.path.exists(vae_dec_path)):
+                if (engine_ready(unet_path) and engine_ready(vae_enc_path)
+                        and engine_ready(vae_dec_path)):
                     try:
                         logging.info(
                             "[Cache hit] All TRT engines present (SD 1.5) — using fast load path"
@@ -481,11 +482,11 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         )
 
         needs_build = not (
-            os.path.exists(unet_path) and os.path.exists(vae_decoder_path)
-            and os.path.exists(vae_encoder_path)
+            engine_ready(unet_path) and engine_ready(vae_decoder_path)
+            and engine_ready(vae_encoder_path)
         )
 
-        if not os.path.exists(unet_path):
+        if not engine_ready(unet_path):
             self._emit_warning(True, "Building TensorRT engine (UNet) - first run can take several minutes")
             os.makedirs(os.path.dirname(unet_path), exist_ok=True)
             if v2v_on:
@@ -541,7 +542,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             gc.collect()
             torch.cuda.empty_cache()
 
-        if not os.path.exists(vae_decoder_path):
+        if not engine_ready(vae_decoder_path):
             self._emit_warning(True, "Building TensorRT engine (VAE decoder) - first run can take a few minutes")
             os.makedirs(os.path.dirname(vae_decoder_path), exist_ok=True)
             stream.vae.forward = stream.vae.decode
@@ -552,7 +553,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                                 opt_image_height=self.height, opt_image_width=self.width)
             delattr(stream.vae, "forward")
 
-        if not os.path.exists(vae_encoder_path):
+        if not engine_ready(vae_encoder_path):
             self._emit_warning(True, "Building TensorRT engine (VAE encoder) - first run can take a few minutes")
             os.makedirs(os.path.dirname(vae_encoder_path), exist_ok=True)
             vae_encoder = TorchVAEEncoder(stream.vae).to(torch.device("cuda"))

@@ -43,12 +43,44 @@ class UNet2DConditionModelEngine:
             self.engine.engine.get_tensor_name(i)
             for i in range(self.engine.engine.num_io_tensors)
         }
-        self._is_v2v = "kvo_in_0" in binding_names
+        # Two cache layouts: legacy (kvo_in_i / kvo_out_i, (3, F, B, seq, dim), shifted
+        # inside the engine and copied in/out every frame) and ring (kvo_in_i_j per cached
+        # frame + kvo_out_i for the current frame, (3, B, seq, dim); the runtime keeps F+1
+        # slot buffers and rotates the engine's addresses, nothing is copied).
+        import re as _re
+        _ring_in = _re.compile(r"^kvo_in_(\d+)_(\d+)$")
+        ring_inputs = {n: _ring_in.match(n) for n in binding_names if _ring_in.match(n)}
+        self._is_v2v_ring = bool(ring_inputs)
+        self._is_v2v = self._is_v2v_ring or "kvo_in_0" in binding_names
         self._kvo_cache = None
         self._n_kvo = 0
         self._kvo_shapes_baked = None
         self._cache_maxframes = v2v_cache_maxframes
-        if self._is_v2v:
+        self._ring = None
+        self._ring_phase = 0
+        self._kvo_names = ()
+        if self._is_v2v_ring:
+            while f"kvo_out_{self._n_kvo}" in binding_names:
+                self._n_kvo += 1
+            # Blocks that never read the cache (attn_decoder_only) have no kvo_in ports:
+            # the frame count comes from the highest cached-frame index present.
+            self._cache_maxframes = 1 + max(int(m.group(2)) for m in ring_inputs.values())
+            self._kvo_shapes_baked = []
+            for i in range(self._n_kvo):
+                shp = tuple(self.engine.engine.get_tensor_shape(f"kvo_out_{i}"))
+                self._kvo_shapes_baked.append((shp[2], shp[3]))
+            self._kvo_names = tuple(
+                [n for n in (f"kvo_in_{i}_{j}" for i in range(self._n_kvo) for j in range(self._cache_maxframes))
+                 if n in binding_names]
+                + [f"kvo_out_{i}" for i in range(self._n_kvo)]
+            )
+            self._kvo_present = set(self._kvo_names)
+            import logging
+            logging.info(
+                f"[TensorRT Engine] StreamV2V (v2v ring) mode: {self._n_kvo} attn1 ports x "
+                f"{self._cache_maxframes} cached frames, kvo_shapes={self._kvo_shapes_baked}"
+            )
+        elif self._is_v2v:
             while f"kvo_in_{self._n_kvo}" in binding_names:
                 self._n_kvo += 1
             # Read baked (seq, dim) from each port. Axes 1/2 (cache_maxframes,
@@ -115,7 +147,13 @@ class UNet2DConditionModelEngine:
                 "latent": sample_shape,
             }
 
-            if self._is_v2v:
+            if self._is_v2v_ring:
+                batch = sample_shape[0]
+                for i, (seq, dim) in enumerate(self._kvo_shapes_baked):
+                    for j in range(self._cache_maxframes):
+                        current_shapes[f"kvo_in_{i}_{j}"] = (3, batch, seq, dim)
+                    current_shapes[f"kvo_out_{i}"] = (3, batch, seq, dim)
+            elif self._is_v2v:
                 batch = sample_shape[0]
                 for i, (seq, dim) in enumerate(self._kvo_shapes_baked):
                     kvo_shape = (3, self._cache_maxframes, batch, seq, dim)
@@ -125,6 +163,7 @@ class UNet2DConditionModelEngine:
             self.engine.allocate_buffers(
                 shape_dict=current_shapes,
                 device=latent_model_input.device,
+                external=self._kvo_names,
             )
             self._buffers_allocated = True
             self._cached_shapes_sig = sig
@@ -133,6 +172,7 @@ class UNet2DConditionModelEngine:
             # Batch changed → drop kvo cache so it re-inits at the new shape.
             if self._is_v2v:
                 self._kvo_cache = None
+                self._ring = None
 
         inputs = {
             "sample": latent_model_input,
@@ -220,7 +260,35 @@ class UNet2DConditionModelEngine:
                 if "time_ids" in added_cond_kwargs:
                     inputs["time_ids"] = added_cond_kwargs["time_ids"]
 
-        if self._is_v2v:
+        graph_key = None
+        if self._is_v2v_ring:
+            n_slots = self._cache_maxframes + 1
+            if self._ring is None:
+                batch = latent_model_input.shape[0]
+                self._ring = [
+                    [
+                        torch.zeros(3, batch, seq, dim, dtype=latent_model_input.dtype,
+                                    device=latent_model_input.device)
+                        for (seq, dim) in self._kvo_shapes_baked
+                    ]
+                    for _ in range(n_slots)
+                ]
+                self._ring_phase = 0
+            # Phase p: cached frames read from slots p..p+F-1 (oldest first), the current
+            # frame written to slot p+F; next phase the oldest slot becomes the free one.
+            # Addresses are baked into one CUDA graph per phase, so binding only happens
+            # until each phase has been captured (or every frame without graphs).
+            phase = self._ring_phase
+            graph_key = phase
+            if not (self.use_cuda_graph and phase in self.engine.graphs):
+                for i in range(self._n_kvo):
+                    for j in range(self._cache_maxframes):
+                        name = f"kvo_in_{i}_{j}"
+                        if name in self._kvo_present:
+                            self.engine.bind_external(name, self._ring[(phase + j) % n_slots][i])
+                    self.engine.bind_external(f"kvo_out_{i}", self._ring[(phase + self._cache_maxframes) % n_slots][i])
+            self._ring_phase = (phase + 1) % n_slots
+        elif self._is_v2v:
             if self._kvo_cache is None:
                 batch = latent_model_input.shape[0]
                 self._kvo_cache = [
@@ -238,12 +306,13 @@ class UNet2DConditionModelEngine:
             inputs,
             self.stream,
             use_cuda_graph=self.use_cuda_graph,
+            graph_key=graph_key,
         )
         noise_pred = engine_outputs["latent"]
 
-        # Copy kvo outputs into the local cache — the engine reuses its
+        # Legacy layout: copy kvo outputs into the local cache — the engine reuses its
         # output buffers, so without a copy the next call would race.
-        if self._is_v2v:
+        if self._is_v2v and not self._is_v2v_ring:
             for i in range(self._n_kvo):
                 self._kvo_cache[i].copy_(engine_outputs[f"kvo_out_{i}"])
 
@@ -322,6 +391,127 @@ class ControlNetEngine:
             down_block_res_samples = tuple(sample * conditioning_scale for sample in down_block_res_samples)
             mid_block_res_sample = mid_block_res_sample * conditioning_scale
 
+        return down_block_res_samples, mid_block_res_sample
+
+    def to(self, *args, **kwargs):
+        pass
+
+    def forward(self, *args, **kwargs):
+        pass
+
+
+class ControlNetUnionEngine:
+    """TensorRT engine for the SDXL Union ControlNet (9 down + 1 mid outputs).
+
+    One engine per ordered control-type tuple (baked at export). Conditioning
+    scales are a runtime (N,) input; timestep is float32 like ControlNetEngine.
+    Call signature mirrors what ``UnionControlNetWrapper`` computes per frame.
+    """
+    NUM_DOWN = 9
+
+    def __init__(self, filepath: str, stream: cuda.Stream, control_type_idx, use_cuda_graph: bool = False):
+        self.engine = Engine(filepath)
+        self.stream = stream
+        self.control_type_idx = tuple(int(i) for i in control_type_idx)
+        self.num_conds = len(self.control_type_idx)
+        self.use_cuda_graph = use_cuda_graph
+
+        self.engine.load()
+        self.engine.activate()
+
+        self._buffers_allocated = False
+        self._cached_shapes_sig = None
+
+    def __call__(
+        self,
+        sample: torch.Tensor,
+        timestep,
+        encoder_hidden_states: torch.Tensor,
+        controlnet_cond,
+        control_type: torch.Tensor,
+        conditioning_scale,
+        text_embeds: torch.Tensor,
+        time_ids: torch.Tensor,
+        **kwargs,
+    ):
+        batch = sample.shape[0]
+        dev = sample.device
+
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([float(timestep)] * batch, device=dev)
+        if timestep.dim() == 0:
+            timestep = timestep.reshape(1)
+        if timestep.dtype != torch.float32:
+            timestep = timestep.float()
+        if timestep.shape[0] != batch:
+            timestep = timestep.expand(batch)
+
+        if not isinstance(controlnet_cond, (list, tuple)):
+            controlnet_cond = [controlnet_cond]
+        if len(controlnet_cond) != self.num_conds:
+            raise ValueError(
+                f"ControlNetUnionEngine: got {len(controlnet_cond)} conditioning images "
+                f"but engine was built for {self.num_conds} control types {self.control_type_idx}."
+            )
+        conds = []
+        for c in controlnet_cond:
+            if c.dim() == 3:
+                c = c.unsqueeze(0)
+            if c.shape[0] != batch:
+                c = c.expand(batch, -1, -1, -1)
+            conds.append(c)
+
+        n = self.num_conds
+        if isinstance(conditioning_scale, torch.Tensor):
+            scales = conditioning_scale.reshape(-1)
+            if scales.numel() == 1 and n > 1:
+                scales = scales.expand(n)
+        else:
+            if not isinstance(conditioning_scale, (list, tuple)):
+                conditioning_scale = [conditioning_scale] * n
+            scales = torch.tensor(
+                [float(s) for s in conditioning_scale], device=dev, dtype=torch.float16
+            )
+
+        if control_type.dim() == 1:
+            control_type = control_type.unsqueeze(0)
+        if control_type.shape[0] != batch:
+            control_type = control_type.expand(batch, -1)
+        if text_embeds.shape[0] != batch:
+            text_embeds = text_embeds.expand(batch, -1)
+        if time_ids.shape[0] != batch:
+            time_ids = time_ids.expand(batch, -1)
+
+        feed = {
+            "sample": sample,
+            "timestep": timestep,
+            "encoder_hidden_states": encoder_hidden_states,
+            "text_embeds": text_embeds,
+            "time_ids": time_ids,
+            "control_type": control_type,
+            "conditioning_scale": scales,
+        }
+        for i, c in enumerate(conds):
+            feed[f"cond_{i}"] = c
+
+        sig = (
+            tuple(sample.shape), tuple(encoder_hidden_states.shape),
+            tuple(tuple(c.shape) for c in conds),
+        )
+        if not self._buffers_allocated or self._cached_shapes_sig != sig:
+            self.engine.allocate_buffers(
+                shape_dict={k: tuple(v.shape) for k, v in feed.items()},
+                device=dev,
+            )
+            self._buffers_allocated = True
+            self._cached_shapes_sig = sig
+
+        outputs = self.engine.infer(feed, self.stream, use_cuda_graph=self.use_cuda_graph)
+
+        # Scales are applied inside the engine (baked forward). Outputs are
+        # graph-owned buffers: consumers must not hold them across frames.
+        down_block_res_samples = [outputs[f"down_block_{i}"] for i in range(self.NUM_DOWN)]
+        mid_block_res_sample = outputs["mid_block"]
         return down_block_res_samples, mid_block_res_sample
 
     def to(self, *args, **kwargs):

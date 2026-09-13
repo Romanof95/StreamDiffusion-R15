@@ -1,4 +1,5 @@
 """Typed configuration schema for StreamDiffusion (SD 1.5 / SDXL)."""
+import os
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
@@ -6,6 +7,10 @@ from typing import List, Optional
 class CNConfig:
     enabled: bool = True
     guidance_strength: float = 0.58
+    # >1: run the preprocessors AND the ControlNet forward every N frames only; in between,
+    # the cached control maps and the previous ControlNet residuals are reused (single-step
+    # streams). Saves the whole ControlNet cost on skipped frames at the price of a control
+    # signal refreshed at fps/N.
     skip_frames: int = 1
     preview_mode: str = "normal"
 
@@ -19,6 +24,8 @@ class CannyConfig:
     high_threshold: int = 255
     aperture_size: int = 3
     l2_gradient: bool = False
+    # GPU Canny (PyTorch + CUDA graph, ~0.4 ms @384 / ~1.5 ms @1024); False = original OpenCV CPU path.
+    gpu: bool = True
 
 
 @dataclass
@@ -47,6 +54,9 @@ class OpenPoseConfig:
     enabled: bool = False
     scale: float = 1.0
     detect_resolution: int = 512
+    # DWPose (YOLOX-S + DW-LL) as TensorRT engines (~5 ms/frame) instead of onnxruntime (~22 ms).
+    # Engines built once into tensorrt_cache/dwpose/; onnxruntime is the automatic fallback.
+    tensorrt: bool = True
 
 
 @dataclass
@@ -64,6 +74,15 @@ class StreamV2VConfig:
     enabled: bool = False
     cache_maxframes: int = 4
     cache_interval: int = 1
+    # Speed/quality trade-offs of the SDXL TensorRT (ring) engine, all off by default.
+    # Not in the Smode packet yet: set the environment variables before launch.
+    # attn_cache_pool: cached keys/values are average-pooled NxN before the extended
+    # attention (2 -> attention over 1.5x tokens instead of 3x with 2 cached frames).
+    attn_cache_pool: int = int(os.environ.get("STREAMDIFFUSION_V2V_ATTN_POOL", "1"))
+    # fi_last_frame_only: feature injection matches the newest cached frame only.
+    fi_last_frame_only: bool = os.environ.get("STREAMDIFFUSION_V2V_FI_LAST", "0") == "1"
+    # attn_decoder_only: extended attention in mid/up blocks only.
+    attn_decoder_only: bool = os.environ.get("STREAMDIFFUSION_V2V_ATTN_DECODER", "0") == "1"
 
 
 @dataclass
@@ -92,9 +111,17 @@ class ControlNetConfig:
     # Acceleration
     use_tiny_vae: bool = True
     torch_compile_enabled: bool = True
+    # TensorRT engine precision: "fp16" | "mxfp8" | "nvfp4" (RTX 50 / Blackwell block-scaled
+    # formats). Applied to the SDXL UNet and the SDXL Union ControlNet at engine-build time
+    # (ModelOpt quantization, one-time per model+LoRA+steps+resolution, cached like fp16
+    # engines). Ignored outside TensorRT. Measured on an RTX 5080 @1024: mxfp8 -12% UNet time
+    # with an image visually identical to fp16; nvfp4 -29% but the 1-step image drifts.
+    # Not in the Smode packet yet: set STREAMDIFFUSION_PRECISION in the environment.
+    precision: str = os.environ.get("STREAMDIFFUSION_PRECISION", "fp16")
 
-    # Profiling
-    profiling_enabled: bool = False
+    # Profiling: [PERF] line every 60 frames (GPU breakdown, frame-time spread, time spent
+    # waiting for the caller). Not in the Smode packet: set STREAMDIFFUSION_PROFILING=1.
+    profiling_enabled: bool = os.environ.get("STREAMDIFFUSION_PROFILING", "0") == "1"
 
     # Low-latency mode (controlled GC + HIGH process priority)
     low_latency_mode: bool = False

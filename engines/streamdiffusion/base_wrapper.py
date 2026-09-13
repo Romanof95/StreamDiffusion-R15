@@ -71,11 +71,13 @@ class BaseStreamDiffusionWrapper(ABC):
         engine_dir: Optional[Union[str, Path]] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         torch_compile_enabled: bool = True,
+        precision: str = "fp16",
         torch_compile_mode: str = "reduce-overhead",
         torch_compile_fullgraph: bool = False,
         faceid_config: Optional[Dict] = None,
         streamv2v_enabled: bool = False,
         streamv2v_cache_maxframes: int = 1,
+        streamv2v_options: Optional[Dict] = None,
         warning_callback: Optional[Callable[[bool, str], None]] = None,
     ):
         self.sd_turbo = "turbo" in model_id_or_path or "sdxs" in model_id_or_path.lower()
@@ -113,11 +115,13 @@ class BaseStreamDiffusionWrapper(ABC):
         self.use_denoising_batch = use_denoising_batch
         self.use_safety_checker = use_safety_checker
         self.torch_compile_enabled = torch_compile_enabled
+        self.precision = precision  # TensorRT engine precision (fp16 | mxfp8 | nvfp4)
         self.torch_compile_mode = torch_compile_mode
         self.faceid_config = faceid_config
         self._faceid_loaded = False
         self.streamv2v_enabled = streamv2v_enabled
         self.streamv2v_cache_maxframes = streamv2v_cache_maxframes
+        self.streamv2v_options = dict(streamv2v_options or {})
 
         if engine_dir is None:
             engine_dir = self._get_default_engine_dir()
@@ -148,6 +152,9 @@ class BaseStreamDiffusionWrapper(ABC):
             self.stream.enable_similar_image_filter(
                 similar_image_filter_threshold, similar_image_filter_max_skip_frame
             )
+        else:
+            # The pipeline starts with the filter ON: honour an explicit "disabled".
+            self.stream.disable_similar_image_filter()
 
     @abstractmethod
     def _load_model(self, **kwargs):

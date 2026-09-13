@@ -87,26 +87,12 @@ class OptimizedDWposeDetector:
         self._prev_scores = scores.copy()
         return kpts, scores
 
-    @torch.inference_mode()
-    def __call__(self, image, detect_resolution=512, draw_pose=None, output_type="pil", **kwargs):
-        from easy_dwpose.body_estimation import resize_image
-        from easy_dwpose.draw import draw_openpose
-
-        if draw_pose is None:
-            draw_pose = draw_openpose
-
-        if type(image) != np.ndarray:
-            image = np.array(image.convert("RGB"))
-
-        image = image.copy()
-        original_height, original_width, _ = image.shape
-
-        image = resize_image(image, target_resolution=detect_resolution)
-        height, width, _ = image.shape
-
-        candidates, scores = self.pose_estimation(image)
-
+    def postprocess(self, candidates, scores, width, height):
+        """Keypoints (n, 134, 2) in pixels + scores -> normalized, temporally filtered
+        pose dict for the drawing step (numpy, a few hundred values)."""
         num_candidates, _, locs = candidates.shape
+        candidates = np.array(candidates, dtype=np.float64)
+        scores = np.array(scores, dtype=np.float64)
         candidates[..., 0] /= float(width)
         candidates[..., 1] /= float(height)
 
@@ -169,11 +155,35 @@ class OptimizedDWposeDetector:
             faces=faces, faces_scores=faces_scores,
         )
 
+        return pose
+
+    @torch.inference_mode()
+    def __call__(self, image, detect_resolution=512, draw_pose=None, output_type="pil", **kwargs):
+        from easy_dwpose.body_estimation import resize_image
+        from easy_dwpose.draw import draw_openpose
+
+        if draw_pose is None:
+            draw_pose = draw_openpose
+
+        if type(image) != np.ndarray:
+            image = np.array(image.convert("RGB"))
+
+        image = image.copy()
+        original_height, original_width, _ = image.shape
+
+        image = resize_image(image, target_resolution=detect_resolution)
+        height, width, _ = image.shape
+
+        candidates, scores = self.pose_estimation(image)
+        pose = self.postprocess(candidates, scores, width, height)
+
         if not draw_pose:
             return pose
 
         import PIL.Image
         pose_image = draw_pose(pose, height=height, width=width, **kwargs)
+        if output_type == "np_native":
+            return pose_image                     # (height, width, 3) uint8 at detect resolution; caller upscales on GPU
         pose_image = cv2.resize(pose_image, (original_width, original_height), cv2.INTER_LANCZOS4)
 
         if output_type == "pil":
@@ -193,6 +203,8 @@ class OpenPoseProcessor(BasePreprocessor):
                  warning_callback=None):
         super().__init__(device, torch_dtype, max_buffer_size, warning_callback)
         self._detector: Optional[OptimizedDWposeDetector] = None
+        self._gpu_path = False
+        self._gpu_failed = False
         self._input_buffer_max: Optional[np.ndarray] = None
         self._output_buffer_max: Optional[torch.Tensor] = None
         self._pose_cache: Optional[torch.Tensor] = None
@@ -227,6 +239,22 @@ class OpenPoseProcessor(BasePreprocessor):
                 model_det=model_det_path,
                 model_pose=model_pose_path
             )
+            # TensorRT engines behind the same session interface (onnxruntime kept as fallback).
+            if hasattr(config, 'detect_resolution'):
+                use_trt = bool(getattr(config, 'tensorrt', True))
+            else:
+                use_trt = bool(config.get('openpose_tensorrt', True)) if config is not None else True
+            if use_trt:
+                try:
+                    from ..dwpose_gpu import make_gpu_wholebody
+                    pose_estimation = make_gpu_wholebody(
+                        model_det_path, model_pose_path, self.device, warn=self._emit_warning,
+                    )
+                    self._gpu_path = True
+                    logging.info("DWPose: TensorRT engines active (YOLOX-S 640x640 + GPU NMS, DW-LL 384x288), "
+                                 "GPU letterbox/crops/decode/rasterizer")
+                except Exception as e:
+                    logging.warning(f"DWPose: TensorRT path unavailable ({type(e).__name__}: {e}); using onnxruntime")
 
             self._detector = OptimizedDWposeDetector(pose_estimation)
             self._loaded = True
@@ -245,12 +273,38 @@ class OpenPoseProcessor(BasePreprocessor):
                 self._detector.pose_estimation.cleanup()
             del self._detector
             self._detector = None
+        self._gpu_path = False
         self._input_buffer_max = None
         self._output_buffer_max = None
         self._pose_cache = None
         self._loaded = False
         torch.cuda.empty_cache()
         logging.info("[OpenPoseProcessor] Unloaded")
+
+    def _process_gpu(self, image_tensor: torch.Tensor, detect_resolution: int, output_buffer: torch.Tensor) -> torch.Tensor:
+        """Whole DWPose pass on the GPU: resize to the detect resolution (easy_dwpose
+        resize_image rounding), detector + pose engines, SimCC decode, then the temporal
+        filtering on the keypoints (numpy, tiny) and the skeleton rasterized on the GPU at
+        the detect resolution and upscaled like before."""
+        from ..dwpose_gpu import draw_pose_gpu
+        h, w = image_tensor.shape[1], image_tensor.shape[2]
+        k = float(detect_resolution) / min(h, w)
+        tw = max(64, int(round(w * k / 64)) * 64)
+        th = max(64, int(round(h * k / 64)) * 64)
+        img = image_tensor.unsqueeze(0).float() * 255.0
+        if (th, tw) != (h, w):
+            img = torch.nn.functional.interpolate(img, size=(th, tw), mode="bilinear",
+                                                  align_corners=False, antialias=k < 1)
+        img = img[0].clamp_(0.0, 255.0)
+        candidates, scores = self._detector.pose_estimation.run(img)
+        pose = self._detector.postprocess(candidates, scores, tw, th)
+        canvas = draw_pose_gpu(pose, th, tw, self.device)             # (3, th, tw) float 0-255
+        if (th, tw) != (h, w):
+            canvas = torch.nn.functional.interpolate(canvas.unsqueeze(0), size=(h, w), mode="bilinear",
+                                                     align_corners=False)[0]
+        output_buffer.copy_(canvas * (1.0 / 255.0))
+        self._cached_result = output_buffer
+        return output_buffer
 
     def process(self, image_tensor: torch.Tensor, config) -> Optional[torch.Tensor]:
         """Run DWPose detection. Input/output: CHW [0,1] on GPU."""
@@ -281,6 +335,13 @@ class OpenPoseProcessor(BasePreprocessor):
 
             output_buffer = self._output_buffer_max[:, :h, :w].contiguous()
 
+            if self._gpu_path and not self._gpu_failed:
+                try:
+                    return self._process_gpu(image_tensor, detect_resolution, output_buffer)
+                except Exception as e:
+                    logging.warning(f"DWPose GPU path failed ({type(e).__name__}: {e}); using the numpy path")
+                    self._gpu_failed = True
+
             # Convert GPU tensor to numpy for DWPose. Scale+cast on the GPU and
             # do a single uint8 D2H into the pre-allocated buffer, instead of
             # copying fp16/fp32 down then doing two full-res CPU passes
@@ -293,16 +354,17 @@ class OpenPoseProcessor(BasePreprocessor):
             openpose_np = self._detector(
                 input_buffer,
                 detect_resolution=detect_resolution,
-                output_type='np',
+                output_type='np_native',
                 include_hands=True,
                 include_face=True,
             )
-
-            openpose_temp = torch.from_numpy(openpose_np).permute(2, 0, 1).to(self.torch_dtype) * (1.0 / 255.0)
-            del openpose_np
-
-            output_buffer.copy_(openpose_temp)
-            del openpose_temp
+            # Upload the small skeleton image and finish on the GPU (upscale + fp16 scale):
+            # replaces a CPU LANCZOS4 resize to full resolution + CPU fp16 conversion (~2 ms).
+            pose_gpu = torch.from_numpy(openpose_np).to(self.device).permute(2, 0, 1).unsqueeze(0).to(self.torch_dtype)
+            if pose_gpu.shape[-2:] != (h, w):
+                pose_gpu = torch.nn.functional.interpolate(pose_gpu, size=(h, w), mode='bilinear', align_corners=False)
+            output_buffer.copy_(pose_gpu[0] * (1.0 / 255.0))
+            del openpose_np, pose_gpu
 
             self._cached_result = output_buffer
             return output_buffer

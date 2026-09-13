@@ -548,6 +548,181 @@ def install_kvo_processors(unet, max_frames=1, use_feature_injection=True,
     return processors
 
 
+class KvoRingAttnProcessor2_0(KvoPassthroughAttnProcessor2_0):
+    """StreamV2V self-attention with a ring cache as engine I/O (TRT-compatible).
+
+    ``_cache_in`` is a tuple of ``max_frames`` tensors, one per cached frame, each
+    (3, B, seq, dim) stacking [key, value, output]; ``_cache_out`` is the current frame's
+    (3, B, seq, dim). Unlike KvoPassthroughAttnProcessor2_0 nothing shifts or stacks the
+    whole cache inside the graph: the runtime rotates buffer addresses instead
+    (tensorrt/engine.py), so the engine reads the cache once, writes only the new frame and
+    no per-frame copy is needed. The order of cached frames is irrelevant: attention over
+    the concatenated keys and the nearest-neighbour feature match are permutation-invariant.
+
+    Speed/quality options (see StreamV2VConfig): ``attn_cache_pool`` average-pools the
+    cached keys/values NxN (``hw`` = the block's latent (h, w)) before the extended
+    attention; ``fi_last_frame_only`` matches features against the newest cached frame
+    only; ``use_cache_attn=False`` keeps this block's attention on the current frame.
+    """
+
+    def __init__(self, *args, attn_cache_pool=1, fi_last_frame_only=False, use_cache_attn=True,
+                 hw=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.attn_cache_pool = int(attn_cache_pool or 1)
+        self.fi_last_frame_only = bool(fi_last_frame_only)
+        self.use_cache_attn = bool(use_cache_attn)
+        self.hw = tuple(hw) if hw is not None else None
+        if self.attn_cache_pool > 1 and (
+            self.hw is None or self.hw[0] % self.attn_cache_pool or self.hw[1] % self.attn_cache_pool
+        ):
+            self.attn_cache_pool = 1  # resolution not divisible: pooling off for this block
+
+    def _pool_cached(self, x):
+        """(B, h*w, dim) cached tokens -> (B, h*w/p^2, dim) by p x p average pooling."""
+        p = self.attn_cache_pool
+        if p == 1:
+            return x
+        h, w = self.hw
+        b, _, d = x.shape
+        return x.reshape(b, h // p, p, w // p, p, d).mean(dim=(2, 4)).reshape(b, -1, d)
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None,
+                 attention_mask=None, temb=None, **kwargs):
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+
+        is_selfattn = encoder_hidden_states is None
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        cache = self._cache_in if (is_selfattn and self._cache_in) else None
+        curr_key, curr_value = key, value
+        if cache is not None and self.use_cache_attn:
+            key = torch.cat([curr_key] + [self._pool_cached(c[0]) for c in cache], dim=1)
+            value = torch.cat([curr_value] + [self._pool_cached(c[1]) for c in cache], dim=1)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        # Feature Injection (decoder blocks only), matched against the cached frames
+        # (the newest one is last).
+        if (cache is not None and self.is_decoder_block and self.use_feature_injection
+                and self.fi_strength > 0.0):
+            fi_cache = cache[-1:] if self.fi_last_frame_only else cache
+            cached_output = torch.cat([c[2] for c in fi_cache], dim=1)
+            nn_feats = _get_nn_feats(hidden_states, cached_output, threshold=self.fi_threshold)
+            hidden_states = hidden_states * (1.0 - self.fi_strength) + self.fi_strength * nn_feats
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        if is_selfattn:
+            if input_ndim == 4:
+                curr_output = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+            else:
+                curr_output = hidden_states
+            self._cache_out = torch.stack([curr_key, curr_value, curr_output], dim=0)
+
+        return hidden_states
+
+
+def get_kvo_cache_hw(unet, height=512, width=512):
+    """Latent (h, w) of each attn1, in the same order as get_kvo_cache_info."""
+    h, w = height // 8, width // 8
+    hw = []
+    for block in unet.down_blocks:
+        if hasattr(block, 'attentions') and block.attentions is not None:
+            for attn_block in block.attentions:
+                hw += [(h, w)] * len(attn_block.transformer_blocks)
+        if hasattr(block, 'downsamplers') and block.downsamplers is not None:
+            h //= 2
+            w //= 2
+    if hasattr(unet.mid_block, 'attentions') and unet.mid_block.attentions is not None:
+        for attn_block in unet.mid_block.attentions:
+            hw += [(h, w)] * len(attn_block.transformer_blocks)
+    for block in unet.up_blocks:
+        if hasattr(block, 'attentions') and block.attentions is not None:
+            for attn_block in block.attentions:
+                hw += [(h, w)] * len(attn_block.transformer_blocks)
+        if hasattr(block, 'upsamplers') and block.upsamplers is not None:
+            h *= 2
+            w *= 2
+    return hw
+
+
+def install_kvo_ring_processors(unet, max_frames=1, use_feature_injection=True,
+                                fi_strength=0.8, fi_threshold=0.98,
+                                attn_cache_pool=1, fi_last_frame_only=False,
+                                attn_decoder_only=False, height=512, width=512):
+    """Install a KvoRingAttnProcessor2_0 on each attn1; return the ordered list.
+    ``attn_decoder_only``: down blocks keep plain self-attention (their cache ports stay
+    in the engine I/O but are not read)."""
+    attn1_modules = _get_unet_attn1_modules_in_order(unet)
+    hw = get_kvo_cache_hw(unet, height, width)
+    n_down = sum(
+        len(ab.transformer_blocks) for b in unet.down_blocks
+        if getattr(b, 'attentions', None) is not None for ab in b.attentions
+    )
+    processors = []
+    for i, (attn_module, is_decoder) in enumerate(attn1_modules):
+        proc = KvoRingAttnProcessor2_0(
+            name=f"attn1_{i}",
+            is_decoder_block=is_decoder,
+            use_feature_injection=use_feature_injection,
+            feature_injection_strength=fi_strength,
+            feature_similarity_threshold=fi_threshold,
+            max_frames=max_frames,
+            attn_cache_pool=attn_cache_pool,
+            fi_last_frame_only=fi_last_frame_only,
+            use_cache_attn=(not attn_decoder_only) or i >= n_down,
+            hw=hw[i] if i < len(hw) else None,
+        )
+        attn_module.set_processor(proc)
+        processors.append(proc)
+    return processors
+
+
 class TorchUNetKvoWrapper(torch.nn.Module):
     """ONNX-export wrapper that threads kvo cache as engine I/O.
 

@@ -41,8 +41,12 @@ class StreamDiffusionSmodeTexture:
         )
 
     def copy_smode_to_stream_diffusion(self):
-        """Copy smode_tensor into stream_diffusion_tensor with implicit dtype cast."""
+        """Copy smode_tensor into stream_diffusion_tensor with implicit dtype cast, clamped to
+        [0, 1]: Smode can deliver HDR values above 1, which the VAE encoder and the ControlNet
+        preprocessors would otherwise receive out of range (blown highlights, edge/depth
+        artifacts)."""
         self.stream_diffusion_tensor.copy_(self.smode_tensor)
+        self.stream_diffusion_tensor.clamp_(0.0, 1.0)
 
     def get_permuted_input_tensor(self) -> torch.Tensor:
         """Return CHW + vertically flipped input in a single GPU copy."""

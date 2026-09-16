@@ -68,6 +68,21 @@ def _loras_touch_text_encoders(lora_dict) -> Optional[bool]:
     return False
 
 
+# Default SDXL tiny VAE. taesdxl decodes with visibly fewer block/screen-door artifacts than
+# cqyan/hybrid-sd-tinyvae-xl at the same speed (same latent, 28.6 vs 27.4 dB against the full
+# SDXL VAE, measured 2026-09-16). SD 1.5 keeps its own tiny VAE (madebyollin/taesd, wrapper.py).
+SDXL_TINY_VAE_DEFAULT = "madebyollin/taesdxl"
+
+
+def _vae_engine_suffix(use_tiny_vae: bool, tiny_vae_id) -> str:
+    """Cache-key suffix of the VAE engines: the tiny VAE model they were exported from
+    (``vae_decoder--taesdxl.engine``); empty for the model's own full VAE."""
+    if not use_tiny_vae or not tiny_vae_id:
+        return ""
+    slug = str(tiny_vae_id).replace("\\", "/").rstrip("/").split("/")[-1].lower()
+    return "--" + "".join(c if c.isalnum() or c in "-_." else "-" for c in slug)
+
+
 def _v2v_variant_suffix(options) -> str:
     """Engine filename tag of the StreamV2V speed/quality options (empty when all off)."""
     options = options or {}
@@ -86,6 +101,7 @@ def _derive_engine_paths_sdxl(
     model_id_or_path, use_lcm_lora, use_tiny_vae, lora_dict, engine_dir,
     trt_unet_batch_size, vae_batch_size, mode, height, width,
     streamv2v_on=False, streamv2v_maxframes=1, precision="fp16", streamv2v_variant="",
+    vae_id=None,
 ):
     """Derive on-disk paths for the SDXL TRT engines.
 
@@ -113,15 +129,16 @@ def _derive_engine_paths_sdxl(
         create_prefix(trt_unet_batch_size, trt_unet_batch_size),
         unet_filename,
     )
+    vae_sfx = _vae_engine_suffix(use_tiny_vae, vae_id or SDXL_TINY_VAE_DEFAULT)
     vae_encoder_path = os.path.join(
         engine_dir,
         create_prefix(vae_batch_size, vae_batch_size),
-        "vae_encoder.engine",
+        f"vae_encoder{vae_sfx}.engine",
     )
     vae_decoder_path = os.path.join(
         engine_dir,
         create_prefix(vae_batch_size, vae_batch_size),
-        "vae_decoder.engine",
+        f"vae_decoder{vae_sfx}.engine",
     )
     return unet_path, vae_encoder_path, vae_decoder_path
 
@@ -259,6 +276,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                     streamv2v_on=v2v_on, streamv2v_maxframes=v2v_maxframes,
                     precision=self._effective_precision(v2v_on),
                     streamv2v_variant=_v2v_variant_suffix(getattr(self, "streamv2v_options", None)),
+                    vae_id=vae_id,
                 )
                 if (engine_ready(unet_path) and engine_ready(vae_enc_path)
                         and engine_ready(vae_dec_path)):
@@ -293,16 +311,18 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                             stream.configure_scheduler(model_type="default")
 
                         tiny_vae_id = (
-                            vae_id if vae_id is not None else "cqyan/hybrid-sd-tinyvae-xl"
+                            vae_id if vae_id is not None else SDXL_TINY_VAE_DEFAULT
                         )
                         try:
                             stream.vae = AutoencoderTiny.from_pretrained(tiny_vae_id).to(
                                 device=self.device, dtype=self.dtype
                             )
                         except Exception:
-                            stream.vae = AutoencoderTiny.from_pretrained(
-                                "madebyollin/taesdxl"
-                            ).to(device=self.device, dtype=self.dtype)
+                            tiny_vae_id = SDXL_TINY_VAE_DEFAULT
+                            stream.vae = AutoencoderTiny.from_pretrained(tiny_vae_id).to(
+                                device=self.device, dtype=self.dtype
+                            )
+                        self._tiny_vae_id = tiny_vae_id
                         # Mirror _configure_vae fixes so the TRT engine inherits the right config.
                         if getattr(stream.vae.config, "scaling_factor", None) is None:
                             stream.vae.config.scaling_factor = 1.0
@@ -533,21 +553,25 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
 
     def _configure_vae(self, stream, pipe, use_tiny_vae, vae_id, cache_dir):
         """Configure SDXL VAE (hybrid TinyVAE / taesdxl + scaling factors)."""
+        self._tiny_vae_id = None
         if use_tiny_vae:
             if vae_id is not None:
                 vae_model_name = vae_id
             else:
-                vae_model_name = "cqyan/hybrid-sd-tinyvae-xl"
+                vae_model_name = SDXL_TINY_VAE_DEFAULT
 
             try:
                 stream.vae = AutoencoderTiny.from_pretrained(vae_model_name).to(
                     device=pipe.device, dtype=pipe.dtype
                 )
             except Exception as e:
-                logging.warning(f"[TinyVAE] Failed to load {vae_model_name}: {e}, falling back to taesdxl")
-                stream.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl").to(
+                logging.warning(f"[TinyVAE] Failed to load {vae_model_name}: {e}, falling back to {SDXL_TINY_VAE_DEFAULT}")
+                vae_model_name = SDXL_TINY_VAE_DEFAULT
+                stream.vae = AutoencoderTiny.from_pretrained(vae_model_name).to(
                     device=pipe.device, dtype=pipe.dtype
                 )
+            self._tiny_vae_id = vae_model_name
+            logging.info(f"[TinyVAE] {vae_model_name}")
 
             if getattr(stream.vae.config, 'scaling_factor', None) is None:
                 stream.vae.config.scaling_factor = 1.0
@@ -665,11 +689,13 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             unet_filename,
         )
         batch = self.batch_size if self.mode == "txt2img" else stream.frame_bff_size
+        # VAE engines are keyed by the tiny VAE they were exported from (see _vae_engine_suffix).
+        vae_sfx = _vae_engine_suffix(use_tiny_vae, getattr(self, "_tiny_vae_id", None))
         vae_encoder_path = os.path.join(
-            engine_dir, create_prefix(model_id_or_path, batch, batch), "vae_encoder.engine",
+            engine_dir, create_prefix(model_id_or_path, batch, batch), f"vae_encoder{vae_sfx}.engine",
         )
         vae_decoder_path = os.path.join(
-            engine_dir, create_prefix(model_id_or_path, batch, batch), "vae_decoder.engine",
+            engine_dir, create_prefix(model_id_or_path, batch, batch), f"vae_decoder{vae_sfx}.engine",
         )
 
         needs_build = not (

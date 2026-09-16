@@ -36,17 +36,30 @@ def discard_build_intermediates(engine_path: str) -> None:
         names = os.listdir(d)
     except OSError:
         return
+    targets = []
     for n in names:
         p = os.path.join(d, n)
         is_export = n.startswith(base + ".onnx") or n.startswith(base + ".opt.onnx")
         is_shard = (n.startswith("onnx__") or n.endswith(".weight") or n.endswith(".bias")) and ".engine" not in n
-        if not (is_export or is_shard) or not os.path.isfile(p):
-            continue
-        try:
-            freed += os.path.getsize(p)
-            os.remove(p)
-        except OSError as e:
-            logging.debug(f"[Engine cache] could not remove {p}: {e}")
+        if (is_export or is_shard) and os.path.isfile(p):
+            targets.append(p)
+    for attempt in range(2):
+        left = []
+        for p in targets:
+            try:
+                size = os.path.getsize(p)
+                os.remove(p)
+                freed += size
+            except OSError:
+                left.append(p)  # typically still mapped by the ONNX parser right after a build
+        targets = left
+        if not targets:
+            break
+        import gc
+        gc.collect()
+    if targets:
+        # Picked up at the next cache hit (engine_ready calls this again).
+        logging.info(f"[Engine cache] {base}: {len(targets)} ONNX intermediate(s) still in use, deferred")
     tmp = engine_path + ".onnx.export_tmp"
     if os.path.isdir(tmp):
         import shutil
@@ -94,4 +107,5 @@ def engine_ready(engine_path) -> bool:
             f"running {ver} - rebuilding"
         )
         return False
+    discard_build_intermediates(engine_path)
     return True

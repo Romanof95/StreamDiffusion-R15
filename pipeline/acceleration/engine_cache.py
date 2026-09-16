@@ -23,16 +23,49 @@ def _trt_version():
         return None
 
 
-def mark_engine(engine_path: str) -> None:
-    """Record the TensorRT version next to a freshly built engine."""
-    ver = _trt_version()
-    if ver is None:
-        return
+def discard_build_intermediates(engine_path: str) -> None:
+    """Delete the ONNX export artifacts next to a freshly built engine: ``<engine>.onnx``,
+    ``<engine>.opt.onnx``, their ``.data`` external-weight files, and the per-tensor weight
+    shards torch.onnx.export spills into the directory for >2 GB models. They are only read
+    while building; left behind they weigh more than the engines themselves (~60 GB seen).
+    A later rebuild (TensorRT upgrade) simply re-exports."""
+    d = os.path.dirname(engine_path) or "."
+    base = os.path.basename(engine_path)
+    freed = 0
     try:
-        with open(engine_path + MARKER_SUFFIX, "w", encoding="utf-8") as f:
-            f.write(ver)
-    except OSError as e:
-        logging.warning(f"[Engine cache] Could not write marker for {engine_path}: {e}")
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(d, n)
+        is_export = n.startswith(base + ".onnx") or n.startswith(base + ".opt.onnx")
+        is_shard = (n.startswith("onnx__") or n.endswith(".weight") or n.endswith(".bias")) and ".engine" not in n
+        if not (is_export or is_shard) or not os.path.isfile(p):
+            continue
+        try:
+            freed += os.path.getsize(p)
+            os.remove(p)
+        except OSError as e:
+            logging.debug(f"[Engine cache] could not remove {p}: {e}")
+    tmp = engine_path + ".onnx.export_tmp"
+    if os.path.isdir(tmp):
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+    if freed:
+        logging.info(f"[Engine cache] {base}: ONNX build intermediates removed ({freed / 2**30:.2f} GB)")
+
+
+def mark_engine(engine_path: str) -> None:
+    """Record the TensorRT version next to a freshly built engine and drop its ONNX
+    intermediates (see ``discard_build_intermediates``)."""
+    ver = _trt_version()
+    if ver is not None:
+        try:
+            with open(engine_path + MARKER_SUFFIX, "w", encoding="utf-8") as f:
+                f.write(ver)
+        except OSError as e:
+            logging.warning(f"[Engine cache] Could not write marker for {engine_path}: {e}")
+    discard_build_intermediates(engine_path)
 
 
 def engine_ready(engine_path) -> bool:

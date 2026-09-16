@@ -17,7 +17,9 @@ from diffusers import ControlNetModel
 
 from ipc import Acceleration
 from pipeline.acceleration.engine_cache import engine_ready
-from pipeline.acceleration.quantization import normalize_precision, precision_suffix, quantization_available
+from pipeline.acceleration.quantization import (
+    normalize_precision, precision_suffix, quantization_available, hardware_precision,
+)
 
 # xinsir/controlnet-union-sdxl-1.0 control-type indices. Order is fixed by
 # the model's training schedule; do not reorder. The control_add_embedding
@@ -464,7 +466,7 @@ class ControlNetManager:
             return "fp16"
         if prec == "fp16" or not quantization_available():
             return "fp16"
-        return prec
+        return hardware_precision(prec)
 
     def _make_union_calibration_loop(self, names: List[str], control_type_idx, batch: int,
                                      n_images: int = 12):

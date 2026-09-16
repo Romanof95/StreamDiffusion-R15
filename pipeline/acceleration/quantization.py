@@ -59,6 +59,31 @@ def precision_suffix(precision: str) -> str:
     return "" if p == "fp16" else f"--prec-{p}"
 
 
+_hw_warned = False
+
+
+def hardware_precision(precision: str) -> str:
+    """`precision` if the GPU can run it, else fp16. MXFP8/NVFP4 engines need the block-scaled
+    GEMM kernels of SM120 (RTX 50 / Blackwell); on older GPUs the quantized build would run a
+    long quantization only to fail (or be slower), so downgrade up front."""
+    global _hw_warned
+    p = normalize_precision(precision)
+    if p == "fp16":
+        return p
+    try:
+        import torch
+        major, minor = torch.cuda.get_device_capability(0)
+        name = torch.cuda.get_device_name(0)
+    except Exception:
+        return p
+    if major >= 12:
+        return p
+    if not _hw_warned:
+        logging.warning(f"[Quant] precision={p} needs an RTX 50 (SM120) GPU; {name} is SM{major}{minor}: using fp16")
+        _hw_warned = True
+    return "fp16"
+
+
 def quantization_available() -> bool:
     try:
         import modelopt.torch.quantization  # noqa: F401

@@ -12,6 +12,7 @@ import torch
 from diffusers import AutoencoderTiny, LCMScheduler, StableDiffusionXLPipeline
 from pipeline.acceleration.engine_cache import engine_ready
 from pipeline.acceleration.quantization import (
+    hardware_precision,
     normalize_precision, precision_suffix, quantization_available,
 )
 from PIL import Image
@@ -611,7 +612,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         if not quantization_available():
             logging.warning(f"[Quant] precision={prec} ignored: nvidia-modelopt not available")
             return "fp16"
-        return prec
+        return hardware_precision(prec)
 
     def enable_tensorrt_acceleration(
         self, stream: StreamDiffusionXL, model_id_or_path: str,

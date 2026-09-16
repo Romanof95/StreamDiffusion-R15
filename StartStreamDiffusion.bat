@@ -24,7 +24,7 @@ REM   ATTN_POOL=2   : cached keys/values pooled 2x2 before the extended attentio
 REM   FI_LAST=1     : feature injection matched against the newest cached frame only
 REM   ATTN_DECODER=1: extended attention in mid/up blocks only
 REM Diagnostics: [PERF] log line every 60 frames (GPU breakdown, frame-time spread, wait for Smode).
- set STREAMDIFFUSION_PROFILING=1
+REM set STREAMDIFFUSION_PROFILING=1
  set STREAMDIFFUSION_V2V_ATTN_POOL=2
  set STREAMDIFFUSION_V2V_FI_LAST=1
  set STREAMDIFFUSION_V2V_ATTN_DECODER=1

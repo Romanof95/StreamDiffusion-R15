@@ -160,7 +160,8 @@ echo [INFO] This step may take 15-20 minutes depending on your connection...
 echo.
 echo Main packages that will be installed:
 echo   - PyTorch 2.10.0 stable + CUDA 12.8 (runtime PyTorch)
-echo   - TensorRT 10.9.0.34
+echo   - TensorRT 10.16.1.11 (+ polygraphy, onnx-graphsurgeon, cuda-python)
+echo   - NVIDIA ModelOpt 0.46.0 (MXFP8 / NVFP4 quantized engines, RTX 50)
 echo   - diffusers 0.36.0 (Hugging Face)
 echo   - transformers 4.57.1
 echo   - controlnet-aux 0.0.10 (Canny, Depth, OpenPose)

@@ -1,4 +1,4 @@
---extra-index-url https://pypi.ngc.nvidia.com
+# (pypi.ngc.nvidia.com removed: unreachable in 2026, everything below resolves from PyPI + the PyTorch cu128 index)
 --extra-index-url https://download.pytorch.org/whl/cu128
 
 # Core ML frameworks
@@ -9,7 +9,9 @@ diffusers==0.36.0
 transformers==4.57.1
 
 # TensorRT acceleration
-tensorrt==10.16.1.11          # 10.16: SM120 (RTX 50) block-scaled FP8/FP4 GEMM kernels used by the mxfp8/nvfp4 precision modes
+# 10.16: SM120 (RTX 50) block-scaled FP8/FP4 GEMM kernels used by the mxfp8/nvfp4 precision modes.
+# CUDA 12 variant only: the `tensorrt` meta package also pulls tensorrt_cu13*, which overwrites the
+# same DLLs (last install wins) and needs a CUDA 13 driver. The cu12 wheels provide `import tensorrt`.
 tensorrt-cu12==10.16.1.11
 tensorrt-cu12-bindings==10.16.1.11
 tensorrt-cu12-libs==10.16.1.11
@@ -63,6 +65,7 @@ psutil>=5.9       # Process priority + memory info (low_latency_mode in SmodeStr
 
 # Python bindings for CUDA
 cuda-python==12.8.0
+nvidia-ml-py==13.610.43       # pynvml module: GPU clock sampling in the [PERF] diagnostics (also a ModelOpt dependency)
 
 # Transformers tokenizers (required by transformers 4.57.1)
 tokenizers==0.22.1

@@ -69,8 +69,28 @@ def main():
     print()
 
     # Test 7: tokenizers
-    print("[7/7] Test tokenizers...")
+    print("[7/10] Test tokenizers...")
     all_ok &= test_import("tokenizers", lambda: __import__("tokenizers"))
+    print()
+
+    # Test 8: TensorRT stack (engines, ONNX export, CUDA runtime bindings)
+    print("[8/10] Test TensorRT stack...")
+    all_ok &= test_import("tensorrt", lambda: __import__("tensorrt"))
+    all_ok &= test_import("polygraphy", lambda: __import__("polygraphy.backend.trt"))
+    all_ok &= test_import("onnx-graphsurgeon", lambda: __import__("onnx_graphsurgeon"))
+    all_ok &= test_import("cuda-python", lambda: __import__("cuda.cudart"))
+    print()
+
+    # Test 9: quantized engines (precision mxfp8 / nvfp4) — NVIDIA ModelOpt + ONNX exporters
+    print("[9/10] Test ModelOpt (quantized engines)...")
+    all_ok &= test_import("nvidia-modelopt", lambda: __import__("modelopt.torch.quantization"))
+    all_ok &= test_import("modelopt onnx exporters",
+        lambda: __import__("modelopt.onnx.export", fromlist=["MXFP8QuantExporter", "NVFP4QuantExporter"]))
+    print()
+
+    # Test 10: NVML (GPU clock sampling in the [PERF] diagnostics)
+    print("[10/10] Test pynvml...")
+    all_ok &= test_import("nvidia-ml-py", lambda: __import__("pynvml"))
     print()
 
     # insightface (IP-Adapter FaceID) is intentionally not installed by

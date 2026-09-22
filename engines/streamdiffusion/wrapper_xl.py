@@ -300,7 +300,9 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                         )
 
                         is_lightning_model = "lightning" in model_id_or_path.lower()
-                        is_hyper_model = "hyper" in model_id_or_path.lower()
+                        is_hyper_model = "hyper" in model_id_or_path.lower() or any(
+                            "hyper" in str(k).lower() for k in (lora_dict or {}).keys()
+                        )
                         if self.sd_turbo:
                             stream.configure_scheduler(model_type="turbo")
                         elif is_hyper_model:

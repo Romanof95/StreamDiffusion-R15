@@ -23,6 +23,10 @@ REM builds its own engine once (~5 min). Uncomment to test:
 REM   ATTN_POOL=2   : cached keys/values pooled 2x2 before the extended attention
 REM   FI_LAST=1     : feature injection matched against the newest cached frame only
 REM   ATTN_DECODER=1: extended attention in mid/up blocks only
+REM Multi-step (2+ t_index) on SDXL: steps run sequentially in the batch-1 engines (no batch-N
+REM engine build, one frame of latency). Options:
+REM   set STREAMDIFFUSION_CN_FIRST_STEP_ONLY=1   ControlNet on the first step only (~-16 ms/frame)
+REM   set STREAMDIFFUSION_DENOISING_BATCH=1      legacy StreamDiffusion stream batch (batch-N engine)
 REM Diagnostics: [PERF] log line every 60 frames (GPU breakdown, frame-time spread, wait for Smode).
 REM set STREAMDIFFUSION_PROFILING=1
  set STREAMDIFFUSION_V2V_ATTN_POOL=2

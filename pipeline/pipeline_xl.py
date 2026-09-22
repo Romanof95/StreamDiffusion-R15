@@ -1,5 +1,6 @@
 import time
 import logging
+import os
 from typing import List, Optional, Union, Any, Dict, Tuple, Literal
 from collections import OrderedDict
 
@@ -87,6 +88,18 @@ class StreamDiffusionXL:
 
         self.do_add_noise = do_add_noise
         self.use_denoising_batch = use_denoising_batch
+        # Sequential multi-step: ControlNet on the first step only (diffusers'
+        # control_guidance_end), saves one ControlNet pass per extra step.
+        self._cn_first_step_only = os.environ.get("STREAMDIFFUSION_CN_FIRST_STEP_ONLY", "0") == "1"
+        # True while an intermediate sequential step runs: the StreamV2V cache must not
+        # advance (one cache entry per frame, taken from the last step).
+        self._v2v_hold = False
+        if not use_denoising_batch and self.denoising_steps_num > 1:
+            logging.info(
+                f"[Multi-step] {self.denoising_steps_num} sequential steps per frame in the "
+                f"batch-{frame_buffer_size} engine"
+                + (" (ControlNet on the first step only)" if self._cn_first_step_only else "")
+            )
 
         self.similar_image_filter = True
         self.similar_filter = SimilarImageFilter(threshold=0.98, max_skip_frame=3)
@@ -332,7 +345,7 @@ class StreamDiffusionXL:
     ) -> None:
         self.generator = generator
         self.generator.manual_seed(seed)
-        if self.denoising_steps_num > 1:
+        if self.denoising_steps_num > 1 and self.use_denoising_batch:
             self.x_t_latent_buffer = torch.zeros(
                 (
                     (self.denoising_steps_num - 1) * self.frame_bff_size,
@@ -463,7 +476,8 @@ class StreamDiffusionXL:
         )
 
         self.init_noise = torch.randn(
-            (self.batch_size, 4, self.latent_height, self.latent_width),
+            (max(self.batch_size, self.denoising_steps_num * self.frame_bff_size),
+             4, self.latent_height, self.latent_width),
             generator=generator,
         ).to(device=self.device, dtype=self.dtype)
 
@@ -794,7 +808,8 @@ class StreamDiffusionXL:
                 **unet_kwargs,
             )[0]
 
-            update_cache_after_unet(self.unet)
+            if not self._v2v_hold:
+                update_cache_after_unet(self.unet)
         finally:
             if down_block_res_samples is not None:
                 del down_block_res_samples
@@ -859,7 +874,7 @@ class StreamDiffusionXL:
         return self.vae.decode(latents, return_dict=False)[0]
 
     def _ensure_cn_ring(self, ring_key: Tuple[int, int], current_cond: torch.Tensor) -> Optional[torch.Tensor]:
-        if self.denoising_steps_num <= 1:
+        if self.denoising_steps_num <= 1 or not self.use_denoising_batch:
             return None
         if current_cond.dim() == 3:
             cur4d = current_cond.unsqueeze(0)
@@ -877,7 +892,7 @@ class StreamDiffusionXL:
         return ring
 
     def _build_per_slot_cond_one(self, ring_key: Tuple[int, int], current_cond: torch.Tensor) -> torch.Tensor:
-        if self.denoising_steps_num <= 1:
+        if self.denoising_steps_num <= 1 or not self.use_denoising_batch:
             return current_cond
         ring = self._ensure_cn_ring(ring_key, current_cond)
         if current_cond.dim() == 3:
@@ -890,7 +905,7 @@ class StreamDiffusionXL:
         return torch.cat([cur4d, ring], dim=0)
 
     def _build_per_slot_cond(self, cn_index: int, cn_image):
-        if self.denoising_steps_num <= 1:
+        if self.denoising_steps_num <= 1 or not self.use_denoising_batch:
             if isinstance(cn_image, list):
                 return [c.unsqueeze(0) if torch.is_tensor(c) and c.dim() == 3 else c
                         for c in cn_image]
@@ -900,7 +915,7 @@ class StreamDiffusionXL:
         return self._build_per_slot_cond_one((cn_index, 0), cn_image)
 
     def _rotate_cn_ring(self, cn_index: int, cn_image) -> None:
-        if self.denoising_steps_num <= 1:
+        if self.denoising_steps_num <= 1 or not self.use_denoising_batch:
             return
         items = cn_image if isinstance(cn_image, list) else [cn_image]
         fb = self.frame_bff_size
@@ -919,6 +934,15 @@ class StreamDiffusionXL:
                         ring[(_k - 1) * fb:_k * fb]
                     )
             ring[:fb].copy_(cur4d.to(self.dtype))
+
+    def _set_v2v_hold(self, hold: bool) -> None:
+        """Freeze the StreamV2V cache during intermediate sequential steps: the TensorRT
+        ring keeps its phase (the final step overwrites the same free slot), the PyTorch
+        processors skip update_cache_after_unet."""
+        self._v2v_hold = hold
+        unet = self.unet
+        if hasattr(unet, "hold_ring_phase"):
+            unet.hold_ring_phase = hold
 
     def _refill_buffer_from_current(self, x_t_latent: torch.Tensor) -> None:
         if self.x_t_latent_buffer is None:
@@ -998,29 +1022,32 @@ class StreamDiffusionXL:
                 x_0_pred_out = x_0_pred_batch
                 self.x_t_latent_buffer = None
         else:
-            self.init_noise = x_t_latent
+            # Sequential multi-step: the steps run one after the other on the current frame
+            # in the batch-1 engine. No extra frame of latency, no batch-N engine. Same
+            # x0-prediction + re-noise scheme as the stream batch, with the fixed per-step
+            # noise (a fresh draw per frame flickers). Assumes frame_buffer_size == 1.
+            n_steps = len(self.sub_timesteps_tensor)
             for idx, t in enumerate(self.sub_timesteps_tensor):
+                last = idx == n_steps - 1
                 t = t.view(1,).repeat(self.frame_bff_size,)
-                x_0_pred, model_pred = self.unet_step(
-                    x_t_latent,
-                    t,
-                    idx,
-                    controlnet_image=controlnet_image,
-                    controlnet_model=controlnet_model,
-                    controlnet_conditioning_scale=controlnet_conditioning_scale,
-                    ip_adapter_image_embeds=ip_adapter_image_embeds,
-                )
-                if idx < len(self.sub_timesteps_tensor) - 1:
+                use_cn = controlnet_model is not None and (idx == 0 or not self._cn_first_step_only)
+                self._set_v2v_hold(not last)
+                try:
+                    x_0_pred, model_pred = self.unet_step(
+                        x_t_latent,
+                        t,
+                        idx,
+                        controlnet_image=controlnet_image if use_cn else None,
+                        controlnet_model=controlnet_model if use_cn else None,
+                        controlnet_conditioning_scale=controlnet_conditioning_scale,
+                        ip_adapter_image_embeds=ip_adapter_image_embeds,
+                    )
+                finally:
+                    self._set_v2v_hold(False)
+                if not last:
+                    x_t_latent = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
                     if self.do_add_noise:
-                        x_t_latent = self.alpha_prod_t_sqrt[
-                            idx + 1
-                        ] * x_0_pred + self.beta_prod_t_sqrt[
-                            idx + 1
-                        ] * torch.randn_like(
-                            x_0_pred, device=self.device, dtype=self.dtype
-                        )
-                    else:
-                        x_t_latent = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
+                        x_t_latent = x_t_latent + self.beta_prod_t_sqrt[idx + 1] * self.init_noise[idx + 1:idx + 2]
             x_0_pred_out = x_0_pred
 
         return x_0_pred_out

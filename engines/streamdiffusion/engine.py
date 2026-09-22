@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 from typing import Any, Dict, Optional, Union
 
 import torch
@@ -87,7 +88,13 @@ class StreamDiffusionEngine(BaseEngine):
             enable_similar_image_filter=config.get("similar_image_filter_enabled", True),
             similar_image_filter_threshold=config.get("similar_image_filter_threshold", 0.95),
             similar_image_filter_max_skip_frame=config.get("similar_image_filter_max_skip", 10),
-            use_denoising_batch=True,
+            # SDXL multi-step runs the steps sequentially in the batch-1 engines (see
+            # StreamDiffusionXL.predict_x0_batch): the StreamDiffusion stream batch needs a
+            # batch-N engine, whose quantized (nvfp4/mxfp8) builds lose the prompt, and adds a
+            # frame of latency per step for no throughput at 1024 on a saturated GPU.
+            # STREAMDIFFUSION_DENOISING_BATCH=1 restores the stream batch. SD 1.5 keeps it.
+            use_denoising_batch=(not self.is_sdxl)
+            or os.environ.get("STREAMDIFFUSION_DENOISING_BATCH", "0") == "1",
             cfg_type=runtime["cfg_type"],
             seed=runtime["seed"],
             dtype=runtime["torch_dtype"],

@@ -94,11 +94,8 @@ class BaseStreamDiffusionWrapper(ABC):
                         "txt2img mode cannot use denoising batch with frame_buffer_size > 1."
                     )
 
-        if mode == "img2img":
-            if not use_denoising_batch:
-                raise NotImplementedError(
-                    "img2img mode must use denoising batch for now."
-                )
+        # img2img without the denoising batch = sequential multi-step on the batch-1
+        # engines (StreamDiffusionXL.predict_x0_batch); the SD 1.5 adapter always batches.
 
         self.device = device
         self.dtype = dtype

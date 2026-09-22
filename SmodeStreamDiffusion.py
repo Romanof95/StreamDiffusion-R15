@@ -652,10 +652,12 @@ class App:
                     elif update_t_index_list:
                         new_len = len(self.t_index_list)
                         old_len = self.stream.stream.denoising_steps_num
-                        # TRT bakes batch = denoising_steps x frame_buffer statically;
-                        # rebuild when step count changes. PyTorch handles dynamic batch.
+                        # Stream batch: TRT bakes batch = denoising_steps x frame_buffer,
+                        # rebuild when the step count changes. Sequential multi-step keeps
+                        # the batch-1 engine: prepare() below re-derives the per-step state.
                         if (new_len != old_len
-                                and self.acceleration == Acceleration.TENSORRT):
+                                and self.acceleration == Acceleration.TENSORRT
+                                and self.stream.stream.use_denoising_batch):
                             logging.info(
                                 f"[Engine] Denoising steps {old_len}->{new_len} "
                                 f"changes TRT batch; recreating stream."

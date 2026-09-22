@@ -58,6 +58,9 @@ class UNet2DConditionModelEngine:
         self._cache_maxframes = v2v_cache_maxframes
         self._ring = None
         self._ring_phase = 0
+        # Sequential multi-step: True on intermediate steps -> the phase does not advance
+        # (the final step of the frame rewrites the same free slot).
+        self.hold_ring_phase = False
         self._kvo_names = ()
         if self._is_v2v_ring:
             while f"kvo_out_{self._n_kvo}" in binding_names:
@@ -287,7 +290,8 @@ class UNet2DConditionModelEngine:
                         if name in self._kvo_present:
                             self.engine.bind_external(name, self._ring[(phase + j) % n_slots][i])
                     self.engine.bind_external(f"kvo_out_{i}", self._ring[(phase + self._cache_maxframes) % n_slots][i])
-            self._ring_phase = (phase + 1) % n_slots
+            if not self.hold_ring_phase:
+                self._ring_phase = (phase + 1) % n_slots
         elif self._is_v2v:
             if self._kvo_cache is None:
                 batch = latent_model_input.shape[0]
@@ -312,7 +316,7 @@ class UNet2DConditionModelEngine:
 
         # Legacy layout: copy kvo outputs into the local cache — the engine reuses its
         # output buffers, so without a copy the next call would race.
-        if self._is_v2v and not self._is_v2v_ring:
+        if self._is_v2v and not self._is_v2v_ring and not self.hold_ring_phase:
             for i in range(self._n_kvo):
                 self._kvo_cache[i].copy_(engine_outputs[f"kvo_out_{i}"])
 

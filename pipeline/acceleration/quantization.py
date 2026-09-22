@@ -299,6 +299,8 @@ def build_strongly_typed_engine(onnx_path: str, engine_path: str, input_profile:
     logging.info(f"[Quant] TensorRT strongly-typed build: {os.path.basename(engine_path)} "
                  f"(free VRAM {free_mem / 2**30:.1f} GB, workspace {workspace / 2**30:.1f} GB, 3-6 min)")
     try:
+        if os.environ.get("STREAMDIFFUSION_TRT_STRONGLY_TYPED", "1") == "0":
+            raise RuntimeError("strongly-typed build disabled (STREAMDIFFUSION_TRT_STRONGLY_TYPED=0)")
         network = network_from_onnx_path(onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM], strongly_typed=True)
         engine = engine_from_network(
             network,

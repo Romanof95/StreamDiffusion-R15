@@ -168,16 +168,66 @@ def make_gpu_wholebody(model_det_path: str, model_pose_path: str, device, warn=N
 
 
 # --------------------------------------------------------------------------- rasterizer
-def _paint(canvas: torch.Tensor, masks: torch.Tensor, colors: torch.Tensor) -> torch.Tensor:
-    """Overwrite canvas (H, W, 3) where masks (N, H, W) hold, later primitives winning
-    (cv2 draw order)."""
-    if masks.shape[0] == 0:
+# Patch pixels evaluated per batch of primitives. Each primitive is evaluated on its own
+# bounding patch only: evaluating all of them over the whole canvas took N x H x W scratch
+# per step (GBs at a 1024 detect resolution with a face and hands), and the caching
+# allocator kept every new peak reserved until the card was full.
+_PATCH_BUDGET = 1 << 21
+
+
+def _paint(canvas: torch.Tensor, shape_fn, prims, colors, reach: float) -> torch.Tensor:
+    """Overwrite canvas (H, W, 3) with primitives, later ones winning (cv2 draw order).
+    ``prims``: (N, 2) points or (N, 4) segments in canvas pixels; ``shape_fn(p, ys, xs)``
+    returns the (n, h, w) mask of primitives ``p`` over the pixel rows ``ys`` (n, h, 1) and
+    columns ``xs`` (n, 1, w); ``reach``: how far a primitive extends around its points."""
+    n = len(prims)
+    if n == 0:
         return canvas
-    n = masks.shape[0]
-    order = torch.arange(1, n + 1, device=canvas.device, dtype=torch.int32).view(n, 1, 1)
-    idx = (masks.to(torch.int32) * order).amax(0)                   # 0 = untouched
-    palette = torch.cat((torch.zeros(1, 3, device=canvas.device), colors), 0)
-    return torch.where((idx > 0).unsqueeze(-1), palette[idx.long()], canvas)
+    H, W = canvas.shape[:2]
+    dev = canvas.device
+    prims = np.asarray(prims, dtype=np.float32).reshape(n, -1)
+    px, py = prims[:, 0::2], prims[:, 1::2]
+    x0 = np.clip(np.floor(px.min(1) - reach) - 1, 0, W).astype(np.int64)
+    y0 = np.clip(np.floor(py.min(1) - reach) - 1, 0, H).astype(np.int64)
+    x1 = np.clip(np.ceil(px.max(1) + reach) + 2, 0, W).astype(np.int64)
+    y1 = np.clip(np.ceil(py.max(1) + reach) + 2, 0, H).astype(np.int64)
+    pw, ph = np.maximum(x1 - x0, 1), np.maximum(y1 - y0, 1)
+
+    # Largest patches first, cut into batches of bounded total patch area (contiguous
+    # ranges of this order, so one upload serves every batch).
+    if n * int(ph.max()) * int(pw.max()) <= _PATCH_BUDGET:          # dots, hands: one batch
+        order = np.arange(n)
+        chunks = [(0, n, int(ph.max()), int(pw.max()))]
+    else:
+        order = np.argsort(-(pw * ph), kind="stable")
+        chunks, start, mh, mw = [], 0, 0, 0
+        for k, i in enumerate(order):
+            h, w = max(mh, int(ph[i])), max(mw, int(pw[i]))
+            if k > start and (k - start + 1) * h * w > _PATCH_BUDGET:
+                chunks.append((start, k, mh, mw))
+                start, h, w = k, int(ph[i]), int(pw[i])
+            mh, mw = h, w
+        chunks.append((start, n, mh, mw))
+
+    # One upload: color, x0, y0, x1, y1, draw order (exact in float32), primitive coordinates.
+    host = np.concatenate((np.asarray(colors, dtype=np.float32).reshape(n, 3)[order],
+                           np.stack((x0, y0, x1, y1, np.arange(1, n + 1)), 1)[order].astype(np.float32),
+                           prims[order]), 1)
+    geo_all = torch.as_tensor(host, device=dev)
+    geo = geo_all[:, 3:]
+    idx = torch.zeros(H * W + 1, dtype=torch.int64, device=dev)    # 0 = untouched, H*W = discard
+    for s, e, h, w in chunks:
+        g = geo[s:e]
+        c = e - s
+        ys = g[:, 1].view(c, 1, 1) + torch.arange(h, device=dev, dtype=torch.float32).view(1, h, 1)
+        xs = g[:, 0].view(c, 1, 1) + torch.arange(w, device=dev, dtype=torch.float32).view(1, 1, w)
+        inside = (ys < g[:, 3].view(c, 1, 1)) & (xs < g[:, 2].view(c, 1, 1))
+        mask = shape_fn(g[:, 5:], ys, xs) & inside
+        lin = torch.where(mask, (ys * W + xs).long(), H * W)
+        idx.scatter_reduce_(0, lin.flatten(), g[:, 4].long().view(c, 1, 1).expand_as(lin).flatten(), "amax")
+    idx = idx[:H * W].view(H, W)
+    palette = torch.zeros(n + 1, 3, device=dev).index_copy_(0, geo[:, 4].long(), geo_all[:, :3])
+    return torch.where((idx > 0).unsqueeze(-1), palette[idx], canvas)
 
 
 def _ellipses(p0: torch.Tensor, p1: torch.Tensor, half_width: float, ys: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
@@ -192,7 +242,9 @@ def _ellipses(p0: torch.Tensor, p1: torch.Tensor, half_width: float, ys: torch.T
     dy = ys - m[:, 1].view(n, 1, 1)
     u = dx * direction[:, 0].view(n, 1, 1) + dy * direction[:, 1].view(n, 1, 1)
     v = -dx * direction[:, 1].view(n, 1, 1) + dy * direction[:, 0].view(n, 1, 1)
-    return (u / a.view(n, 1, 1)) ** 2 + (v / half_width) ** 2 <= 1.0
+    # Zero-length limb (both joints on the same pixel): u = v = 0 everywhere would fill the
+    # whole canvas with the limb color; cv2 draws a degenerate 1-px polygon, i.e. nothing.
+    return ((u / a.view(n, 1, 1)) ** 2 + (v / half_width) ** 2 <= 1.0) & (length >= 1.0).view(n, 1, 1)
 
 
 def _capsules(p0: torch.Tensor, p1: torch.Tensor, radius: float, ys: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
@@ -221,10 +273,10 @@ def draw_pose_gpu(pose: dict, height: int, width: int, device, include_face: boo
     """easy_dwpose.draw.openpose.draw_pose on the GPU. ``pose`` is the numpy dict built by
     OptimizedDWposeDetector (normalized coordinates, -1 = filtered). Returns (3, H, W)
     float RGB in [0, 255]."""
-    ys = torch.arange(height, device=device, dtype=torch.float32).view(1, height, 1)
-    xs = torch.arange(width, device=device, dtype=torch.float32).view(1, 1, width)
     canvas = torch.zeros(height, width, 3, device=device)
-    f32 = lambda a: torch.as_tensor(np.ascontiguousarray(a, dtype=np.float32), device=device)
+    limb = lambda p, ys, xs: _ellipses(p[:, :2], p[:, 2:], 4.0, ys, xs)
+    line = lambda p, ys, xs: _capsules(p[:, :2], p[:, 2:], 1.0, ys, xs)
+    dot = lambda r: (lambda p, ys, xs: _discs(p, r, ys, xs))
 
     bodies = np.asarray(pose["bodies"], dtype=np.float32)          # (n*18, 2) normalized
     subset = np.asarray(pose["body_scores"])                        # (n, 18) index or -1
@@ -240,7 +292,7 @@ def draw_pose_gpu(pose: dict, height: int, width: int, device, include_face: boo
             p0.append((math.floor(xa), math.floor(ya))); p1.append((math.floor(xb), math.floor(yb)))
             col.append(_COLORS[i])
     if p0:
-        canvas = _paint(canvas, _ellipses(f32(p0), f32(p1), 4.0, ys, xs), f32(col))
+        canvas = _paint(canvas, limb, [a + b for a, b in zip(p0, p1)], col, 4.0)
     canvas = canvas * 0.6
     # body joints
     pts, col = [], []
@@ -251,14 +303,14 @@ def draw_pose_gpu(pose: dict, height: int, width: int, device, include_face: boo
                 continue
             pts.append((math.floor(px[idx][0]), math.floor(px[idx][1]))); col.append(_COLORS[i])
     if pts:
-        canvas = _paint(canvas, _discs(f32(pts), 4.0, ys, xs), f32(col))
+        canvas = _paint(canvas, dot(4.0), pts, col, 4.0)
     # face
     if include_face:
         faces = np.asarray(pose["faces"], dtype=np.float32).reshape(-1, 2)
         ok = (faces[:, 0] > _EPS) & (faces[:, 1] > _EPS)
         if ok.any():
             pts = np.floor(faces[ok] * np.array([width, height], dtype=np.float32))
-            canvas = _paint(canvas, _discs(f32(pts), 3.0, ys, xs), f32([[255.0, 255.0, 255.0]] * len(pts)))
+            canvas = _paint(canvas, dot(3.0), pts, [[255.0, 255.0, 255.0]] * len(pts), 3.0)
     # hands
     if include_hands:
         hands = np.asarray(pose["hands"], dtype=np.float32)          # (2n, 21, 2)
@@ -273,7 +325,7 @@ def draw_pose_gpu(pose: dict, height: int, width: int, device, include_face: boo
                 if x > _EPS and y > _EPS:
                     pts.append((x, y))
         if p0:
-            canvas = _paint(canvas, _capsules(f32(p0), f32(p1), 1.0, ys, xs), f32(col))
+            canvas = _paint(canvas, line, [a + b for a, b in zip(p0, p1)], col, 1.0)
         if pts:
-            canvas = _paint(canvas, _discs(f32(pts), 4.0, ys, xs), f32([[0.0, 0.0, 255.0]] * len(pts)))
+            canvas = _paint(canvas, dot(4.0), pts, [[0.0, 0.0, 255.0]] * len(pts), 4.0)
     return canvas.permute(2, 0, 1)

@@ -103,7 +103,9 @@ class LowLatencyController:
             return
         self._frame_counter += 1
         if self._frame_counter >= self._gc_interval:
-            gc.collect()
+            # Young generations only: a full collection takes ~200 ms with the model
+            # objects tracked, i.e. a periodic hitch.
+            gc.collect(1)
             self._frame_counter = 0
 
     # ------------------------------------------------------------------ misc

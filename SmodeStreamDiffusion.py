@@ -274,6 +274,22 @@ class App:
         self._create_tensors(3, self.width, self.height)
         send_message(self.socket, StreamCreationPacket(True))
 
+    def _settle_gc(self):
+        """After warm-up: one full collection now, then no automatic full (generation 2)
+        collection while streaming. With ~650k tracked objects (diffusers, transformers,
+        torch) a full collection takes ~200 ms, i.e. a hitch of several frames at a random
+        moment; the steady frame loop creates almost no cyclic garbage (5 young collections
+        in 1500 SDXL frames, measured). Young generations are still collected, and every
+        teardown path (stream recreation, ControlNet / preprocessor unload) runs an explicit
+        gc.collect(), so memory is still reclaimed on configuration changes."""
+        import gc
+        t0 = time.time()
+        gc.collect()
+        g0, g1, _ = gc.get_threshold()
+        gc.set_threshold(g0, g1, 1_000_000_000)
+        logging.info(f"[GC] full collection {1000 * (time.time() - t0):.0f} ms after warm-up; "
+                     f"automatic full collections disabled while streaming")
+
     def _release_stream_dependents(self):
         """Free everything built for / holding the current stream before a new one loads:
         ControlNets (built for its model family, batch, resolution, acceleration), the FaceID
@@ -868,6 +884,7 @@ class App:
                         finally:
                             if 'dummy_input' in locals():
                                 del dummy_input
+                            self._settle_gc()
                             if is_torch_compile_warmup:
                                 self._send_warning(False)
                                 torch.cuda.empty_cache()

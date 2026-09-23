@@ -28,7 +28,7 @@ REM steps of consecutive frames share one batch-N engine, one frame of latency p
 REM 1 = sequential: the steps run one after the other in the batch-1 engines (no batch-N engine
 REM build, one frame of latency, step count changes live, quantized batch-N engines not used).
 if not defined STREAMDIFFUSION_SEQUENTIAL set STREAMDIFFUSION_SEQUENTIAL=1
-REM Sequential only: ControlNet on the first step only (SDXL Union at 1024: one ~39 ms ControlNet
+REM Sequential only: ControlNet on the first step only (SDXL Union at 1024: one ~17 ms ControlNet
 REM pass saved per extra step). Keep the set line alone: text after = becomes part of the value.
 REM set STREAMDIFFUSION_CN_FIRST_STEP_ONLY=1
 REM Overlap with Smode: when the next input arrives, Smode gets the previous result at once and the

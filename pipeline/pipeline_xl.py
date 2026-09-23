@@ -137,6 +137,7 @@ class StreamDiffusionXL:
         self.last_internal_timings = {}
         self.enable_profiling = False
         self._cuda_events = {}
+        self._cn_spans = []    # [PERF]: (UNet-call start, ControlNet end) events of the frame
 
         self._scheduler_coeffs_cache = OrderedDict()
         self._max_scheduler_cache_size = 16
@@ -631,6 +632,10 @@ class StreamDiffusionXL:
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _cn_start_event = None
+        if self.enable_profiling:
+            _cn_start_event = torch.cuda.Event(enable_timing=True)
+            _cn_start_event.record()
         if self.cfg_type == "initialize":
             x_t_latent_plus_uc = torch.concat([x_t_latent[0:1], x_t_latent], dim=0)
             t_list_new = torch.concat([t_list[0:1], t_list], dim=0)
@@ -782,10 +787,12 @@ class StreamDiffusionXL:
                 # reused); PyTorch residuals are fresh tensors. Guidance strength already applied.
                 self._cn_residual_cache = (reuse_key, down_block_res_samples, mid_block_res_sample)
 
-        if self.enable_profiling:
-            # Split point for [PERF]: ControlNet residuals done, UNet starts.
-            self._cn_end_event = torch.cuda.Event(enable_timing=True)
-            self._cn_end_event.record()
+        if _cn_start_event is not None and len(self._cn_spans) < 64:
+            # Split point for [PERF]: ControlNet residuals done, UNet starts. One span per
+            # UNet call: sequential multi-step runs several per frame.
+            _cn_end_event = torch.cuda.Event(enable_timing=True)
+            _cn_end_event.record()
+            self._cn_spans.append((_cn_start_event, _cn_end_event))
 
         try:
             unet_kwargs = {
@@ -1122,6 +1129,7 @@ class StreamDiffusionXL:
                 'frame_end': torch.cuda.Event(enable_timing=True),
             }
             events['frame_start'].record()
+            self._cn_spans = []
             _ueng = getattr(self.unet, 'engine', None)
             if _ueng is not None and hasattr(_ueng, 'profile_graph'):
                 _ueng.profile_graph = True
@@ -1202,25 +1210,28 @@ class StreamDiffusionXL:
             overhead_ms = total_ms - (preprocess_ms + vae_encode_ms + unet_ms + vae_decode_ms)
             fps = 1000.0 / total_ms if total_ms > 0 else 0
 
-            # ControlNet vs UNet split (event recorded in unet_step after the CN loop).
-            cn_event = getattr(self, '_cn_end_event', None)
+            # ControlNet vs UNet split: summed over the UNet calls of the frame (one per step
+            # in sequential multi-step; a single start-to-last-split span counted the earlier
+            # steps' UNet as ControlNet).
             controlnet_ms = 0.0
-            if cn_event is not None:
-                try:
-                    controlnet_ms = max(0.0, events['vae_encode_end'].elapsed_time(cn_event))
-                except Exception:
-                    controlnet_ms = 0.0
-                self._cn_end_event = None
+            try:
+                for _s, _e in self._cn_spans:
+                    controlnet_ms += max(0.0, _s.elapsed_time(_e))
+            except Exception:
+                controlnet_ms = 0.0
+            n_unet_calls = max(1, len(self._cn_spans))
+            self._cn_spans = []
             unet_only_ms = max(0.0, unet_ms - controlnet_ms)
 
             # UNet engine graph time vs phase time: the gap is GPU idle inside the UNet phase.
+            # graph_ms() times the last replay only: one step, scaled to the frame's calls.
             _ueng = getattr(self.unet, 'engine', None)
             graph_ms = _ueng.graph_ms() if _ueng is not None and hasattr(_ueng, 'graph_ms') else None
             if graph_ms is not None:
                 lst = getattr(self, '_perf_graph', None)
                 if lst is None:
                     lst = self._perf_graph = []
-                lst.append((graph_ms, unet_only_ms - graph_ms))
+                lst.append((graph_ms, unet_only_ms - graph_ms * n_unet_calls))
             clk = self._perf_sm_clock_mhz()
             if clk is not None:
                 lst = getattr(self, '_perf_clock', None)
@@ -1258,8 +1269,9 @@ class StreamDiffusionXL:
                             f"VAE Decode: {vae_decode_ms:.1f}ms | "
                             f"Overhead: {overhead_ms:.1f}ms | "
                             f"window({len(srt)}): mean {mean_ms:.1f} p95 {p95_ms:.1f} max {srt[-1]:.1f}ms"
-                            + (f" | UNet graph {sum(g for g, _ in gl) / len(gl):.1f}ms "
-                               f"(GPU idle in UNet phase {sum(d for _, d in gl) / len(gl):.1f}ms)"
+                            + (f" | UNet graph {sum(g for g, _ in gl) / len(gl):.1f}ms"
+                               + (f" x{n_unet_calls} steps" if n_unet_calls > 1 else "")
+                               + f" (GPU idle in UNet phase {sum(d for _, d in gl) / len(gl):.1f}ms)"
                                if (gl := getattr(self, '_perf_graph', None)) else "")
                             + (f" | SM clock min {min(cl):.0f} mean {sum(cl) / len(cl):.0f} MHz"
                                if (cl := getattr(self, '_perf_clock', None)) else "")

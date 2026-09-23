@@ -31,6 +31,10 @@ def _compute_trt_unet_batch_size_xl(t_index_list, frame_buffer_size, cfg_type, u
             return 2 * denoising_steps_num * frame_buffer_size
         else:
             return denoising_steps_num * frame_buffer_size
+    elif cfg_type == "initialize":
+        return frame_buffer_size + 1
+    elif cfg_type == "full":
+        return 2 * frame_buffer_size
     else:
         return frame_buffer_size
 

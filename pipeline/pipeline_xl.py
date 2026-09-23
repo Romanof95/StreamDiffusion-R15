@@ -81,7 +81,14 @@ class StreamDiffusionXL:
             else:
                 self.trt_unet_batch_size = self.denoising_steps_num * frame_buffer_size
         else:
-            self.trt_unet_batch_size = self.frame_bff_size
+            # Sequential steps: one frame per UNet call; "full"/"initialize" CFG still
+            # concatenate the unconditional pass in the same call.
+            if self.cfg_type == "initialize":
+                self.trt_unet_batch_size = frame_buffer_size + 1
+            elif self.cfg_type == "full":
+                self.trt_unet_batch_size = 2 * frame_buffer_size
+            else:
+                self.trt_unet_batch_size = self.frame_bff_size
             self.batch_size = frame_buffer_size
 
         self.t_list = t_index_list
@@ -443,7 +450,7 @@ class StreamDiffusionXL:
             else:
                 self.added_cond_kwargs = None
 
-            if self.use_denoising_batch and self.cfg_type == "full":
+            if self.cfg_type == "full":
                 if encoder_output[1] is not None:
                     uncond_prompt_embeds = encoder_output[1].repeat(self.batch_size, 1, 1)
             elif self.cfg_type == "initialize":
@@ -816,13 +823,18 @@ class StreamDiffusionXL:
             if mid_block_res_sample is not None:
                 del mid_block_res_sample
 
+        # Sequential steps keep one RCFG slot per step (stock_noise[idx]).
+        stock_idx = 0 if idx is None else idx
         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
             noise_pred_text = model_pred[1:]
-            old_stock_noise = self.stock_noise
-            self.stock_noise = torch.concat(
-                [model_pred[0:1], self.stock_noise[1:]], dim=0
-            )
-            del old_stock_noise
+            if self.use_denoising_batch:
+                old_stock_noise = self.stock_noise
+                self.stock_noise = torch.concat(
+                    [model_pred[0:1], self.stock_noise[1:]], dim=0
+                )
+                del old_stock_noise
+            else:
+                self.stock_noise[stock_idx:stock_idx + 1].copy_(model_pred[0:1])
         elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
             noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
         else:
@@ -830,7 +842,9 @@ class StreamDiffusionXL:
         if self.guidance_scale > 1.0 and (
             self.cfg_type == "self" or self.cfg_type == "initialize"
         ):
-            noise_pred_uncond = self.stock_noise * self.delta
+            stock = (self.stock_noise if self.use_denoising_batch
+                     else self.stock_noise[stock_idx:stock_idx + 1])
+            noise_pred_uncond = stock * self.delta
         if self.guidance_scale > 1.0 and self.cfg_type != "none":
             model_pred = noise_pred_uncond + self.guidance_scale * (
                 noise_pred_text - noise_pred_uncond
@@ -848,6 +862,16 @@ class StreamDiffusionXL:
                 self.stock_noise = self._init_noise_rolled + delta_x
         else:
             denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
+            # Sequential RCFG: the residual of this step becomes the virtual unconditional
+            # prediction of the next step (the stream-batch recurrence, but within the
+            # frame: nothing carries over between frames).
+            nxt = stock_idx + 1
+            if (self.guidance_scale > 1.0 and self.cfg_type in ("self", "initialize")
+                    and nxt < self.denoising_steps_num):
+                scaled_noise = self.beta_prod_t_sqrt[stock_idx] * self.stock_noise[stock_idx:nxt]
+                delta_x = self.scheduler_step_batch(model_pred, scaled_noise, stock_idx)
+                delta_x = self.alpha_prod_t_sqrt[nxt] * delta_x / self.beta_prod_t_sqrt[nxt]
+                self.stock_noise[nxt:nxt + 1].copy_(self.init_noise[nxt:nxt + 1] + delta_x)
 
         if self.guidance_scale > 1.0:
             if 'x_t_latent_plus_uc' in locals() and x_t_latent_plus_uc is not x_t_latent:
@@ -1027,6 +1051,9 @@ class StreamDiffusionXL:
             # x0-prediction + re-noise scheme as the stream batch, with the fixed per-step
             # noise (a fresh draw per frame flickers). Assumes frame_buffer_size == 1.
             n_steps = len(self.sub_timesteps_tensor)
+            if self.guidance_scale > 1.0 and self.cfg_type in ("self", "initialize"):
+                # RCFG: the first step's virtual unconditional prediction is the input noise.
+                self.stock_noise[0:1].copy_(self.init_noise[0:1])
             for idx, t in enumerate(self.sub_timesteps_tensor):
                 last = idx == n_steps - 1
                 t = t.view(1,).repeat(self.frame_bff_size,)

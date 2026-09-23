@@ -1,5 +1,6 @@
 import time
 import logging
+import os
 from typing import List, Optional, Union, Any, Dict, Tuple, Literal
 from collections import OrderedDict
 
@@ -68,13 +69,32 @@ class StreamDiffusion:
             else:
                 self.trt_unet_batch_size = self.denoising_steps_num * frame_buffer_size
         else:
-            self.trt_unet_batch_size = self.frame_bff_size
+            # Sequential steps: one frame per UNet call; "full"/"initialize" CFG still
+            # concatenate the unconditional pass in the same call.
+            if self.cfg_type == "initialize":
+                self.trt_unet_batch_size = frame_buffer_size + 1
+            elif self.cfg_type == "full":
+                self.trt_unet_batch_size = 2 * frame_buffer_size
+            else:
+                self.trt_unet_batch_size = self.frame_bff_size
             self.batch_size = frame_buffer_size
 
         self.t_list = t_index_list
 
         self.do_add_noise = do_add_noise
         self.use_denoising_batch = use_denoising_batch
+        # Sequential multi-step: ControlNet on the first step only (diffusers'
+        # control_guidance_end), saves one ControlNet pass per extra step.
+        self._cn_first_step_only = os.environ.get("STREAMDIFFUSION_CN_FIRST_STEP_ONLY", "0") == "1"
+        # True while an intermediate sequential step runs: the StreamV2V cache must not
+        # advance (one cache entry per frame, taken from the last step).
+        self._v2v_hold = False
+        if not use_denoising_batch and self.denoising_steps_num > 1:
+            logging.info(
+                f"[Multi-step] {self.denoising_steps_num} sequential steps per frame in the "
+                f"batch-{frame_buffer_size} engine"
+                + (" (ControlNet on the first step only)" if self._cn_first_step_only else "")
+            )
 
         # SSF (Stochastic Similarity Filter)
         self.similar_image_filter = True
@@ -339,7 +359,7 @@ class StreamDiffusion:
         self._cn_cond_ring: Dict[int, torch.Tensor] = {}
         self._cn_cond_ring_needs_init = True
 
-        if self.denoising_steps_num > 1:
+        if self.denoising_steps_num > 1 and self.use_denoising_batch:
             self.x_t_latent_buffer = torch.zeros(
                 (
                     (self.denoising_steps_num - 1) * self.frame_bff_size,
@@ -376,7 +396,7 @@ class StreamDiffusion:
             )
             self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
 
-            if self.use_denoising_batch and self.cfg_type == "full":
+            if self.cfg_type == "full":
                 if encoder_output[1] is not None:
                     uncond_prompt_embeds = encoder_output[1].repeat(self.batch_size, 1, 1)
             elif self.cfg_type == "initialize":
@@ -406,8 +426,10 @@ class StreamDiffusion:
             dim=0,
         )
 
+        # Sequential steps keep one fixed noise (and one RCFG slot) per step.
         self.init_noise = torch.randn(
-            (self.batch_size, 4, self.latent_height, self.latent_width),
+            (max(self.batch_size, self.denoising_steps_num * self.frame_bff_size),
+             4, self.latent_height, self.latent_width),
             generator=generator,
         ).to(device=self.device, dtype=self.dtype)
 
@@ -704,20 +726,26 @@ class StreamDiffusion:
             )[0]
 
             # StreamV2V cache update runs outside the CUDA graph.
-            update_cache_after_unet(self.unet)
+            if not self._v2v_hold:
+                update_cache_after_unet(self.unet)
         finally:
             if down_block_res_samples is not None:
                 del down_block_res_samples
             if mid_block_res_sample is not None:
                 del mid_block_res_sample
 
+        # Sequential steps keep one RCFG slot per step (stock_noise[idx]).
+        stock_idx = 0 if idx is None else idx
         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
             noise_pred_text = model_pred[1:]
-            old_stock_noise = self.stock_noise
-            self.stock_noise = torch.concat(
-                [model_pred[0:1], self.stock_noise[1:]], dim=0
-            )
-            del old_stock_noise
+            if self.use_denoising_batch:
+                old_stock_noise = self.stock_noise
+                self.stock_noise = torch.concat(
+                    [model_pred[0:1], self.stock_noise[1:]], dim=0
+                )
+                del old_stock_noise
+            else:
+                self.stock_noise[stock_idx:stock_idx + 1].copy_(model_pred[0:1])
         elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
             noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
         else:
@@ -725,7 +753,9 @@ class StreamDiffusion:
         if self.guidance_scale > 1.0 and (
             self.cfg_type == "self" or self.cfg_type == "initialize"
         ):
-            noise_pred_uncond = self.stock_noise * self.delta
+            stock = (self.stock_noise if self.use_denoising_batch
+                     else self.stock_noise[stock_idx:stock_idx + 1])
+            noise_pred_uncond = stock * self.delta
         if self.guidance_scale > 1.0 and self.cfg_type != "none":
             model_pred = noise_pred_uncond + self.guidance_scale * (
                 noise_pred_text - noise_pred_uncond
@@ -743,6 +773,16 @@ class StreamDiffusion:
                 self.stock_noise = self._init_noise_rolled + delta_x
         else:
             denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
+            # Sequential RCFG: the residual of this step becomes the virtual unconditional
+            # prediction of the next step (the stream-batch recurrence, but within the
+            # frame: nothing carries over between frames).
+            nxt = stock_idx + 1
+            if (self.guidance_scale > 1.0 and self.cfg_type in ("self", "initialize")
+                    and nxt < self.denoising_steps_num):
+                scaled_noise = self.beta_prod_t_sqrt[stock_idx] * self.stock_noise[stock_idx:nxt]
+                delta_x = self.scheduler_step_batch(model_pred, scaled_noise, stock_idx)
+                delta_x = self.alpha_prod_t_sqrt[nxt] * delta_x / self.beta_prod_t_sqrt[nxt]
+                self.stock_noise[nxt:nxt + 1].copy_(self.init_noise[nxt:nxt + 1] + delta_x)
 
         if self.guidance_scale > 1.0:
             if 'x_t_latent_plus_uc' in locals() and x_t_latent_plus_uc is not x_t_latent:
@@ -768,7 +808,7 @@ class StreamDiffusion:
         )[0]
 
     def _ensure_cn_ring(self, cn_index: int, current_cond: torch.Tensor) -> Optional[torch.Tensor]:
-        if self.denoising_steps_num <= 1:
+        if self.denoising_steps_num <= 1 or not self.use_denoising_batch:
             return None
         if current_cond.dim() == 3:
             cur4d = current_cond.unsqueeze(0)
@@ -786,7 +826,7 @@ class StreamDiffusion:
         return ring
 
     def _build_per_slot_cond(self, cn_index: int, current_cond: torch.Tensor) -> torch.Tensor:
-        if self.denoising_steps_num <= 1:
+        if self.denoising_steps_num <= 1 or not self.use_denoising_batch:
             return current_cond.unsqueeze(0) if current_cond.dim() == 3 else current_cond
         ring = self._ensure_cn_ring(cn_index, current_cond)
         if current_cond.dim() == 3:
@@ -799,7 +839,7 @@ class StreamDiffusion:
         return torch.cat([cur4d, ring], dim=0)
 
     def _rotate_cn_ring(self, cn_index: int, current_cond: torch.Tensor) -> None:
-        if self.denoising_steps_num <= 1:
+        if self.denoising_steps_num <= 1 or not self.use_denoising_batch:
             return
         ring = self._cn_cond_ring.get(cn_index)
         if ring is None:
@@ -812,6 +852,15 @@ class StreamDiffusion:
         if ring.shape[0] > fb:
             ring[fb:].copy_(ring[:-fb].clone())
         ring[:fb].copy_(cur4d.to(self.dtype))
+
+    def _set_v2v_hold(self, hold: bool) -> None:
+        """Freeze the StreamV2V cache during intermediate sequential steps: the TensorRT
+        engine skips its kvo cache update, the PyTorch processors skip
+        update_cache_after_unet."""
+        self._v2v_hold = hold
+        unet = self.unet
+        if hasattr(unet, "hold_ring_phase"):
+            unet.hold_ring_phase = hold
 
     def _refill_buffer_from_current(self, x_t_latent: torch.Tensor) -> None:
         if self.x_t_latent_buffer is None:
@@ -895,29 +944,35 @@ class StreamDiffusion:
                 x_0_pred_out = x_0_pred_batch
                 self.x_t_latent_buffer = None
         else:
-            self.init_noise = x_t_latent
+            # Sequential multi-step: the steps run one after the other on the current frame
+            # in the batch-1 engine. No extra frame of latency, no batch-N engine. Same
+            # x0-prediction + re-noise scheme as the stream batch, with the fixed per-step
+            # noise (a fresh draw per frame flickers). Assumes frame_buffer_size == 1.
+            n_steps = len(self.sub_timesteps_tensor)
+            if self.guidance_scale > 1.0 and self.cfg_type in ("self", "initialize"):
+                # RCFG: the first step's virtual unconditional prediction is the input noise.
+                self.stock_noise[0:1].copy_(self.init_noise[0:1])
             for idx, t in enumerate(self.sub_timesteps_tensor):
+                last = idx == n_steps - 1
                 t = t.view(1,).repeat(self.frame_bff_size,)
-                x_0_pred, model_pred = self.unet_step(
-                    x_t_latent,
-                    t,
-                    idx,
-                    controlnet_image=controlnet_image,
-                    controlnet_model=controlnet_model,
-                    controlnet_conditioning_scale=controlnet_conditioning_scale,
-                    ip_adapter_image_embeds=ip_adapter_image_embeds,
-                )
-                if idx < len(self.sub_timesteps_tensor) - 1:
+                use_cn = controlnet_model is not None and (idx == 0 or not self._cn_first_step_only)
+                self._set_v2v_hold(not last)
+                try:
+                    x_0_pred, model_pred = self.unet_step(
+                        x_t_latent,
+                        t,
+                        idx,
+                        controlnet_image=controlnet_image if use_cn else None,
+                        controlnet_model=controlnet_model if use_cn else None,
+                        controlnet_conditioning_scale=controlnet_conditioning_scale,
+                        ip_adapter_image_embeds=ip_adapter_image_embeds,
+                    )
+                finally:
+                    self._set_v2v_hold(False)
+                if not last:
+                    x_t_latent = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
                     if self.do_add_noise:
-                        x_t_latent = self.alpha_prod_t_sqrt[
-                            idx + 1
-                        ] * x_0_pred + self.beta_prod_t_sqrt[
-                            idx + 1
-                        ] * torch.randn_like(
-                            x_0_pred, device=self.device, dtype=self.dtype
-                        )
-                    else:
-                        x_t_latent = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
+                        x_t_latent = x_t_latent + self.beta_prod_t_sqrt[idx + 1] * self.init_noise[idx + 1:idx + 2]
             x_0_pred_out = x_0_pred
 
         return x_0_pred_out

@@ -95,7 +95,7 @@ class BaseStreamDiffusionWrapper(ABC):
                     )
 
         # img2img without the denoising batch = sequential multi-step on the batch-1
-        # engines (StreamDiffusionXL.predict_x0_batch); the SD 1.5 adapter always batches.
+        # engines (predict_x0_batch of both pipelines, STREAMDIFFUSION_SEQUENTIAL=1).
 
         self.device = device
         self.dtype = dtype

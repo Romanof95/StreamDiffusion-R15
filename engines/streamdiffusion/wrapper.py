@@ -140,13 +140,17 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         return PACKAGE_DIR / "tensorrt_cache" / "sd"
 
     def recreate_pipe(self):
-        if not self.sd_turbo:
-            self.stream.load_lcm_lora()
-            self.stream.fuse_lora()
-
-        self.stream.vae = AutoencoderTiny.from_pretrained("madebyollin/taesd").to(
-            device=self.stream.pipe.device, dtype=self.stream.pipe.dtype
-        )
+        """Called by the app right after the stream was (re)created on the PyTorch path
+        (fresh _load_model, or an inline StreamDiffusion(...) on the existing pipe). The pipe
+        already carries the LCM / user LoRAs fused at load time, and only when the model
+        wanted LCM (not Hyper / Turbo / Lightning): loading LCM here again stacked it a
+        second time on every call (and put the SD 1.5 LCM LoRA on SDXL models). Only the
+        tiny VAE, which lives on the stream and not on the pipe, has to be restored."""
+        tiny_vae_id = getattr(self, "_tiny_vae_id", None)
+        if tiny_vae_id and not isinstance(self.stream.vae, AutoencoderTiny):
+            self.stream.vae = AutoencoderTiny.from_pretrained(tiny_vae_id).to(
+                device=self.stream.pipe.device, dtype=self.stream.pipe.dtype
+            )
 
     def _load_model(
         self,
@@ -370,15 +374,12 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                     logging.info(f"[LoRA] Loading {lora_name} with weight {lora_scale}")
                 stream.fuse_lora(lora_scale=lora_scale)
 
+        self._tiny_vae_id = None
         if use_tiny_vae:
-            if vae_id is not None:
-                stream.vae = AutoencoderTiny.from_pretrained(vae_id).to(
-                    device=pipe.device, dtype=pipe.dtype
-                )
-            else:
-                stream.vae = AutoencoderTiny.from_pretrained("madebyollin/taesd").to(
-                    device=pipe.device, dtype=pipe.dtype
-                )
+            self._tiny_vae_id = vae_id if vae_id is not None else "madebyollin/taesd"
+            stream.vae = AutoencoderTiny.from_pretrained(self._tiny_vae_id).to(
+                device=pipe.device, dtype=pipe.dtype
+            )
         elif is_hyper_model:
             if vae_id is not None:
                 from diffusers import AutoencoderKL

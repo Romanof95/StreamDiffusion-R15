@@ -197,13 +197,17 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         return PACKAGE_DIR / "tensorrt_cache" / "sdxl"
 
     def recreate_pipe(self):
-        if not self.sd_turbo:
-            self.stream.load_lcm_lora()
-            self.stream.fuse_lora()
-
-        self.stream.vae = AutoencoderTiny.from_pretrained("madebyollin/taesdxl").to(
-            device=self.stream.pipe.device, dtype=self.stream.pipe.dtype
-        )
+        """Called by the app right after the stream was (re)created on the PyTorch path
+        (fresh _load_model, or an inline StreamDiffusion(...) on the existing pipe). The pipe
+        already carries the LCM / user LoRAs fused at load time, and only when the model
+        wanted LCM (not Hyper / Turbo / Lightning): loading LCM here again stacked it a
+        second time on every call (and put the SD 1.5 LCM LoRA on SDXL models). Only the
+        tiny VAE, which lives on the stream and not on the pipe, has to be restored."""
+        tiny_vae_id = getattr(self, "_tiny_vae_id", None)
+        if tiny_vae_id and not isinstance(self.stream.vae, AutoencoderTiny):
+            self.stream.vae = AutoencoderTiny.from_pretrained(tiny_vae_id).to(
+                device=self.stream.pipe.device, dtype=self.stream.pipe.dtype
+            )
 
     def _load_model(
         self,

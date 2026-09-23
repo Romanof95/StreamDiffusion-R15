@@ -88,13 +88,14 @@ class StreamDiffusionEngine(BaseEngine):
             enable_similar_image_filter=config.get("similar_image_filter_enabled", True),
             similar_image_filter_threshold=config.get("similar_image_filter_threshold", 0.95),
             similar_image_filter_max_skip_frame=config.get("similar_image_filter_max_skip", 10),
-            # SDXL multi-step runs the steps sequentially in the batch-1 engines (see
-            # StreamDiffusionXL.predict_x0_batch): the StreamDiffusion stream batch needs a
-            # batch-N engine, whose quantized (nvfp4/mxfp8) builds lose the prompt, and adds a
-            # frame of latency per step for no throughput at 1024 on a saturated GPU.
-            # STREAMDIFFUSION_DENOISING_BATCH=1 restores the stream batch. SD 1.5 keeps it.
+            # SDXL multi-step: the StreamDiffusion stream batch (default) denoises the steps
+            # of consecutive frames in one batch-N engine, one frame of latency per extra
+            # step. STREAMDIFFUSION_SEQUENTIAL=1 runs the steps one after the other in the
+            # batch-1 engines instead (StreamDiffusionXL.predict_x0_batch): no batch-N engine
+            # build, one frame of latency, and the quantized (nvfp4/mxfp8) batch-N engines,
+            # which lose the prompt, are not used. SD 1.5 always keeps the stream batch.
             use_denoising_batch=(not self.is_sdxl)
-            or os.environ.get("STREAMDIFFUSION_DENOISING_BATCH", "0") == "1",
+            or os.environ.get("STREAMDIFFUSION_SEQUENTIAL", "0") != "1",
             cfg_type=runtime["cfg_type"],
             seed=runtime["seed"],
             dtype=runtime["torch_dtype"],

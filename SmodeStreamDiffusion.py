@@ -193,6 +193,13 @@ class App:
 
         if self.stream is not None:
             logging.info(f"[Engine] Freeing previous engine...")
+            # ControlNets were built for the previous stream (model family, batch,
+            # resolution, acceleration): drop them all, the reload below rebuilds what the
+            # config enables for the new stream.
+            try:
+                self.controlnet_manager.reset()
+            except Exception as e:
+                logging.warning(f"[ControlNet] reset() raised: {e}")
             if self.engine is not None:
                 try:
                     self.engine.cleanup()
@@ -260,6 +267,13 @@ class App:
 
         if hasattr(self.stream, "stream"):
             self.stream.stream._cached_controlnet_guidance_strength = self._cached_controlnet_guidance_strength
+
+        # Reload the ControlNets the config enables, against the new stream.
+        try:
+            self.controlnet_manager.load_models()
+            self.controlnet_manager.update_active_list()
+        except Exception as e:
+            logging.warning(f"[ControlNet] reload after stream creation failed: {e}")
 
         self._create_tensors(3, self.width, self.height)
         send_message(self.socket, StreamCreationPacket(True))

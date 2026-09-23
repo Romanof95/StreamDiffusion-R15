@@ -213,6 +213,26 @@ def round_to_vit_patch(resolution: int) -> int:
     return max(252, min(518, rounded))
 
 
+def _release_engine(obj) -> None:
+    """Release a TRT engine wrapper (ControlNetEngine / ControlNetUnionEngine / ...) now,
+    graphs and activation memory included, instead of waiting for (and trusting) GC."""
+    eng = getattr(obj, "engine", None)
+    release = getattr(eng, "release", None)
+    if callable(release):
+        try:
+            release()
+        except Exception as e:
+            logging.debug(f"[ControlNet] engine release failed: {e}")
+
+
+def _release_union_wrapper(wrapper) -> None:
+    if wrapper is None:
+        return
+    for eng in list(getattr(wrapper, "_trt_engines", {}).values()):
+        _release_engine(eng)
+    wrapper._trt_engines = {}
+
+
 class ControlNetManager:
     """Owner of ControlNet models + their pre-cached hot-path lists."""
 
@@ -227,6 +247,9 @@ class ControlNetManager:
         self._union_wrapper: "UnionControlNetWrapper" = None
         # Control-type tuples whose Union TRT build failed (stay on PyTorch).
         self._union_trt_failed = set()
+        # Quantized Union engine paths whose build failed this session: go straight to the
+        # fp16 engine next time instead of re-running the quantization on every switch.
+        self._union_quant_failed = set()
 
     def _emit_warning(self, active: bool, message: str = "") -> None:
         app = self._app
@@ -548,11 +571,17 @@ class ControlNetManager:
         if wrapper is None or self._union_model is None:
             return
         idx = tuple(wrapper.control_type_idx)
-        if not idx or idx in wrapper._trt_engines or idx in self._union_trt_failed:
+        if not idx or idx in self._union_trt_failed:
+            return
+        if idx in wrapper._trt_engines:
+            # Most recently used last (eviction order below).
+            wrapper._trt_engines[idx] = wrapper._trt_engines.pop(idx)
             return
         engine_path = self._union_trt_engine_path(idx)
         if engine_path is None:
             return
+        if engine_path in self._union_quant_failed:
+            engine_path = self._union_trt_engine_path(idx, precision="fp16")
         app = self._app
         try:
             from pipeline.acceleration.tensorrt import compile_controlnet_union
@@ -631,6 +660,7 @@ class ControlNetManager:
                         # fp16 engine (built below if missing), never to the PyTorch Union.
                         logging.error(f"[Union TRT] {union_prec} engine failed "
                                       f"({type(e).__name__}: {e}); falling back to the fp16 engine")
+                        self._union_quant_failed.add(engine_path)
                         union_prec = "fp16"
                         engine_path = self._union_trt_engine_path(idx, precision="fp16")
                         os.makedirs(os.path.dirname(engine_path), exist_ok=True)
@@ -652,6 +682,16 @@ class ControlNetManager:
                     )
                 logging.info(f"[Union TRT] Engine built for {names} in {time.time() - t0:.0f}s")
 
+            # One engine per control-type set, each a full copy of the Union weights plus its
+            # own activation memory (up to ~2.5 GB fp16): keep only the most recent ones
+            # (STREAMDIFFUSION_UNION_ENGINE_CACHE, default 1). An evicted set reloads from the
+            # engine cache on disk in a few seconds, it is not rebuilt.
+            keep = max(1, int(os.environ.get("STREAMDIFFUSION_UNION_ENGINE_CACHE", "1") or 1))
+            while len(wrapper._trt_engines) >= keep:
+                old_idx = next(iter(wrapper._trt_engines))
+                _release_engine(wrapper._trt_engines.pop(old_idx))
+                logging.info(f"[Union TRT] Released the engine of control set {old_idx}")
+            torch.cuda.empty_cache()
             engine = ControlNetUnionEngine(engine_path, cuda_stream, idx, use_cuda_graph=True)
             wrapper._trt_engines[idx] = engine
             # Free the ~2.5 GB PyTorch Union from VRAM. The wrapper moves it
@@ -1382,6 +1422,7 @@ class ControlNetManager:
                 self._union_model.to("cpu")
             except Exception:
                 pass
+            _release_union_wrapper(self._union_wrapper)
             self._union_model = None
             self._union_wrapper = None
             import gc
@@ -1390,14 +1431,40 @@ class ControlNetManager:
 
     # ---- Cleanup --------------------------------------------------------
 
+    def reset(self) -> None:
+        """Drop every ControlNet model / engine and the hot-path caches but keep the app
+        link: called when the stream is recreated (new model family, batch, resolution or
+        acceleration), so nothing built for the previous stream survives or is reused.
+        load_models() rebuilds what the config enables."""
+        for model in list(self.models.values()):
+            _release_engine(model)
+        self.models.clear()
+        self.models_cache = []
+        self.scales_cache = []
+        self.active_keys = []
+        _release_union_wrapper(self._union_wrapper)
+        self._union_wrapper = None
+        if self._union_model is not None:
+            try:
+                self._union_model.to("cpu")
+            except Exception:
+                pass
+            self._union_model = None
+        self._union_trt_failed = set()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def cleanup(self) -> None:
         """Release all on-GPU ControlNet models. Safe to call multiple times."""
         try:
             for _model_name, model in list(self.models.items()):
+                _release_engine(model)
                 del model
             self.models.clear()
         except Exception as e:
             logging.warning(f"Error cleaning up ControlNet models: {e}")
+        _release_union_wrapper(self._union_wrapper)
 
         if self._union_model is not None:
             try:

@@ -115,12 +115,37 @@ class Engine:
         self.profile_graph = False
         self._graph_events = None
 
+    def release(self):
+        """Free everything this engine owns, now: captured CUDA graphs (never freed by
+        dropping the Python object), the cudart events, the I/O buffers, the execution
+        context (its activation memory) and the deserialized engine. Idempotent; the
+        object is unusable afterwards."""
+        try:
+            self._destroy_graphs()
+        except Exception:
+            pass
+        for name in ("_input_event", "_replay_event"):
+            ev = getattr(self, name, None)
+            if ev is not None:
+                try:
+                    cudart.cudaEventDestroy(ev)
+                except Exception:
+                    pass
+                setattr(self, name, None)
+        try:
+            [buf.free() for buf in getattr(self, "buffers", {}).values() if isinstance(buf, cuda.DeviceArray)]
+        except Exception:
+            pass
+        self.buffers = OrderedDict()
+        self.tensors = OrderedDict()
+        self.context = None   # context before engine
+        self.engine = None
+
     def __del__(self):
-        [buf.free() for buf in self.buffers.values() if isinstance(buf, cuda.DeviceArray)]
-        del self.engine
-        del self.context
-        del self.buffers
-        del self.tensors
+        try:
+            self.release()
+        except Exception:
+            pass
 
     def refit(self, onnx_path, onnx_refit_path):
         def convert_int64(arr):

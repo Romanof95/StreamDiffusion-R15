@@ -985,6 +985,12 @@ class StreamDiffusion:
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
+        # No ControlNet this frame: drop the last models / residuals the step cache holds, or
+        # they (and a disabled Union's TRT engines) stay alive after every control is off.
+        if controlnet_model is None and self._cached_controlnet_model is not None:
+            self._cached_controlnet_model = None
+            self._cached_controlnet_model_list = None
+            self._cn_residual_cache = None
         internal_timings = {}
 
         if x is not None:

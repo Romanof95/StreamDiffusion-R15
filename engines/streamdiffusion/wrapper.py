@@ -285,6 +285,9 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                             del pipe
                         except Exception:
                             pass
+                        # The half-built stream holds the text encoders and possibly the
+                        # loaded TRT engines: drop it before the heavy load below.
+                        stream = None
                         gc.collect()
                         torch.cuda.empty_cache()
                 else:

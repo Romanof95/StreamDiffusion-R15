@@ -193,13 +193,7 @@ class App:
 
         if self.stream is not None:
             logging.info(f"[Engine] Freeing previous engine...")
-            # ControlNets were built for the previous stream (model family, batch,
-            # resolution, acceleration): drop them all, the reload below rebuilds what the
-            # config enables for the new stream.
-            try:
-                self.controlnet_manager.reset()
-            except Exception as e:
-                logging.warning(f"[ControlNet] reset() raised: {e}")
+            self._release_stream_dependents()
             if self.engine is not None:
                 try:
                     self.engine.cleanup()
@@ -213,9 +207,11 @@ class App:
             # leaves cycle-held tensors alive so their blocks aren't released
             # before the next engine's (TRT) allocations. Matches the rest of
             # the codebase's teardown order.
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Always, also after a failed load (self.stream is None then): TensorRT deserializes
+        # outside torch's allocator and must not compete with GBs cached by torch.
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
         if self.acceleration == Acceleration.TENSORRT:
             acceleration_str = "tensorrt"
@@ -277,6 +273,29 @@ class App:
 
         self._create_tensors(3, self.width, self.height)
         send_message(self.socket, StreamCreationPacket(True))
+
+    def _release_stream_dependents(self):
+        """Free everything built for / holding the current stream before a new one loads:
+        ControlNets (built for its model family, batch, resolution, acceleration), the FaceID
+        processor (holds the whole diffusers pipe) and the preprocessor orchestrator
+        (Depth-Anything, DWPose). Freed only after the new load before, which doubled the
+        VRAM peak of every model / LoRA switch."""
+        try:
+            self.controlnet_manager.reset()
+        except Exception as e:
+            logging.warning(f"[ControlNet] reset() raised: {e}")
+        if self.faceid_processor is not None:
+            try:
+                self.faceid_processor.cleanup()
+            except Exception:
+                pass
+            self.faceid_processor = None
+        if self.preprocessor_orchestrator is not None:
+            try:
+                self.preprocessor_orchestrator.cleanup()
+            except Exception as e:
+                logging.debug(f"Orchestrator cleanup error (non-critical): {e}")
+            self.preprocessor_orchestrator = None
 
     def _post_load_streamdiffusion(self):
         """Post-load setup: FaceID processor + modular preprocessor orchestrator."""
@@ -416,9 +435,18 @@ class App:
             logging.info("Torch.compile acceleration enabled")
         elif self.acceleration == Acceleration.TENSORRT:
             try:
+                unet = getattr(getattr(self.stream, "stream", None), "unet", None)
                 if previous_acceleration == Acceleration.TORCHCOMPILE:
                     # Switching from torch.compile to TensorRT requires full stream recreation
                     self._create_stream()
+                elif type(unet).__name__ == "UNet2DConditionModelEngine":
+                    # _create_stream() already loaded the TensorRT engines: enabling again
+                    # would deserialize every engine a second time (~5 GB for the SDXL UNet)
+                    # and leave the ControlNet / depth engines on an orphaned stream.
+                    logging.info("[Engine] TensorRT engines already active")
+                elif getattr(self.stream, "_faceid_loaded", False):
+                    # FaceID forces the PyTorch UNet (see the wrapper): keep it.
+                    logging.info("[Engine] FaceID active: staying on the PyTorch UNet")
                 else:
                     self.stream.enable_tensorrt_acceleration(self.stream.stream, self.model_name, True, True)
 
@@ -854,11 +882,11 @@ class App:
                 logging.warning(f"Received unexpected command: {cmd}")
         return False
 
-    def _recover_from_failed_command(self):
+    def _recover_from_failed_command(self, failed_tb: str = ""):
         # Survive a failed CONFIG (parse or load error): log it, release the host
         # spinner, reset to a clean state so the next CONFIG can retry.
-        import traceback
-        logging.error(f"Command handling failed:\n{traceback.format_exc()}")
+        logging.error(f"Command handling failed:\n{failed_tb}")
+        self._release_stream_dependents()
         engine = getattr(self, 'engine', None)
         if engine is not None:
             try:
@@ -869,6 +897,8 @@ class App:
         self.stream = None
         self.warmup_completed = False
         self._streamv2v_active = False
+        import gc
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         try:
@@ -1178,11 +1208,17 @@ class App:
                                 smode_idle = timings['wall_clock'] - timings['total_frame']
                                 logging.info(f"  {'wall_clock':25s}: {timings['wall_clock']:6.2f}ms (frame-to-frame interval)")
                                 logging.info(f"  {'smode_idle':25s}: {smode_idle:6.2f}ms (Smode + idle time)")
+                failed_tb = None
                 try:
                     if self._handle_pending_commands(messages):
                         return
                 except Exception:
-                    self._recover_from_failed_command()
+                    import traceback
+                    failed_tb = traceback.format_exc()
+                if failed_tb is not None:
+                    # Outside the except block: its traceback references the failed load's
+                    # frames (pipe, stream, engines: GBs) until the block exits.
+                    self._recover_from_failed_command(failed_tb)
         except socket.error as e:
             logging.error(f"Socket error during processing: {e}")
         except Exception as e:

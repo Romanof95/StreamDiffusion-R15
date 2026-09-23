@@ -84,10 +84,31 @@ def hardware_precision(precision: str) -> str:
     return "fp16"
 
 
+def _scrub_import_tracebacks(prefixes=("pulp",)) -> None:
+    """Drop the tracebacks of exceptions that imported modules keep. ModelOpt imports pulp,
+    whose solver modules store their failed optional import (``CPLEX_PY.err = e``, ...) as
+    class attributes: the traceback pins every frame up to the one that first imported
+    modelopt, i.e. _create_stream / _load_model and the previous stream in their locals
+    (~4.4 GB of SDXL TensorRT engines kept alive after the first model switch). The
+    exceptions stay, only their frames are released."""
+    import sys
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not name.startswith(prefixes):
+            continue
+        for value in list(vars(mod).values()):
+            candidates = [value]
+            if isinstance(value, type):
+                candidates += list(vars(value).values())
+            for c in candidates:
+                if isinstance(c, BaseException) and c.__traceback__ is not None:
+                    c.__traceback__ = None
+
+
 def quantization_available() -> bool:
     try:
         import modelopt.torch.quantization  # noqa: F401
         from modelopt.onnx.export import MXFP8QuantExporter, NVFP4QuantExporter  # noqa: F401
+        _scrub_import_tracebacks()
         return True
     except Exception as e:
         logging.warning(f"[Quant] nvidia-modelopt (+ onnx exporter deps) not available: {e}")

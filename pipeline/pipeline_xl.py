@@ -419,9 +419,10 @@ class StreamDiffusionXL:
 
         self.delta = delta
 
-        do_classifier_free_guidance = False
-        if self.guidance_scale > 1.0:
-            do_classifier_free_guidance = True
+        # "initialize" / "full" always carry the unconditional pass in the UNet batch (the
+        # TensorRT engine is built for that batch), even at guidance <= 1 where it is unused.
+        do_classifier_free_guidance = self.guidance_scale > 1.0 or self._uncond_in_batch
+        self._negative_prompt = negative_prompt
 
         # Skip the eager dual-CLIP encode when prompt inputs are unchanged.
         _embed_key = (prompt, negative_prompt, do_classifier_free_guidance,
@@ -460,9 +461,7 @@ class StreamDiffusionXL:
                 if encoder_output[1] is not None:
                     uncond_prompt_embeds = encoder_output[1].repeat(self.frame_bff_size, 1, 1)
 
-            if self.guidance_scale > 1.0 and (
-                self.cfg_type == "initialize" or self.cfg_type == "full"
-            ):
+            if self._uncond_in_batch:
                 self.prompt_embeds = torch.cat(
                     [uncond_prompt_embeds, self.prompt_embeds], dim=0
                 )
@@ -537,15 +536,28 @@ class StreamDiffusionXL:
             self.alpha_next = None
             self.beta_next = None
 
+    @property
+    def _uncond_in_batch(self) -> bool:
+        """The unconditional pass is concatenated into the UNet batch ("initialize": one
+        frame, "full": every frame), whatever the guidance scale: the batch the TensorRT
+        engine was built for depends on the CFG type only."""
+        return self.cfg_type in ("initialize", "full")
+
     @torch.no_grad()
     def update_prompt(self, prompt: str) -> None:
         encoder_output = self.pipe.encode_prompt(
             prompt=prompt,
             device=self.device,
             num_images_per_prompt=1,
-            do_classifier_free_guidance=False,
+            do_classifier_free_guidance=self._uncond_in_batch,
+            negative_prompt=getattr(self, "_negative_prompt", None) if self._uncond_in_batch else None,
         )
         self.prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
+        if self._uncond_in_batch:
+            uncond_repeat = self.batch_size if self.cfg_type == "full" else self.frame_bff_size
+            self.prompt_embeds = torch.cat(
+                [encoder_output[1].repeat(uncond_repeat, 1, 1), self.prompt_embeds], dim=0
+            )
 
         # Update SDXL pooled embeds in added_cond_kwargs (time_ids stay).
         if len(encoder_output) > 2:
@@ -619,11 +631,11 @@ class StreamDiffusionXL:
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
+        if self.cfg_type == "initialize":
             x_t_latent_plus_uc = torch.concat([x_t_latent[0:1], x_t_latent], dim=0)
             t_list_new = torch.concat([t_list[0:1], t_list], dim=0)
             t_list = t_list_new
-        elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
+        elif self.cfg_type == "full":
             x_t_latent_plus_uc = torch.concat([x_t_latent, x_t_latent], dim=0)
             t_list_new = torch.concat([t_list, t_list], dim=0)
             t_list = t_list_new
@@ -827,7 +839,7 @@ class StreamDiffusionXL:
 
         # Sequential steps keep one RCFG slot per step (stock_noise[idx]).
         stock_idx = 0 if idx is None else idx
-        if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
+        if self.cfg_type == "initialize":
             noise_pred_text = model_pred[1:]
             if self.use_denoising_batch:
                 old_stock_noise = self.stock_noise
@@ -837,7 +849,7 @@ class StreamDiffusionXL:
                 del old_stock_noise
             else:
                 self.stock_noise[stock_idx:stock_idx + 1].copy_(model_pred[0:1])
-        elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
+        elif self.cfg_type == "full":
             noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
         else:
             noise_pred_text = model_pred

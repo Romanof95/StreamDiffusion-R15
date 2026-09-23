@@ -369,6 +369,23 @@ class Engine:
         is set here."""
         any_reallocated = False
         external = set(external)
+        # Reject a shape the engine cannot take before touching any buffer: TensorRT only
+        # logs the failed set_input_shape, and the run then reads buffers sized for the
+        # wrong batch (illegal memory access that poisons the CUDA context).
+        if shape_dict:
+            for idx in range(self.engine.num_io_tensors):
+                tensor_name = self.engine.get_tensor_name(idx)
+                if tensor_name not in shape_dict:
+                    continue
+                shape = tuple(shape_dict[tensor_name])
+                engine_shape = tuple(self.engine.get_tensor_shape(tensor_name))
+                if len(shape) != len(engine_shape) or any(
+                    e != -1 and e != s for e, s in zip(engine_shape, shape)
+                ):
+                    raise RuntimeError(
+                        f"TensorRT engine input/output '{tensor_name}' is {engine_shape}, "
+                        f"got {shape} (engine built for another batch: CFG type / step count)"
+                    )
         for idx in range(self.engine.num_io_tensors):
             tensor_name = self.engine.get_tensor_name(idx)
             if shape_dict and tensor_name in shape_dict:

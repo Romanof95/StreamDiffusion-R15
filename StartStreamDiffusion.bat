@@ -29,6 +29,10 @@ REM 1 = sequential: the steps run one after the other in the batch-1 engines (no
 REM build, one frame of latency, step count changes live, quantized batch-N engines not used).
 if not defined STREAMDIFFUSION_SEQUENTIAL set STREAMDIFFUSION_SEQUENTIAL=1
 REM   set STREAMDIFFUSION_CN_FIRST_STEP_ONLY=1   sequential only: ControlNet on the first step (~-16 ms/frame)
+REM Overlap with Smode: when the next input arrives, Smode gets the previous result at once and the
+REM generation runs while Smode renders (frame time max(Smode, generation) instead of their sum,
+REM +1 frame of latency). 0 = off (default), 1 = on.
+if not defined STREAMDIFFUSION_OVERLAP_SMODE set STREAMDIFFUSION_OVERLAP_SMODE=0
 REM Diagnostics: [PERF] log line every 60 frames (GPU breakdown, frame-time spread, wait for Smode).
 REM set STREAMDIFFUSION_PROFILING=1
  set STREAMDIFFUSION_V2V_ATTN_POOL=2

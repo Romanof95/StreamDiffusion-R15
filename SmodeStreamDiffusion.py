@@ -143,6 +143,14 @@ class App:
 
         self.low_latency = LowLatencyController()
 
+        # Hand Smode the previous result and generate while it renders (+1 frame of latency).
+        self._overlap_smode = os.environ.get("STREAMDIFFUSION_OVERLAP_SMODE", "0") == "1"
+        self._overlap_out: Optional[torch.Tensor] = None
+        self._overlap_fresh = False
+        if self._overlap_smode:
+            logging.info("[Smode] Overlap mode: previous result handed over at each input, "
+                         "generation runs while Smode renders (+1 frame of latency)")
+
         self.similar_image_filter = SimilarImageFilterConfig()
 
         self.controlnet_config = ControlNetConfig(
@@ -379,6 +387,8 @@ class App:
         logging.info("[Orchestrator] Modular preprocessors ready")
 
     def _create_tensors(self, channels, w, h):
+        self._overlap_out = None
+        self._overlap_fresh = False
         self.input_tensors = StreamDiffusionSmodeTexture(
             self.device, w, h, channels, self.torch_dtype
         )
@@ -923,11 +933,8 @@ class App:
         except Exception:
             pass
 
-    def _process_frame(self, timings: dict) -> None:
-        """Per-frame compute: input -> preprocess -> inference -> output -> signal."""
-        profiling_enabled = self._cached_profiling_enabled
-
-        if profiling_enabled:
+    def _copy_input(self, timings: dict) -> None:
+        if self._cached_profiling_enabled:
             input_copy_start = time.time()
             self.input_tensors.copy_smode_to_stream_diffusion()
             torch.cuda.synchronize()
@@ -935,6 +942,10 @@ class App:
         else:
             self.input_tensors.copy_smode_to_stream_diffusion()
 
+    def _generate(self, timings: dict) -> Optional[torch.Tensor]:
+        """Preprocess + inference on the copied input frame. Returns the CHW output, or None
+        when there is nothing to hand over (similar-image skip, unknown mode)."""
+        profiling_enabled = self._cached_profiling_enabled
         x_output = None
         permuted_input_texture = None
 
@@ -970,8 +981,7 @@ class App:
                 torch.mul(permuted_input_texture, 2.0, out=ssf_buf[0])
                 ssf_buf.sub_(1.0)
                 if inner_stream.similar_filter.decide_skip(ssf_buf):
-                    self.streamDiffusionToSmodeInterProcessEvent.signal()
-                    return
+                    return None
 
             if profiling_enabled:
                 controlnet_start = time.time()
@@ -1084,12 +1094,18 @@ class App:
                 timings['generation'] = 0.0
         else:
             logging.error(f"Unknown mode: {self.mode}")
-            # Signal anyway so the host never waits forever on this frame.
-            self.streamDiffusionToSmodeInterProcessEvent.signal()
-            return
+            # The caller signals anyway so the host never waits forever on this frame.
+            return None
 
         if x_output is not None:
             x_output = x_output.squeeze(0) if x_output.shape[0] == 1 else x_output
+        return x_output
+
+    def _process_frame(self, timings: dict) -> None:
+        """Per-frame compute: input -> preprocess -> inference -> output -> signal."""
+        self._copy_input(timings)
+        x_output = self._generate(timings)
+        profiling_enabled = self._cached_profiling_enabled
 
         if profiling_enabled:
             output_copy_start = time.time()
@@ -1110,6 +1126,39 @@ class App:
             timings['signal_smode'] = (time.time() - signal_start) * 1000
         else:
             self.streamDiffusionToSmodeInterProcessEvent.signal()
+
+    def _process_frame_overlapped(self, timings: dict) -> None:
+        """STREAMDIFFUSION_OVERLAP_SMODE=1: take the new input, hand Smode the previous frame's
+        result and signal right away, then generate while Smode renders and prepares the
+        next input. Throughput max(Smode, generation) instead of their sum, one extra frame
+        of latency. The result waits in a private buffer: the Smode output texture is only
+        written while Smode waits for the signal, like in the sequential path."""
+        self._copy_input(timings)
+        pending = self._overlap_out
+        if pending is not None:
+            if self._overlap_fresh:
+                self.output_tensors.write_chw_to_smode(pending)
+                self._overlap_fresh = False
+            # Input consumed and output written before Smode may touch either again.
+            torch.cuda.synchronize()
+            self.streamDiffusionToSmodeInterProcessEvent.signal()
+
+        x_output = self._generate(timings)
+        if pending is None:
+            # First frame (or new textures): nothing to hand over yet, finish it in line.
+            if x_output is not None:
+                self.output_tensors.write_chw_to_smode(x_output)
+                self._overlap_out = torch.empty_like(x_output)
+            torch.cuda.synchronize()
+            self.streamDiffusionToSmodeInterProcessEvent.signal()
+            return
+        if x_output is not None:
+            if pending.shape != x_output.shape or pending.dtype != x_output.dtype:
+                pending = self._overlap_out = torch.empty_like(x_output)
+            pending.copy_(x_output)
+            self._overlap_fresh = True
+        # Same queue bound as the sequential path; Smode is already busy meanwhile.
+        torch.cuda.synchronize()
 
     def run(self):
         logging.info("Entering main command loop")
@@ -1160,7 +1209,10 @@ class App:
 
                     profiling_enabled = self._cached_profiling_enabled
 
-                    self._process_frame(timings)
+                    if self._overlap_smode:
+                        self._process_frame_overlapped(timings)
+                    else:
+                        self._process_frame(timings)
 
                     frames_processed += 1
                     self.low_latency.tick()

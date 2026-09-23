@@ -28,9 +28,13 @@ REM steps of consecutive frames share one batch-N engine, one frame of latency p
 REM 1 = sequential: the steps run one after the other in the batch-1 engines (no batch-N engine
 REM build, one frame of latency, step count changes live, quantized batch-N engines not used).
 if not defined STREAMDIFFUSION_SEQUENTIAL set STREAMDIFFUSION_SEQUENTIAL=1
-REM Sequential only: ControlNet on the first step only (SDXL Union at 1024: one ~17 ms ControlNet
-REM pass saved per extra step). Keep the set line alone: text after = becomes part of the value.
-REM set STREAMDIFFUSION_CN_FIRST_STEP_ONLY=1
+REM Sequential only, ControlNet per step: all = every step (default); first = first step only (the
+REM later steps redraw the details: flicker); reuse = first step, its residuals fed to the later
+REM steps (first's speed, all's stability: SD 1.5 512 4 steps 65 to 52 ms, SDXL Union 1024 2 steps
+REM 134 to 118 ms). Keep the set lines alone: text after = becomes part of the value.
+REM set STREAMDIFFUSION_CN_STEPS=reuse
+REM reuse: residual scale on the later steps (below 1 = more freedom and detail, default 1).
+REM set STREAMDIFFUSION_CN_REUSE_SCALE=0.7
 REM Overlap with Smode: when the next input arrives, Smode gets the previous result at once and the
 REM generation runs while Smode renders (frame time max(Smode, generation) instead of their sum,
 REM +1 frame of latency). 0 = off (default), 1 = on.

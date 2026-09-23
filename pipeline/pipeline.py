@@ -83,14 +83,35 @@ class StreamDiffusion:
 
         self.do_add_noise = do_add_noise
         self.use_denoising_batch = use_denoising_batch
-        # Sequential multi-step: ControlNet on the first step only (diffusers'
-        # control_guidance_end), saves one ControlNet pass per extra step.
-        self._cn_first_step_only = os.environ.get("STREAMDIFFUSION_CN_FIRST_STEP_ONLY", "0") == "1"
+        # Sequential multi-step ControlNet (STREAMDIFFUSION_CN_STEPS): "all" runs it on every
+        # step; "first" on the first step only (diffusers' control_guidance_end: the later steps
+        # lose the anchoring and redraw the details, which flickers); "reuse" runs it on the
+        # first step and feeds the same residuals to the later steps (one ControlNet pass per
+        # frame, every step anchored), scaled by STREAMDIFFUSION_CN_REUSE_SCALE.
+        # STREAMDIFFUSION_CN_FIRST_STEP_ONLY=1 (older launchers) means "first".
+        cn_steps = os.environ.get("STREAMDIFFUSION_CN_STEPS", "").strip().lower()
+        if cn_steps not in ("all", "first", "reuse"):
+            if cn_steps:
+                logging.warning(f"[Multi-step] STREAMDIFFUSION_CN_STEPS={cn_steps!r} unknown (all | first | reuse)")
+            cn_steps = "first" if os.environ.get("STREAMDIFFUSION_CN_FIRST_STEP_ONLY", "0") == "1" else "all"
+        self._cn_steps = cn_steps
+        try:
+            self._cn_reuse_scale = float(os.environ.get("STREAMDIFFUSION_CN_REUSE_SCALE", "1.0"))
+        except ValueError:
+            logging.warning("[Multi-step] STREAMDIFFUSION_CN_REUSE_SCALE is not a number, using 1.0")
+            self._cn_reuse_scale = 1.0
+        # Residuals fed to the UNet of a sequential step that skips the ControlNet ("reuse").
+        self._cn_step_residuals = None
         if not use_denoising_batch and self.denoising_steps_num > 1:
+            cn_note = {
+                "all": "",
+                "first": " (ControlNet on the first step only)",
+                "reuse": f" (ControlNet on the first step, residuals x{self._cn_reuse_scale:g} "
+                         f"reused on the later steps)",
+            }[cn_steps]
             logging.info(
                 f"[Multi-step] {self.denoising_steps_num} sequential steps per frame in the "
-                f"batch-{frame_buffer_size} engine"
-                + (" (ControlNet on the first step only)" if self._cn_first_step_only else "")
+                f"batch-{frame_buffer_size} engine" + cn_note
             )
 
         # SSF (Stochastic Similarity Filter)
@@ -700,6 +721,9 @@ class StreamDiffusion:
                 # reused); PyTorch residuals are fresh tensors. Guidance strength already applied.
                 self._cn_residual_cache = (reuse_key, down_block_res_samples, mid_block_res_sample)
 
+        if down_block_res_samples is None and self._cn_step_residuals is not None:
+            down_block_res_samples, mid_block_res_sample = self._cn_step_residuals
+
         try:
             unet_kwargs = {
                 "encoder_hidden_states": self.prompt_embeds,
@@ -969,10 +993,22 @@ class StreamDiffusion:
             if self.guidance_scale > 1.0 and self.cfg_type in ("self", "initialize"):
                 # RCFG: the first step's virtual unconditional prediction is the input noise.
                 self.stock_noise[0:1].copy_(self.init_noise[0:1])
+            reused = None
             for idx, t in enumerate(self.sub_timesteps_tensor):
                 last = idx == n_steps - 1
                 t = t.view(1,).repeat(self.frame_bff_size,)
-                use_cn = controlnet_model is not None and (idx == 0 or not self._cn_first_step_only)
+                use_cn = controlnet_model is not None and (idx == 0 or self._cn_steps == "all")
+                if idx == 1 and controlnet_model is not None and self._cn_steps == "reuse":
+                    # Residuals of the first step (guidance strength applied); TRT keeps them
+                    # in the ControlNet engine's output buffers until its next run.
+                    cache = getattr(self, '_cn_residual_cache', None)
+                    if cache is not None:
+                        down, mid = cache[1], cache[2]
+                        if self._cn_reuse_scale != 1.0:
+                            down = [r * self._cn_reuse_scale for r in down]
+                            mid = mid * self._cn_reuse_scale
+                        reused = (down, mid)
+                self._cn_step_residuals = reused if idx > 0 else None
                 self._set_v2v_slot(idx)
                 try:
                     x_0_pred, model_pred = self.unet_step(
@@ -986,6 +1022,7 @@ class StreamDiffusion:
                     )
                 finally:
                     self._set_v2v_slot(0)
+                    self._cn_step_residuals = None
                 if not last:
                     x_t_latent = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
                     if self.do_add_noise:

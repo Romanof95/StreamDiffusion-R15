@@ -450,6 +450,67 @@ class UNetV2V(UNet):
         return tuple(base)
 
 
+class UNetV2VRing(UNet):
+    """SD 1.5 UNet spec + StreamV2V ring cache as engine I/O (same layout as UNetXLV2VRing).
+
+    Per attn1 ``i``: ``max_cache_frames`` inputs ``kvo_in_{i}_{j}`` (one per cached frame)
+    and one output ``kvo_out_{i}`` (the current frame), all (3, 2B, seq, dim) with the
+    leading 3 stacking [key, value, output]. See KvoRingAttnProcessor2_0.
+    """
+
+    def __init__(self, kvo_cache_shapes, max_cache_frames=1, **kwargs):
+        super().__init__(**kwargs)
+        self.kvo_cache_shapes = list(kvo_cache_shapes)
+        self.max_cache_frames = max_cache_frames
+        self.n_kvo = len(self.kvo_cache_shapes)
+        self.name = "UNetV2VRing"
+
+    def kvo_input_names(self):
+        return [f"kvo_in_{i}_{j}" for i in range(self.n_kvo) for j in range(self.max_cache_frames)]
+
+    def get_input_names(self):
+        return super().get_input_names() + self.kvo_input_names()
+
+    def get_output_names(self):
+        return super().get_output_names() + [f"kvo_out_{i}" for i in range(self.n_kvo)]
+
+    def get_dynamic_axes(self):
+        axes = super().get_dynamic_axes()
+        for name in self.kvo_input_names():
+            axes[name] = {1: "2B"}
+        for i in range(self.n_kvo):
+            axes[f"kvo_out_{i}"] = {1: "2B"}
+        return axes
+
+    def get_input_profile(self, batch_size, image_height, image_width, static_batch, static_shape):
+        profile = super().get_input_profile(batch_size, image_height, image_width, static_batch, static_shape)
+        min_batch, max_batch = self.get_minmax_dims(
+            batch_size, image_height, image_width, static_batch, static_shape
+        )[:2]
+        for i, (seq, dim) in enumerate(self.kvo_cache_shapes):
+            for j in range(self.max_cache_frames):
+                profile[f"kvo_in_{i}_{j}"] = [
+                    (3, min_batch, seq, dim), (3, batch_size, seq, dim), (3, max_batch, seq, dim),
+                ]
+        return profile
+
+    def get_shape_dict(self, batch_size, image_height, image_width):
+        d = super().get_shape_dict(batch_size, image_height, image_width)
+        for i, (seq, dim) in enumerate(self.kvo_cache_shapes):
+            for j in range(self.max_cache_frames):
+                d[f"kvo_in_{i}_{j}"] = (3, 2 * batch_size, seq, dim)
+            d[f"kvo_out_{i}"] = (3, 2 * batch_size, seq, dim)
+        return d
+
+    def get_sample_input(self, batch_size, image_height, image_width):
+        base = list(super().get_sample_input(batch_size, image_height, image_width))
+        dtype = torch.float16 if self.fp16 else torch.float32
+        for seq, dim in self.kvo_cache_shapes:
+            for _ in range(self.max_cache_frames):
+                base.append(torch.zeros(3, 2 * batch_size, seq, dim, dtype=dtype, device=self.device))
+        return tuple(base)
+
+
 class UNetSimple(BaseModel):
     """UNet spec without ControlNet: sample/timestep/encoder_hidden_states only."""
     def __init__(

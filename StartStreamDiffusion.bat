@@ -18,7 +18,7 @@ REM mxfp8: ~-12%% UNet time, image visually identical to fp16. nvfp4: ~-29%% but
 REM First build per model+LoRA+steps+resolution quantizes and compiles (5-15 min), then cached.
 if not defined STREAMDIFFUSION_PRECISION set STREAMDIFFUSION_PRECISION=nvfp4
 
-REM StreamV2V speed/quality options (SDXL TensorRT engine), all off by default. Each combination
+REM StreamV2V speed/quality options (SDXL and SD 1.5 TensorRT engines), all off by default. Each combination
 REM builds its own engine once (~5 min). Uncomment to test:
 REM   ATTN_POOL=2   : cached keys/values pooled 2x2 before the extended attention
 REM   FI_LAST=1     : feature injection matched against the newest cached frame only
@@ -27,7 +27,7 @@ REM Multi-step (2+ t_index), SDXL and SD 1.5. 0 = StreamDiffusion stream batch (
 REM steps of consecutive frames share one batch-N engine, one frame of latency per extra step.
 REM 1 = sequential: the steps run one after the other in the batch-1 engines (no batch-N engine
 REM build, one frame of latency, step count changes live, quantized batch-N engines not used).
-if not defined STREAMDIFFUSION_SEQUENTIAL set STREAMDIFFUSION_SEQUENTIAL=0
+if not defined STREAMDIFFUSION_SEQUENTIAL set STREAMDIFFUSION_SEQUENTIAL=1
 REM   set STREAMDIFFUSION_CN_FIRST_STEP_ONLY=1   sequential only: ControlNet on the first step (~-16 ms/frame)
 REM Diagnostics: [PERF] log line every 60 frames (GPU breakdown, frame-time spread, wait for Smode).
 REM set STREAMDIFFUSION_PROFILING=1

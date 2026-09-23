@@ -226,6 +226,49 @@ class TorchUNetV2VWrapper(torch.nn.Module):
         return (model_pred,) + kvo_cache_out
 
 
+class TorchUNetV2VRingWrapper(torch.nn.Module):
+    """SD 1.5 UNet ONNX wrapper: 12 CN residuals + StreamV2V ring cache (``max_frames``
+    inputs per attn1, one output per attn1; see KvoRingAttnProcessor2_0)."""
+    def __init__(self, unet: UNet2DConditionModel, kvo_processors, max_frames: int):
+        super().__init__()
+        self.unet = unet
+        self._kvo_processors = list(kvo_processors)
+        self._max_frames = int(max_frames)
+
+    def forward(
+        self,
+        sample,
+        timestep,
+        encoder_hidden_states,
+        down_block_0, down_block_1, down_block_2, down_block_3,
+        down_block_4, down_block_5, down_block_6, down_block_7,
+        down_block_8, down_block_9, down_block_10, down_block_11,
+        mid_block,
+        *kvo_cache_in,
+    ):
+        n = self._max_frames
+        for k, proc in enumerate(self._kvo_processors):
+            proc._cache_in = tuple(kvo_cache_in[k * n:(k + 1) * n])
+
+        down_block_additional_residuals = (
+            down_block_0, down_block_1, down_block_2,
+            down_block_3, down_block_4, down_block_5,
+            down_block_6, down_block_7, down_block_8,
+            down_block_9, down_block_10, down_block_11,
+        )
+
+        model_pred = self.unet(
+            sample,
+            timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            down_block_additional_residuals=down_block_additional_residuals,
+            mid_block_additional_residual=mid_block,
+            return_dict=False,
+        )[0]
+
+        return (model_pred,) + tuple(proc._cache_out for proc in self._kvo_processors)
+
+
 class TorchUNetXLV2VWrapper(torch.nn.Module):
     """SDXL UNet ONNX wrapper: 9 CN residuals + SDXL conditioning + StreamV2V kvo cache."""
     def __init__(self, unet: UNet2DConditionModel, kvo_processors):
@@ -416,6 +459,10 @@ def compile_unet(
             )
         elif is_sdxl:
             unet_wrapper = TorchUNetXLV2VWrapper(unet, kvo_processors).to(
+                torch.device("cuda"), dtype=torch.float16
+            )
+        elif kvo_ring_frames:
+            unet_wrapper = TorchUNetV2VRingWrapper(unet, kvo_processors, kvo_ring_frames).to(
                 torch.device("cuda"), dtype=torch.float16
             )
         else:

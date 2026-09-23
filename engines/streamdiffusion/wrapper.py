@@ -16,6 +16,28 @@ from pipeline import StreamDiffusion
 from .base_wrapper import BaseStreamDiffusionWrapper, PACKAGE_DIR, lora_signature
 
 
+def _v2v_variant_suffix(options) -> str:
+    """Engine filename tag of the StreamV2V speed/quality options (empty when all off)."""
+    options = options or {}
+    tag = ""
+    pool = int(options.get("attn_cache_pool", 1) or 1)
+    if pool > 1:
+        tag += f"--pool{pool}"
+    if options.get("fi_last_frame_only"):
+        tag += "--filast"
+    if options.get("attn_decoder_only"):
+        tag += "--attndec"
+    return tag
+
+
+def _v2v_unet_filename(streamv2v_on, streamv2v_maxframes, options) -> str:
+    """``unet_v2vr`` = StreamV2V ring cache layout (UNetV2VRing, same as SDXL); the older
+    ``unet_v2v_mfN`` engines (shifted cache, copied every call, no CUDA graph) are not reused."""
+    if not streamv2v_on:
+        return "unet.engine"
+    return f"unet_v2vr_mf{streamv2v_maxframes}{_v2v_variant_suffix(options)}.engine"
+
+
 def _compute_trt_unet_batch_size(t_index_list, frame_buffer_size, cfg_type, use_denoising_batch):
     """Mirror of StreamDiffusion.__init__ logic for trt_unet_batch_size."""
     denoising_steps_num = len(t_index_list)
@@ -37,7 +59,7 @@ def _compute_trt_unet_batch_size(t_index_list, frame_buffer_size, cfg_type, use_
 def _derive_engine_paths_sd15(
     model_id_or_path, use_lcm_lora, use_tiny_vae, lora_dict, engine_dir,
     trt_unet_batch_size, vae_batch_size, mode, height, width,
-    streamv2v_on, streamv2v_maxframes,
+    streamv2v_on, streamv2v_maxframes, streamv2v_options=None,
 ):
     """Derive on-disk paths for the three TRT engines (unet, vae enc, vae dec).
 
@@ -56,9 +78,7 @@ def _derive_engine_paths_sd15(
         )
 
     engine_dir = Path(engine_dir)
-    unet_filename = (
-        f"unet_v2v_mf{streamv2v_maxframes}.engine" if streamv2v_on else "unet.engine"
-    )
+    unet_filename = _v2v_unet_filename(streamv2v_on, streamv2v_maxframes, streamv2v_options)
     unet_path = os.path.join(
         engine_dir,
         create_prefix(trt_unet_batch_size, trt_unet_batch_size),
@@ -194,6 +214,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                     height=self.height, width=self.width,
                     streamv2v_on=v2v_on,
                     streamv2v_maxframes=v2v_maxframes,
+                    streamv2v_options=getattr(self, "streamv2v_options", None),
                 )
                 if (engine_ready(unet_path) and engine_ready(vae_enc_path)
                         and engine_ready(vae_dec_path)):
@@ -446,7 +467,7 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         from pipeline.acceleration.tensorrt.engine import (
             AutoencoderKLEngine, UNet2DConditionModelEngine,
         )
-        from pipeline.acceleration.tensorrt.models import VAE, UNet, UNetV2V, VAEEncoder
+        from pipeline.acceleration.tensorrt.models import VAE, UNet, UNetV2VRing, VAEEncoder
 
         lora_sig = lora_signature(lora_dict)
         v2v_on = bool(getattr(self, "streamv2v_enabled", False))
@@ -464,7 +485,8 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         engine_dir = Path(engine_dir)
         # Distinct filename for the v2v engine so a stale plain engine is
         # NEVER loaded as v2v (their bindings are incompatible).
-        unet_filename = f"unet_v2v_mf{v2v_maxframes}.engine" if v2v_on else "unet.engine"
+        v2v_opts = dict(getattr(self, "streamv2v_options", None) or {})
+        unet_filename = _v2v_unet_filename(v2v_on, v2v_maxframes, v2v_opts)
         unet_path = os.path.join(
             engine_dir,
             create_prefix(model_id_or_path, stream.trt_unet_batch_size, stream.trt_unet_batch_size),
@@ -497,21 +519,26 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                 # Install kvo passthrough processors BEFORE export so the ONNX
                 # trace captures the modified attention behavior.
                 from pipeline.attention_processors import (
-                    install_kvo_processors, get_kvo_cache_info,
+                    install_kvo_ring_processors, get_kvo_cache_info,
                 )
-                kvo_procs = install_kvo_processors(
+                kvo_procs = install_kvo_ring_processors(
                     stream.unet,
                     max_frames=v2v_maxframes,
                     use_feature_injection=True,
+                    attn_cache_pool=int(v2v_opts.get("attn_cache_pool", 1) or 1),
+                    fi_last_frame_only=bool(v2v_opts.get("fi_last_frame_only", False)),
+                    attn_decoder_only=bool(v2v_opts.get("attn_decoder_only", False)),
+                    height=self.height, width=self.width,
                 )
                 kvo_shapes, kvo_structure, _ = get_kvo_cache_info(
                     stream.unet, self.height, self.width,
                 )
                 logging.info(
-                    f"[StreamV2V TRT] Installed {len(kvo_procs)} kvo passthrough "
-                    f"processors, structure={kvo_structure}, max_cache_frames={v2v_maxframes}"
+                    f"[StreamV2V TRT] Installed {len(kvo_procs)} kvo ring processors, "
+                    f"structure={kvo_structure}, max_cache_frames={v2v_maxframes}, "
+                    f"options={_v2v_variant_suffix(v2v_opts) or 'default'}"
                 )
-                unet_model = UNetV2V(
+                unet_model = UNetV2VRing(
                     kvo_cache_shapes=kvo_shapes,
                     max_cache_frames=v2v_maxframes,
                     fp16=True, device=stream.device,
@@ -524,7 +551,12 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                              unet_path + ".opt.onnx", unet_path,
                              opt_batch_size=stream.trt_unet_batch_size,
                              opt_image_height=self.height, opt_image_width=self.width,
-                             kvo_processors=kvo_procs)
+                             kvo_processors=kvo_procs, kvo_ring_frames=v2v_maxframes)
+                # The cache tensors captured during the export trace are plain attributes
+                # on the processors: unet.to("cpu") does not move them.
+                for _p in kvo_procs:
+                    _p._cache_in = None
+                    _p._cache_out = None
             else:
                 unet_model = UNet(
                     fp16=True, device=stream.device,
@@ -598,9 +630,9 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         gc.collect()
         torch.cuda.empty_cache()
 
-        # CUDA Graph capture saves ~1-2 ms/frame on stable shapes; disabled
-        # for StreamV2V (per-frame kvo cache copy_ not yet verified safe).
-        unet_use_cuda_graph = not v2v_on
+        # CUDA Graph capture saves ~1-2 ms per UNet call on stable shapes. The StreamV2V
+        # ring engine gets one graph per (step, ring phase), with the cache addresses baked.
+        unet_use_cuda_graph = True
         stream.unet = UNet2DConditionModelEngine(
             unet_path, cuda_stream, use_cuda_graph=unet_use_cuda_graph,
             v2v_cache_maxframes=v2v_maxframes,

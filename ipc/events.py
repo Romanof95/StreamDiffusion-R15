@@ -18,19 +18,15 @@ class InterProcessEvent:
         if self.event is not None:
             raise RuntimeError("Event already assigned")
 
-        CREATE_EVENT_MANUAL_RESET = 0x00000001
-        CREATE_EVENT_INITIAL_SET = 0x00000002
         self.signal_awakes_all_clients = signal_awakes_all_clients
 
-        flags = 0
-        if signal_awakes_all_clients:
-            flags |= CREATE_EVENT_MANUAL_RESET
-
-        if initial_signaled_state:
-            flags |= CREATE_EVENT_INITIAL_SET
-
+        # CreateEvent(attributes, bManualReset, bInitialState, name). EVENT_ALL_ACCESS used to
+        # sit in the bInitialState slot: every event was created signaled, so the first wait
+        # on "frame done" returned before any frame and host and Python ran one frame apart.
         try:
-            self.event = win32event.CreateEvent(None, flags, win32event.EVENT_ALL_ACCESS, name)
+            self.event = win32event.CreateEvent(
+                None, bool(signal_awakes_all_clients), bool(initial_signaled_state), name
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to create event {name}: {e}") from e
         

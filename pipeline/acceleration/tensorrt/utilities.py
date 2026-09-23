@@ -332,6 +332,23 @@ class Engine:
         else:
             self.context = self.engine.create_execution_context()
 
+    def _destroy_graph(self, key):
+        entry = self.graphs.pop(key, None)
+        if entry is None:
+            return
+        graph, instance = entry
+        try:
+            cudart.cudaGraphExecDestroy(instance)
+        except Exception:
+            pass
+        try:
+            cudart.cudaGraphDestroy(graph)
+        except Exception:
+            pass
+        if self.cuda_graph_instance is instance:
+            self.cuda_graph_instance = None
+            self.graph = None
+
     def _destroy_graphs(self):
         for graph, instance in self.graphs.values():
             try:

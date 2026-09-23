@@ -466,6 +466,29 @@ class BaseStreamDiffusionWrapper(ABC):
                 if hasattr(self.stream, 'similar_filter') and self.stream.similar_filter is not None:
                     self.stream.similar_filter.prev_tensor = None
 
+                # TensorRT: release the engines now (graphs, contexts, buffers) rather than
+                # whenever GC reaches them, then the CUDA stream they ran on (polygraphy
+                # streams have no finalizer). ControlNet / depth engines that borrow this
+                # stream are released by the app before this cleanup.
+                trt_stream = None
+                for comp in (getattr(self.stream, 'unet', None), getattr(self.stream, 'vae', None)):
+                    if comp is None:
+                        continue
+                    trt_stream = trt_stream or getattr(comp, 'stream', None)
+                    for attr in ('engine', 'encoder', 'decoder'):
+                        eng = getattr(comp, attr, None)
+                        if eng is not None and hasattr(eng, 'release'):
+                            try:
+                                eng.release()
+                            except Exception:
+                                pass
+                if trt_stream is not None and hasattr(trt_stream, 'free'):
+                    try:
+                        trt_stream.synchronize()
+                        trt_stream.free()
+                    except Exception:
+                        pass
+
                 del self.stream
                 self.stream = None
 

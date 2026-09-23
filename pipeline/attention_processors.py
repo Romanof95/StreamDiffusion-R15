@@ -262,6 +262,24 @@ def select_attention_cache_slot(unet, slot):
     config['slot'] = slot
 
 
+def prune_attention_cache_slots(unet, n_slots):
+    """Drop the per-step caches of steps >= n_slots (see select_attention_cache_slot)."""
+    config = getattr(unet, '_sv2v_config', None)
+    if config is None:
+        return
+    n_slots = max(1, int(n_slots))
+    if config.get('slot', 0) >= n_slots:
+        select_attention_cache_slot(unet, 0)
+    for name, module, _ in config['attn1_modules']:
+        slots = module.__dict__.get('_sv2v_slot_bufs')
+        if slots:
+            for s in [s for s in slots if s >= n_slots]:
+                del slots[s]
+    counts = config.get('slot_counts', {})
+    for s in [s for s in counts if s >= n_slots]:
+        del counts[s]
+
+
 def update_cache_after_unet(unet):
     """Copy new -> cached for each attn1. Call after each UNet forward (outside CUDA graph)."""
     config = getattr(unet, '_sv2v_config', None)

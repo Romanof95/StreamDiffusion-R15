@@ -1244,7 +1244,10 @@ class App:
                     logging.warning(f"Error cleaning up stream: {e}")
 
             if hasattr(self, 'controlnet_manager'):
-                self.controlnet_manager.cleanup()
+                try:
+                    self.controlnet_manager.cleanup()
+                except Exception as e:
+                    logging.debug(f"ControlNet cleanup error at shutdown (non-critical): {e}")
 
             if hasattr(self, 'faceid_processor') and self.faceid_processor is not None:
                 try:

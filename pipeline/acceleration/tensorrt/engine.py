@@ -6,7 +6,7 @@ from diffusers.models.unets.unet_2d_condition import UNet2DConditionOutput
 from diffusers.models.autoencoders.vae import DecoderOutput
 from polygraphy import cuda
 
-from .utilities import Engine
+from .utilities import Engine, cudart
 
 
 class UNet2DConditionModelEngine:
@@ -330,6 +330,24 @@ class UNet2DConditionModelEngine:
 
         return UNet2DConditionOutput(sample=noise_pred)
 
+    def prune_v2v_slots(self, n_slots: int) -> None:
+        """Keep the StreamV2V caches (and their CUDA graphs) of steps < n_slots only: a
+        sequential run that goes from N steps to fewer would otherwise keep every extra
+        step's ring (~1.3 GB per step for SDXL at 1024)."""
+        n_slots = max(1, int(n_slots))
+        dropped = [s for s in list(self._rings) + list(self._kvo_caches) if s >= n_slots]
+        if not dropped:
+            return
+        for s in set(dropped):
+            self._rings.pop(s, None)
+            self._ring_phases.pop(s, None)
+            self._kvo_caches.pop(s, None)
+        for key in [k for k in list(self.engine.graphs) if isinstance(k, tuple) and k[0] >= n_slots]:
+            self.engine._destroy_graph(key)
+        if self.v2v_slot >= n_slots:
+            self.v2v_slot = 0
+        torch.cuda.empty_cache()
+
     def to(self, *args, **kwargs):
         pass
 
@@ -557,6 +575,15 @@ class DepthAnythingEngine:
         # Lazy-init: avoid paying event allocation if engine is never called.
         self._pre_event = None
         self._post_event = None
+
+    def __del__(self):
+        for name in ("_pre_event", "_post_event"):
+            ev = getattr(self, name, None)
+            if ev is not None:
+                try:
+                    cudart.cudaEventDestroy(ev)
+                except Exception:
+                    pass
 
     def __call__(self, pixel_values=None, **kwargs):
         if pixel_values is None:

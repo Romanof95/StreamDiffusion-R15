@@ -20,7 +20,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 )
 
 from .image_filter import SimilarImageFilter
-from .attention_processors import update_cache_after_unet, select_attention_cache_slot
+from .attention_processors import update_cache_after_unet, select_attention_cache_slot, prune_attention_cache_slots
 
 
 _SHAPE_CACHE = {}  # (height, width, scale_factor) -> (latent_h, latent_w)
@@ -349,6 +349,12 @@ class StreamDiffusionXL:
     ) -> None:
         self.generator = generator
         self.generator.manual_seed(seed)
+        # Per-step StreamV2V caches beyond the current step count (sequential mode) go.
+        _n_v2v = 1 if self.use_denoising_batch else self.denoising_steps_num
+        if hasattr(self.unet, "prune_v2v_slots"):
+            self.unet.prune_v2v_slots(_n_v2v)
+        elif getattr(self.unet, "_sv2v_config", None) is not None:
+            prune_attention_cache_slots(self.unet, _n_v2v)
         if self.denoising_steps_num > 1 and self.use_denoising_batch:
             self.x_t_latent_buffer = torch.zeros(
                 (

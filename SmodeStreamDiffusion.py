@@ -634,6 +634,15 @@ class App:
                     if model_has_changed or lora_dict_has_changed:
                         self._create_stream()
                         self.accelerate(previous_acceleration)
+                    elif update_stream and (
+                            previous_acceleration == Acceleration.TENSORRT
+                            or getattr(self, "is_sdxl", False)
+                            or not hasattr(self.stream.stream.pipe, "unet")):
+                        # The TensorRT path deletes the PyTorch UNet/VAE from the pipe and
+                        # SDXL needs StreamDiffusionXL: the inline recreation below would build
+                        # a stream on a gutted pipe ('tuple' object has no attribute 'dtype').
+                        self._create_stream()
+                        self.accelerate(previous_acceleration)
                     elif update_stream:
                         # Inline recreation for width/height/mode/cfg changes.
                         self.stream.stream = StreamDiffusion(

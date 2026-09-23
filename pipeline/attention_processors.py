@@ -236,14 +236,44 @@ def enable_cached_attention(unet, cache_maxframes=1, cache_interval=1,
     return len(attn1_modules)
 
 
+_SV2V_CACHE_BUFS = ('_sv2v_cached_key', '_sv2v_cached_value', '_sv2v_cached_output')
+
+
+def select_attention_cache_slot(unet, slot):
+    """Point every attn1 at the cache of denoising step ``slot`` (sequential multi-step:
+    each step attends to the previous frame at its own noise level). Slot 0 holds the
+    buffers allocated by enable_cached_attention; the others are allocated on first use."""
+    config = getattr(unet, '_sv2v_config', None)
+    if config is None or config.get('slot', 0) == slot:
+        return
+    for name, module, _ in config['attn1_modules']:
+        if not hasattr(module, '_sv2v_cached_key'):
+            continue
+        slots = module.__dict__.setdefault('_sv2v_slot_bufs', {})
+        cur = config.get('slot', 0)
+        slots[cur] = tuple(getattr(module, b, None) for b in _SV2V_CACHE_BUFS)
+        bufs = slots.get(slot)
+        if bufs is None:
+            bufs = tuple(None if t is None else torch.zeros_like(t) for t in slots[cur])
+            slots[slot] = bufs
+        for b, t in zip(_SV2V_CACHE_BUFS, bufs):
+            if t is not None:
+                setattr(module, b, t)
+    config['slot'] = slot
+
+
 def update_cache_after_unet(unet):
     """Copy new -> cached for each attn1. Call after each UNet forward (outside CUDA graph)."""
     config = getattr(unet, '_sv2v_config', None)
     if config is None:
         return
 
-    config['frame_count'] += 1
-    if config['frame_count'] % config['cache_interval'] != 0:
+    # cache_interval counts frames: with sequential steps each step has its own counter.
+    counts = config.setdefault('slot_counts', {})
+    slot = config.get('slot', 0)
+    counts[slot] = counts.get(slot, 0) + 1
+    config['frame_count'] = counts.get(0, 0)
+    if counts[slot] % config['cache_interval'] != 0:
         return
 
     for name, module, is_decoder in config['attn1_modules']:
@@ -293,11 +323,16 @@ def reset_attention_cache(unet):
     if config is None:
         return
     config['frame_count'] = 0
+    config['slot_counts'] = {}
     for name, module, _ in config['attn1_modules']:
-        for buf_name in ['_sv2v_cached_key', '_sv2v_cached_value', '_sv2v_cached_output']:
+        for buf_name in _SV2V_CACHE_BUFS:
             buf = getattr(module, buf_name, None)
             if buf is not None:
                 buf.zero_()
+        for bufs in module.__dict__.get('_sv2v_slot_bufs', {}).values():
+            for buf in bufs:
+                if buf is not None:
+                    buf.zero_()
 
 
 # ============================================================================

@@ -20,7 +20,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 )
 
 from .image_filter import SimilarImageFilter
-from .attention_processors import update_cache_after_unet
+from .attention_processors import update_cache_after_unet, select_attention_cache_slot
 
 
 _SHAPE_CACHE = {}  # (height, width, scale_factor) -> (latent_h, latent_w)
@@ -98,9 +98,6 @@ class StreamDiffusionXL:
         # Sequential multi-step: ControlNet on the first step only (diffusers'
         # control_guidance_end), saves one ControlNet pass per extra step.
         self._cn_first_step_only = os.environ.get("STREAMDIFFUSION_CN_FIRST_STEP_ONLY", "0") == "1"
-        # True while an intermediate sequential step runs: the StreamV2V cache must not
-        # advance (one cache entry per frame, taken from the last step).
-        self._v2v_hold = False
         if not use_denoising_batch and self.denoising_steps_num > 1:
             logging.info(
                 f"[Multi-step] {self.denoising_steps_num} sequential steps per frame in the "
@@ -815,8 +812,7 @@ class StreamDiffusionXL:
                 **unet_kwargs,
             )[0]
 
-            if not self._v2v_hold:
-                update_cache_after_unet(self.unet)
+            update_cache_after_unet(self.unet)
         finally:
             if down_block_res_samples is not None:
                 del down_block_res_samples
@@ -959,14 +955,17 @@ class StreamDiffusionXL:
                     )
             ring[:fb].copy_(cur4d.to(self.dtype))
 
-    def _set_v2v_hold(self, hold: bool) -> None:
-        """Freeze the StreamV2V cache during intermediate sequential steps: the TensorRT
-        ring keeps its phase (the final step overwrites the same free slot), the PyTorch
-        processors skip update_cache_after_unet."""
-        self._v2v_hold = hold
+    def _set_v2v_slot(self, slot: int) -> None:
+        """Select the StreamV2V cache of sequential step ``slot``: each step keeps its own
+        cache, filled by that step on the previous frame, so the extended attention and
+        the feature injection always match the step's noise level (a single cache taken
+        from the last step feeds low-noise features into the first step and breaks the
+        image). TensorRT engines switch their cache/ring, PyTorch processors their buffers."""
         unet = self.unet
-        if hasattr(unet, "hold_ring_phase"):
-            unet.hold_ring_phase = hold
+        if hasattr(unet, "v2v_slot"):
+            unet.v2v_slot = slot
+        elif getattr(unet, "_sv2v_config", None) is not None:
+            select_attention_cache_slot(unet, slot)
 
     def _refill_buffer_from_current(self, x_t_latent: torch.Tensor) -> None:
         if self.x_t_latent_buffer is None:
@@ -1058,7 +1057,7 @@ class StreamDiffusionXL:
                 last = idx == n_steps - 1
                 t = t.view(1,).repeat(self.frame_bff_size,)
                 use_cn = controlnet_model is not None and (idx == 0 or not self._cn_first_step_only)
-                self._set_v2v_hold(not last)
+                self._set_v2v_slot(idx)
                 try:
                     x_0_pred, model_pred = self.unet_step(
                         x_t_latent,
@@ -1070,7 +1069,7 @@ class StreamDiffusionXL:
                         ip_adapter_image_embeds=ip_adapter_image_embeds,
                     )
                 finally:
-                    self._set_v2v_hold(False)
+                    self._set_v2v_slot(0)
                 if not last:
                     x_t_latent = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
                     if self.do_add_noise:

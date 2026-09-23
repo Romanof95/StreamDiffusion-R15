@@ -52,15 +52,17 @@ class UNet2DConditionModelEngine:
         ring_inputs = {n: _ring_in.match(n) for n in binding_names if _ring_in.match(n)}
         self._is_v2v_ring = bool(ring_inputs)
         self._is_v2v = self._is_v2v_ring or "kvo_in_0" in binding_names
-        self._kvo_cache = None
         self._n_kvo = 0
         self._kvo_shapes_baked = None
         self._cache_maxframes = v2v_cache_maxframes
-        self._ring = None
-        self._ring_phase = 0
-        # Sequential multi-step: True on intermediate steps -> the phase does not advance
-        # (the final step of the frame rewrites the same free slot).
-        self.hold_ring_phase = False
+        # Sequential multi-step: one StreamV2V cache per denoising step (v2v_slot = step
+        # index, set by the pipeline before each step), so every step attends to the
+        # previous frame at its own noise level, as the stream batch does per batch slot.
+        # Slot 0 is the only one used by single-step and stream-batch runs.
+        self.v2v_slot = 0
+        self._kvo_caches = {}      # legacy layout: slot -> [per-port cache]
+        self._rings = {}           # ring layout: slot -> [F+1 ring slots][per-port buffer]
+        self._ring_phases = {}     # ring layout: slot -> phase
         self._kvo_names = ()
         if self._is_v2v_ring:
             while f"kvo_out_{self._n_kvo}" in binding_names:
@@ -174,8 +176,9 @@ class UNet2DConditionModelEngine:
             self._zeros_staged = False
             # Batch changed → drop kvo cache so it re-inits at the new shape.
             if self._is_v2v:
-                self._kvo_cache = None
-                self._ring = None
+                self._kvo_caches = {}
+                self._rings = {}
+                self._ring_phases = {}
 
         inputs = {
             "sample": latent_model_input,
@@ -264,11 +267,14 @@ class UNet2DConditionModelEngine:
                     inputs["time_ids"] = added_cond_kwargs["time_ids"]
 
         graph_key = None
+        kvo_cache = None
         if self._is_v2v_ring:
             n_slots = self._cache_maxframes + 1
-            if self._ring is None:
+            step = self.v2v_slot
+            ring = self._rings.get(step)
+            if ring is None:
                 batch = latent_model_input.shape[0]
-                self._ring = [
+                ring = [
                     [
                         torch.zeros(3, batch, seq, dim, dtype=latent_model_input.dtype,
                                     device=latent_model_input.device)
@@ -276,26 +282,27 @@ class UNet2DConditionModelEngine:
                     ]
                     for _ in range(n_slots)
                 ]
-                self._ring_phase = 0
+                self._rings[step] = ring
+                self._ring_phases[step] = 0
             # Phase p: cached frames read from slots p..p+F-1 (oldest first), the current
             # frame written to slot p+F; next phase the oldest slot becomes the free one.
-            # Addresses are baked into one CUDA graph per phase, so binding only happens
-            # until each phase has been captured (or every frame without graphs).
-            phase = self._ring_phase
-            graph_key = phase
-            if not (self.use_cuda_graph and phase in self.engine.graphs):
+            # Addresses are baked into one CUDA graph per (step, phase), so binding only
+            # happens until each one has been captured (or every call without graphs).
+            phase = self._ring_phases[step]
+            graph_key = phase if step == 0 else (step, phase)
+            if not (self.use_cuda_graph and graph_key in self.engine.graphs):
                 for i in range(self._n_kvo):
                     for j in range(self._cache_maxframes):
                         name = f"kvo_in_{i}_{j}"
                         if name in self._kvo_present:
-                            self.engine.bind_external(name, self._ring[(phase + j) % n_slots][i])
-                    self.engine.bind_external(f"kvo_out_{i}", self._ring[(phase + self._cache_maxframes) % n_slots][i])
-            if not self.hold_ring_phase:
-                self._ring_phase = (phase + 1) % n_slots
+                            self.engine.bind_external(name, ring[(phase + j) % n_slots][i])
+                    self.engine.bind_external(f"kvo_out_{i}", ring[(phase + self._cache_maxframes) % n_slots][i])
+            self._ring_phases[step] = (phase + 1) % n_slots
         elif self._is_v2v:
-            if self._kvo_cache is None:
+            kvo_cache = self._kvo_caches.get(self.v2v_slot)
+            if kvo_cache is None:
                 batch = latent_model_input.shape[0]
-                self._kvo_cache = [
+                kvo_cache = [
                     torch.zeros(
                         3, self._cache_maxframes, batch, seq, dim,
                         dtype=latent_model_input.dtype,
@@ -303,8 +310,9 @@ class UNet2DConditionModelEngine:
                     )
                     for (seq, dim) in self._kvo_shapes_baked
                 ]
+                self._kvo_caches[self.v2v_slot] = kvo_cache
             for i in range(self._n_kvo):
-                inputs[f"kvo_in_{i}"] = self._kvo_cache[i]
+                inputs[f"kvo_in_{i}"] = kvo_cache[i]
 
         engine_outputs = self.engine.infer(
             inputs,
@@ -316,9 +324,9 @@ class UNet2DConditionModelEngine:
 
         # Legacy layout: copy kvo outputs into the local cache — the engine reuses its
         # output buffers, so without a copy the next call would race.
-        if self._is_v2v and not self._is_v2v_ring and not self.hold_ring_phase:
+        if kvo_cache is not None:
             for i in range(self._n_kvo):
-                self._kvo_cache[i].copy_(engine_outputs[f"kvo_out_{i}"])
+                kvo_cache[i].copy_(engine_outputs[f"kvo_out_{i}"])
 
         return UNet2DConditionOutput(sample=noise_pred)
 

@@ -17,6 +17,20 @@ _SD2_KEYWORDS = ["sd-turbo", "sd_turbo", "2.0", "2.1", "2-1", "stabilityai/sd-tu
 _SDXL_KEYWORDS = ["sdxl", "xl", "sd-xl", "sd_xl"]
 
 
+def _clean_lora_dict(lora_dict: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+    """Strips pasted whitespace and quotes (Windows "Copy as path") from LoRA names and around
+    "::" ("repo::file.safetensors  " was looked up with the spaces and failed with a 404)."""
+    if not lora_dict:
+        return lora_dict
+    cleaned: Dict[str, float] = {}
+    for name, weight in lora_dict.items():
+        parts = [p.strip().strip("\"'").strip() for p in str(name).split("::", 1)]
+        key = "::".join(parts)
+        if parts[0]:
+            cleaned[key] = weight
+    return cleaned
+
+
 class StreamDiffusionEngine(BaseEngine):
     """Adapter for the StreamDiffusion SD 1.5 / SDXL pipelines."""
 
@@ -75,7 +89,7 @@ class StreamDiffusionEngine(BaseEngine):
         self.wrapper = WrapperClass(
             model_id_or_path=model_name,
             t_index_list=runtime.get("t_index_list"),
-            lora_dict=runtime.get("lora_dict"),
+            lora_dict=_clean_lora_dict(runtime.get("lora_dict")),
             mode="img2img" if runtime.get("mode_is_img2img", True) else "txt2img",
             frame_buffer_size=1,
             width=runtime["width"],

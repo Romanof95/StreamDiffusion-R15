@@ -14,7 +14,8 @@ from PIL import Image
 
 from pipeline import StreamDiffusion
 from .base_wrapper import (
-    BaseStreamDiffusionWrapper, PACKAGE_DIR, from_pretrained_any_variant, lora_signature,
+    BaseStreamDiffusionWrapper, PACKAGE_DIR, from_pretrained_any_variant, fuse_lora_adapters,
+    lcm_lora_fused, lora_signature,
 )
 
 
@@ -68,7 +69,9 @@ def _derive_engine_paths_sd15(
     Height/width are folded into the prefix: static-shape TRT engines can't
     serve another resolution, so each resolution needs its own cache path.
     """
-    lora_sig = lora_signature(lora_dict)
+    lora_sig = lora_signature(
+        lora_dict, lcm_fused=lcm_lora_fused(model_id_or_path, use_lcm_lora, lora_dict, sdxl=False),
+    )
 
     def create_prefix(max_batch_size, min_batch_size):
         maybe_path = Path(model_id_or_path)
@@ -357,25 +360,19 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         else:
             stream.configure_scheduler(model_type="default")
 
-        # LCM LoRA (skip for Hyper-SD/Turbo)
-        if not self.sd_turbo and not is_hyper_model and not is_turbo_model:
-            if use_lcm_lora:
-                if lcm_lora_id is not None:
-                    stream.load_lcm_lora(pretrained_model_name_or_path_or_dict=lcm_lora_id)
-                else:
-                    stream.load_lcm_lora()
-                stream.fuse_lora()
-
-        if lora_dict is not None:
-            for lora_name, lora_scale in lora_dict.items():
-                if "::" in lora_name:
-                    repo_id, weight_name = lora_name.split("::", 1)
-                    stream.load_lora(repo_id, weight_name=weight_name)
-                    logging.info(f"[LoRA] Loading {repo_id} (file: {weight_name}) with weight {lora_scale}")
-                else:
-                    stream.load_lora(lora_name)
-                    logging.info(f"[LoRA] Loading {lora_name} with weight {lora_scale}")
-                stream.fuse_lora(lora_scale=lora_scale)
+        # LCM LoRA (skip for Hyper-SD/Turbo) and custom LoRAs, fused together.
+        adapters = []
+        if not self.sd_turbo and not is_hyper_model and not is_turbo_model and use_lcm_lora:
+            lcm_args = (lcm_lora_id,) if lcm_lora_id is not None else ()
+            adapters.append((f"LCM LoRA {lcm_lora_id or 'default'}", stream.load_lcm_lora, lcm_args, {}, 1.0))
+        for lora_name, lora_scale in (lora_dict or {}).items():
+            if "::" in lora_name:
+                repo_id, weight_name = lora_name.split("::", 1)
+                adapters.append((f"{repo_id} (file: {weight_name})", stream.load_lora, (repo_id,),
+                                 {"weight_name": weight_name}, lora_scale))
+            else:
+                adapters.append((lora_name, stream.load_lora, (lora_name,), {}, lora_scale))
+        fuse_lora_adapters(stream, adapters)
 
         self._tiny_vae_id = None
         if use_tiny_vae:
@@ -476,7 +473,9 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         )
         from pipeline.acceleration.tensorrt.models import VAE, UNet, UNetV2VRing, VAEEncoder
 
-        lora_sig = lora_signature(lora_dict)
+        lora_sig = lora_signature(
+            lora_dict, lcm_fused=lcm_lora_fused(model_id_or_path, use_lcm_lora, lora_dict, sdxl=False),
+        )
         v2v_on = bool(getattr(self, "streamv2v_enabled", False))
         v2v_maxframes = int(getattr(self, "streamv2v_cache_maxframes", 1))
 

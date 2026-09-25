@@ -33,17 +33,57 @@ def from_pretrained_any_variant(load: Callable, *args, **kwargs):
         return result
 
 
-def lora_signature(lora_dict: Optional[Dict[str, float]]) -> str:
+def lora_signature(lora_dict: Optional[Dict[str, float]], lcm_fused: bool = False) -> str:
     """Stable short hash of (lora_name, weight) pairs for TRT engine prefixes.
 
     Returns empty string when no custom LoRAs are set, so default engines
-    keep their existing on-disk path.
+    keep their existing on-disk path. ``-f2`` marks engines where two or more adapters
+    (custom LoRAs, or the LCM LoRA plus a custom one) are fused: before
+    ``fuse_lora_adapters`` only the last one survived, so those engines must be rebuilt.
     """
     if not lora_dict:
         return ""
     items = sorted((k, round(float(v), 4)) for k, v in lora_dict.items())
     h = hashlib.md5(repr(items).encode("utf-8")).hexdigest()[:10]
-    return f"--lora-{h}"
+    stacked = len(lora_dict) + (1 if lcm_fused else 0) >= 2
+    return f"--lora-{h}" + ("-f2" if stacked else "")
+
+
+def lcm_lora_fused(model_id_or_path, use_lcm_lora, lora_dict, sdxl=False, use_hyper_unet=False) -> bool:
+    """Whether the wrappers fuse the LCM LoRA: requested, and the model is not turbo /
+    Hyper-SD (LoRA or, on SDXL, checkpoint) / SDXL Lightning."""
+    m = str(model_id_or_path).lower()
+    if not use_lcm_lora or "turbo" in m or "sdxs" in m:
+        return False
+    if any("hyper" in str(k).lower() for k in (lora_dict or {})):
+        return False
+    if sdxl and ("lightning" in m or "hyper" in m or use_hyper_unet):
+        return False
+    return True
+
+
+def fuse_lora_adapters(stream, adapters) -> None:
+    """Load every LoRA as its own named adapter, fuse them together with their weights,
+    then drop the PEFT wrappers (the fused weights stay).
+
+    ``adapters``: list of ``(label, load_fn, args, kwargs, scale)``; ``load_fn`` is
+    ``stream.load_lora`` / ``stream.load_lcm_lora``. Fusing after each load does not stack:
+    loading the next adapter unmerges the fused ones ("Adapter cannot be set when the
+    model is merged"), so only the last LoRA survived (Hyper-SDXL + a style LoRA ran on
+    the base model plus the style LoRA)."""
+    if not adapters:
+        return
+    names, weights = [], []
+    for i, (label, load_fn, args, kwargs, scale) in enumerate(adapters):
+        name = f"smode_lora_{i}"
+        load_fn(*args, adapter_name=name, **kwargs)
+        names.append(name)
+        weights.append(float(scale))
+        logging.info(f"[LoRA] Loaded {label} with weight {scale}")
+    stream.pipe.set_adapters(names, adapter_weights=weights)
+    stream.pipe.fuse_lora(adapter_names=names, lora_scale=1.0)
+    stream.pipe.unload_lora_weights()
+    logging.info(f"[LoRA] {len(names)} adapter(s) fused into the model weights")
 
 
 torch.set_grad_enabled(False)

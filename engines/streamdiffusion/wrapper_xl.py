@@ -19,7 +19,8 @@ from PIL import Image
 
 from pipeline.pipeline_xl import StreamDiffusionXL
 from .base_wrapper import (
-    BaseStreamDiffusionWrapper, PACKAGE_DIR, from_pretrained_any_variant, lora_signature,
+    BaseStreamDiffusionWrapper, PACKAGE_DIR, from_pretrained_any_variant, fuse_lora_adapters,
+    lcm_lora_fused, lora_signature,
 )
 
 
@@ -114,7 +115,9 @@ def _derive_engine_paths_sdxl(
     UNet filename is ``unet_cn.engine`` for the CN-enabled UNet, or
     ``unet_v2v_xl_mfN.engine`` when StreamV2V is enabled (kvo I/O ports).
     """
-    lora_sig = lora_signature(lora_dict)
+    lora_sig = lora_signature(
+        lora_dict, lcm_fused=lcm_lora_fused(model_id_or_path, use_lcm_lora, lora_dict, sdxl=True),
+    )
 
     def create_prefix(max_batch_size, min_batch_size):
         maybe_path = Path(model_id_or_path)
@@ -450,16 +453,13 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         else:
             stream.configure_scheduler(model_type="default")
 
-        if not self.sd_turbo:
-            if use_lcm_lora and not is_lightning_model and not is_hyper_model:
-                if lcm_lora_id is not None:
-                    stream.load_lcm_lora(pretrained_model_name_or_path_or_dict=lcm_lora_id)
-                else:
-                    stream.load_lcm_lora()
-                stream.fuse_lora()
-
-        if lora_dict is not None:
-            self._load_loras(stream, lora_dict, cache_dir)
+        # LCM LoRA (not for turbo / Lightning / Hyper) and custom LoRAs, fused together.
+        adapters = []
+        if not self.sd_turbo and use_lcm_lora and not is_lightning_model and not is_hyper_model:
+            lcm_args = (lcm_lora_id,) if lcm_lora_id is not None else ()
+            adapters.append((f"LCM LoRA {lcm_lora_id or 'default'}", stream.load_lcm_lora, lcm_args, {}, 1.0))
+        adapters += self._lora_adapters(stream, lora_dict)
+        fuse_lora_adapters(stream, adapters)
 
         self._configure_vae(stream, pipe, use_tiny_vae, vae_id, cache_dir)
 
@@ -551,21 +551,22 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         stream.unet = stream.pipe.unet
         stream.use_hyper_unet_checkpoint = True
 
-    def _load_loras(self, stream, lora_dict, cache_dir):
-        """Load custom LoRAs (Hyper-SDXL Kohya format handled specially)."""
+    def _lora_adapters(self, stream, lora_dict):
+        """``fuse_lora_adapters`` entries of the custom LoRAs (Hyper-SDXL Kohya format is
+        loaded from the downloaded file path)."""
         from huggingface_hub import hf_hub_download
 
-        for lora_name, lora_scale in lora_dict.items():
+        adapters = []
+        for lora_name, lora_scale in (lora_dict or {}).items():
             if "::" in lora_name:
                 repo_id, weight_name = lora_name.split("::", 1)
                 if "hyper" in lora_name.lower() and "sdxl" in lora_name.lower():
-                    lora_path = hf_hub_download(repo_id, weight_name)
-                    stream.load_lora(lora_path)
+                    adapters.append((lora_name, stream.load_lora, (hf_hub_download(repo_id, weight_name),), {}, lora_scale))
                 else:
-                    stream.load_lora(repo_id, weight_name=weight_name)
+                    adapters.append((lora_name, stream.load_lora, (repo_id,), {"weight_name": weight_name}, lora_scale))
             else:
-                stream.load_lora(lora_name)
-            stream.fuse_lora(lora_scale=lora_scale)
+                adapters.append((lora_name, stream.load_lora, (lora_name,), {}, lora_scale))
+        return adapters
 
     def _configure_vae(self, stream, pipe, use_tiny_vae, vae_id, cache_dir):
         """Configure SDXL VAE (hybrid TinyVAE / taesdxl + scaling factors)."""
@@ -674,7 +675,9 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             VAE, UNetXL, UNetXLV2VRing, VAEEncoder,
         )
 
-        lora_sig = lora_signature(lora_dict)
+        lora_sig = lora_signature(
+            lora_dict, lcm_fused=lcm_lora_fused(model_id_or_path, use_lcm_lora, lora_dict, sdxl=True),
+        )
         v2v_on = bool(getattr(self, "streamv2v_enabled", False))
         v2v_maxframes = int(getattr(self, "streamv2v_cache_maxframes", 1))
 

@@ -20,7 +20,7 @@ from PIL import Image
 from pipeline.pipeline_xl import StreamDiffusionXL
 from .base_wrapper import (
     BaseStreamDiffusionWrapper, PACKAGE_DIR, from_pretrained_any_variant, fuse_lora_adapters,
-    lcm_lora_fused, lora_signature,
+    lcm_lora_fused, lora_signature, user_lcm_lora,
 )
 
 
@@ -453,9 +453,11 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         else:
             stream.configure_scheduler(model_type="default")
 
-        # LCM LoRA (not for turbo / Lightning / Hyper) and custom LoRAs, fused together.
+        # LCM LoRA (not for turbo / Lightning / Hyper, or when listed with the custom LoRAs) and
+        # custom LoRAs, fused together.
         adapters = []
-        if not self.sd_turbo and use_lcm_lora and not is_lightning_model and not is_hyper_model:
+        if (not self.sd_turbo and use_lcm_lora and not is_lightning_model and not is_hyper_model
+                and not user_lcm_lora(lora_dict)):
             lcm_args = (lcm_lora_id,) if lcm_lora_id is not None else ()
             adapters.append((f"LCM LoRA {lcm_lora_id or 'default'}", stream.load_lcm_lora, lcm_args, {}, 1.0))
         adapters += self._lora_adapters(stream, lora_dict)

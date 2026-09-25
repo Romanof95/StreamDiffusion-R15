@@ -49,11 +49,17 @@ def lora_signature(lora_dict: Optional[Dict[str, float]], lcm_fused: bool = Fals
     return f"--lora-{h}" + ("-f2" if stacked else "")
 
 
+def user_lcm_lora(lora_dict) -> bool:
+    """An LCM LoRA listed with the user LoRAs (latent-consistency/lcm-lora-sdv1-5...) replaces
+    the automatic one: both fused stacked LCM at 2x and burned the image."""
+    return any("lcm" in str(k).lower() for k in (lora_dict or {}))
+
+
 def lcm_lora_fused(model_id_or_path, use_lcm_lora, lora_dict, sdxl=False, use_hyper_unet=False) -> bool:
-    """Whether the wrappers fuse the LCM LoRA: requested, and the model is not turbo /
-    Hyper-SD (LoRA or, on SDXL, checkpoint) / SDXL Lightning."""
+    """Whether the wrappers fuse the automatic LCM LoRA: requested, not already in the user
+    LoRAs, and the model is not turbo / Hyper-SD (LoRA or, on SDXL, checkpoint) / SDXL Lightning."""
     m = str(model_id_or_path).lower()
-    if not use_lcm_lora or "turbo" in m or "sdxs" in m:
+    if not use_lcm_lora or "turbo" in m or "sdxs" in m or user_lcm_lora(lora_dict):
         return False
     if any("hyper" in str(k).lower() for k in (lora_dict or {})):
         return False

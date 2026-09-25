@@ -17,6 +17,22 @@ from pipeline.image_utils import postprocess_image
 PACKAGE_DIR = Path(__file__).resolve().parent.parent.parent
 
 
+def from_pretrained_any_variant(load: Callable, *args, **kwargs):
+    """``load(*args, **kwargs)`` (a ``from_pretrained``), retried with ``variant="fp16"``: some
+    repos ship only ``*.fp16.safetensors`` (RunDiffusion/Juggernaut-XL-v9), the default load then
+    fetches the configs alone and fails on the first model ("no file named model.safetensors").
+    Raises the first error when the fp16 retry fails too."""
+    try:
+        return load(*args, **kwargs)
+    except Exception as first:
+        try:
+            result = load(*args, variant="fp16", **kwargs)
+        except Exception:
+            raise first
+        logging.info(f"[Model] {args[0] if args else ''}: no default weights, fp16 variant loaded")
+        return result
+
+
 def lora_signature(lora_dict: Optional[Dict[str, float]]) -> str:
     """Stable short hash of (lora_name, weight) pairs for TRT engine prefixes.
 

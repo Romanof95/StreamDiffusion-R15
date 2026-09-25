@@ -13,7 +13,9 @@ from pipeline.acceleration.engine_cache import engine_ready
 from PIL import Image
 
 from pipeline import StreamDiffusion
-from .base_wrapper import BaseStreamDiffusionWrapper, PACKAGE_DIR, lora_signature
+from .base_wrapper import (
+    BaseStreamDiffusionWrapper, PACKAGE_DIR, from_pretrained_any_variant, lora_signature,
+)
 
 
 def _v2v_variant_suffix(options) -> str:
@@ -108,8 +110,8 @@ def _build_stub_pipe_sd15(model_id_or_path, cache_dir, device, dtype):
         model_id_or_path, subfolder="tokenizer",
         cache_dir=cache_dir if cache_dir else None,
     )
-    text_encoder = CLIPTextModel.from_pretrained(
-        model_id_or_path, subfolder="text_encoder",
+    text_encoder = from_pretrained_any_variant(
+        CLIPTextModel.from_pretrained, model_id_or_path, subfolder="text_encoder",
         cache_dir=cache_dir if cache_dir else None,
         torch_dtype=dtype,
     ).to(device)
@@ -307,14 +309,15 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
 
         try:
             try:
-                pipe = StableDiffusionPipeline.from_pretrained(
-                    model_id_or_path, torch_dtype=self.dtype,
+                pipe = from_pretrained_any_variant(
+                    StableDiffusionPipeline.from_pretrained, model_id_or_path, torch_dtype=self.dtype,
                     cache_dir=cache_dir if cache_dir else None
                 ).to(device=self.device, dtype=self.dtype)
             except Exception:
                 try:
-                    pipe = StableDiffusionPipeline.from_pretrained(
-                        model_id_or_path, local_files_only=True, torch_dtype=self.dtype,
+                    pipe = from_pretrained_any_variant(
+                        StableDiffusionPipeline.from_pretrained, model_id_or_path, local_files_only=True,
+                        torch_dtype=self.dtype,
                         cache_dir=cache_dir if cache_dir else None
                     ).to(device=self.device, dtype=self.dtype)
                 except Exception:

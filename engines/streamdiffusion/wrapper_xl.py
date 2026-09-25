@@ -18,7 +18,9 @@ from pipeline.acceleration.quantization import (
 from PIL import Image
 
 from pipeline.pipeline_xl import StreamDiffusionXL
-from .base_wrapper import BaseStreamDiffusionWrapper, PACKAGE_DIR, lora_signature
+from .base_wrapper import (
+    BaseStreamDiffusionWrapper, PACKAGE_DIR, from_pretrained_any_variant, lora_signature,
+)
 
 
 def _compute_trt_unet_batch_size_xl(t_index_list, frame_buffer_size, cfg_type, use_denoising_batch):
@@ -162,13 +164,13 @@ def _build_stub_pipe_sdxl(model_id_or_path, cache_dir, device, dtype):
         model_id_or_path, subfolder="tokenizer_2",
         cache_dir=cache_dir if cache_dir else None,
     )
-    text_encoder = CLIPTextModel.from_pretrained(
-        model_id_or_path, subfolder="text_encoder",
+    text_encoder = from_pretrained_any_variant(
+        CLIPTextModel.from_pretrained, model_id_or_path, subfolder="text_encoder",
         cache_dir=cache_dir if cache_dir else None,
         torch_dtype=dtype,
     ).to(device)
-    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-        model_id_or_path, subfolder="text_encoder_2",
+    text_encoder_2 = from_pretrained_any_variant(
+        CLIPTextModelWithProjection.from_pretrained, model_id_or_path, subfolder="text_encoder_2",
         cache_dir=cache_dir if cache_dir else None,
         torch_dtype=dtype,
     ).to(device)
@@ -393,14 +395,15 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
 
         try:
             try:
-                pipe = StableDiffusionXLPipeline.from_pretrained(
-                    base_model_path, torch_dtype=self.dtype,
+                pipe = from_pretrained_any_variant(
+                    StableDiffusionXLPipeline.from_pretrained, base_model_path, torch_dtype=self.dtype,
                     cache_dir=cache_dir if cache_dir else None
                 ).to(device=self.device, dtype=self.dtype)
             except Exception:
                 try:
-                    pipe = StableDiffusionXLPipeline.from_pretrained(
-                        base_model_path, local_files_only=True, torch_dtype=self.dtype,
+                    pipe = from_pretrained_any_variant(
+                        StableDiffusionXLPipeline.from_pretrained, base_model_path, local_files_only=True,
+                        torch_dtype=self.dtype,
                         cache_dir=cache_dir if cache_dir else None
                     ).to(device=self.device, dtype=self.dtype)
                 except Exception:

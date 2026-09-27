@@ -461,6 +461,25 @@ class BaseStreamDiffusionWrapper(ABC):
             return None
         return budget, thr, refresh
 
+    def _step_cache_settings(self, steps: int, use_denoising_batch: bool, sparse_on: bool = False) -> int:
+        """Full-UNet interval of STREAMDIFFUSION_STEP_CACHE when it can apply to this stream
+        (SD 1.5 TensorRT, sequential multi-step), else 0 (see pipeline/step_cache.py)."""
+        from pipeline.step_cache import step_cache_config
+        interval = step_cache_config()
+        if not interval:
+            return 0
+        reason = None
+        if steps < 2:
+            reason = "single step"
+        elif use_denoising_batch:
+            reason = "needs STREAMDIFFUSION_SEQUENTIAL=1"
+        elif sparse_on:
+            reason = "not combined with STREAMDIFFUSION_SPARSE_TOKENS yet (sparse tokens kept)"
+        if reason:
+            logging.warning(f"[StepCache] Off: {reason}")
+            return 0
+        return interval
+
     def setup_torch_compile(self, stream, acceleration: str, cache_subdir: str):
         """Apply torch.compile() to UNet and VAE (shared SD/SDXL logic)."""
         if not self.torch_compile_enabled:

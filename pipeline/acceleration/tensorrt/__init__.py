@@ -452,9 +452,12 @@ def compile_unet(
     kvo_processors=None,
     kvo_ring_frames=None,
     sparse=None,
+    step_cache=None,
 ):
     """``sparse``: (SparseTokenSpec, SparseTokenContext) of pipeline/sparse_tokens.py — the
-    wrapper below is wrapped to export the sparse-token ports (``model_data`` is the spec)."""
+    wrapper below is wrapped to export the sparse-token ports (``model_data`` is the spec).
+    ``step_cache``: StepCacheSpec of pipeline/step_cache.py (full or shallow UNet, ``model_data``
+    is the spec)."""
     if kvo_processors is not None:
         if is_sdxl and kvo_ring_frames:
             unet_wrapper = TorchUNetXLV2VRingWrapper(unet, kvo_processors, kvo_ring_frames).to(
@@ -481,6 +484,9 @@ def compile_unet(
     if sparse is not None:
         from ...sparse_tokens import TorchSparseWrapper
         unet_wrapper = TorchSparseWrapper(unet_wrapper, sparse[0], sparse[1])
+    if step_cache is not None:
+        from ...step_cache import TorchStepCacheWrapper
+        unet_wrapper = TorchStepCacheWrapper(unet_wrapper, step_cache)
 
     builder = EngineBuilder(model_data, unet_wrapper, device=torch.device("cuda"))
     builder.build(

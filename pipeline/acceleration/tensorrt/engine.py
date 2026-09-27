@@ -63,8 +63,9 @@ class UNet2DConditionModelEngine:
         self._kvo_caches = {}      # legacy layout: slot -> [per-port cache]
         self._rings = {}           # ring layout: slot -> [F+1 ring slots][per-port buffer]
         self._ring_phases = {}     # ring layout: slot -> phase
-        # Sparse token update (pipeline/sparse_tokens.py): hook owning the sp_* ports.
-        self.sparse_io = None
+        # Extra engine I/O owned by a hook (pipeline/sparse_tokens.py sp_* ports,
+        # pipeline/step_cache.py dc_feat): names, shapes, per-step binding, post-run update.
+        self.extra_io = None
         self._kvo_names = ()
         if self._is_v2v_ring:
             while f"kvo_out_{self._n_kvo}" in binding_names:
@@ -167,9 +168,9 @@ class UNet2DConditionModelEngine:
                     current_shapes[f"kvo_in_{i}"] = kvo_shape
                     current_shapes[f"kvo_out_{i}"] = kvo_shape
             external = tuple(self._kvo_names)
-            if self.sparse_io is not None:
-                current_shapes.update(self.sparse_io.shapes(sample_shape[0]))
-                external += tuple(self.sparse_io.names())
+            if self.extra_io is not None:
+                current_shapes.update(self.extra_io.shapes(sample_shape[0]))
+                external += tuple(self.extra_io.names())
 
             self.engine.allocate_buffers(
                 shape_dict=current_shapes,
@@ -305,14 +306,14 @@ class UNet2DConditionModelEngine:
                         if name in self._kvo_present:
                             self.engine.bind_external(name, ring[(phase + j) % n_slots][i])
                     self.engine.bind_external(f"kvo_out_{i}", ring[(phase + self._cache_maxframes) % n_slots][i])
-                if self.sparse_io is not None:
-                    self.sparse_io.bind(self.engine, step)
+                if self.extra_io is not None:
+                    self.extra_io.bind(self.engine, step)
             self._ring_phases[step] = (phase + 1) % n_slots
-        elif self.sparse_io is not None and not self._is_v2v:
-            # Token caches are per denoising step: one CUDA graph per step.
+        elif self.extra_io is not None and not self._is_v2v:
+            # Hook ports bound per denoising step: one CUDA graph per step.
             graph_key = (self.v2v_slot, -1)
             if not (self.use_cuda_graph and graph_key in self.engine.graphs):
-                self.sparse_io.bind(self.engine, self.v2v_slot)
+                self.extra_io.bind(self.engine, self.v2v_slot)
         elif self._is_v2v:
             kvo_cache = self._kvo_caches.get(self.v2v_slot)
             if kvo_cache is None:
@@ -336,8 +337,8 @@ class UNet2DConditionModelEngine:
             graph_key=graph_key,
         )
         noise_pred = engine_outputs["latent"]
-        if self.sparse_io is not None:
-            self.sparse_io.after(self.v2v_slot)
+        if self.extra_io is not None:
+            self.extra_io.after(self.v2v_slot)
 
         # Legacy layout: copy kvo outputs into the local cache — the engine reuses its
         # output buffers, so without a copy the next call would race.

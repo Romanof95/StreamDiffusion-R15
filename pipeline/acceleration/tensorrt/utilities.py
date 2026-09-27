@@ -451,7 +451,11 @@ class Engine:
 
     def infer(self, feed_dict, stream, use_cuda_graph=False, graph_key=None):
         for name, buf in feed_dict.items():
-            self.tensors[name].copy_(buf)
+            # A port the build pruned (unused by the graph, e.g. the ControlNet residuals of
+            # the levels a step-cache shallow UNet skips) has no buffer: nothing to feed.
+            t = self.tensors.get(name)
+            if t is not None:
+                t.copy_(buf)
 
         # Order the engine after the input copies just issued on the torch stream. When that
         # stream is the legacy default stream the ordering is implicit, but the preprocessor

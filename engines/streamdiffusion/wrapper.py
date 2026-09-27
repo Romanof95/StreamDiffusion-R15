@@ -201,6 +201,8 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                 gate_reason = "StreamV2V enabled (kvo processor install needs PyTorch UNet)"
             elif self._sparse_settings(len(t_index_list), self.use_denoising_batch) is not None:
                 gate_reason = "sparse token update (dense + sparse engine pair)"
+            elif self._step_cache_settings(len(t_index_list), self.use_denoising_batch):
+                gate_reason = "step cache (full + shallow engine pair)"
             elif lora_dict:
                 gate_reason = "custom lora_dict set"
             elif not use_tiny_vae:
@@ -509,6 +511,15 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             from pipeline.sparse_tokens import sparse_engine_paths
             _d_path, _s_path = sparse_engine_paths(unet_path, sp_cfg[0])
             unet_targets = [(_d_path, "dense"), (_s_path, "sparse")]
+        # Step cache: a full engine (also outputs the deep feature) + a shallow one.
+        sc_interval = self._step_cache_settings(
+            stream.denoising_steps_num, stream.use_denoising_batch, sparse_on=sp_cfg is not None,
+        )
+        if sc_interval:
+            from pipeline.step_cache import BRANCH, step_cache_engine_paths
+            sc_channels = list(stream.unet.config.block_out_channels)[-1 - BRANCH]
+            _f_path, _s_path = step_cache_engine_paths(unet_path)
+            unet_targets = [(_f_path, "full"), (_s_path, "shallow")]
         vae_encoder_path = os.path.join(
             engine_dir,
             create_prefix(model_id_or_path,
@@ -591,14 +602,21 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             for _path, _mode in unet_targets:
                 if engine_ready(_path):
                     continue
-                _sp = None if _mode is None else (SparseTokenSpec(unet_model, sp_groups, _mode, sp_cfg[0]), sp_ctx)
-                compile_unet(stream.unet, _sp[0] if _sp else unet_model, _path + ".onnx",
+                _sp = _sc = None
+                model_data = unet_model
+                if _mode in ("dense", "sparse"):
+                    _sp = (SparseTokenSpec(unet_model, sp_groups, _mode, sp_cfg[0]), sp_ctx)
+                    model_data = _sp[0]
+                elif _mode in ("full", "shallow"):
+                    from pipeline.step_cache import StepCacheSpec
+                    _sc = model_data = StepCacheSpec(unet_model, _mode, sc_channels)
+                compile_unet(stream.unet, model_data, _path + ".onnx",
                              _path + ".opt.onnx", _path,
                              opt_batch_size=stream.trt_unet_batch_size,
                              opt_image_height=self.height, opt_image_width=self.width,
                              kvo_processors=kvo_procs,
                              kvo_ring_frames=v2v_maxframes if kvo_procs is not None else None,
-                             sparse=_sp)
+                             sparse=_sp, step_cache=_sc)
             if kvo_procs is not None:
                 # The cache tensors captured during the export trace are plain attributes
                 # on the processors: unet.to("cpu") does not move them.
@@ -691,6 +709,20 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                             for g in sp_groups)
                 + f", dense above {sp_cfg[1]} motion, refresh every {sp_cfg[2] or 'never'} frames"
             )
+        elif sc_interval:
+            from pipeline.step_cache import StepCacheUNetPair, step_cache_log
+            full_eng, shallow_eng = (
+                UNet2DConditionModelEngine(
+                    _p, cuda_stream, use_cuda_graph=unet_use_cuda_graph,
+                    v2v_cache_maxframes=v2v_maxframes,
+                )
+                for _p, _ in unet_targets
+            )
+            stream.unet = StepCacheUNetPair(
+                full_eng, shallow_eng, sc_interval, (self.height // 8, self.width // 8), sc_channels,
+                device=stream.device, dtype=stream.dtype,
+            )
+            step_cache_log(sc_interval, stream.denoising_steps_num)
         else:
             stream.unet = UNet2DConditionModelEngine(
                 unet_path, cuda_stream, use_cuda_graph=unet_use_cuda_graph,

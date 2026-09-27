@@ -60,6 +60,13 @@ REM = full frame (default 0.15; raise it if a noisy webcam keeps forcing full fr
 REM set STREAMDIFFUSION_SPARSE_THRESH=0.15
 REM Full frame every N frames (default 0 = only when needed).
 REM set STREAMDIFFUSION_SPARSE_REFRESH=0
+REM Step cache (SD 1.5, multi-step, needs STREAMDIFFUSION_SEQUENTIAL=1): the full UNet runs every N
+REM steps, the others only recompute the two highest-resolution levels on the deep features kept
+REM from the last full step (webcam test, 4 steps: N=2 looks the same, -20 percent frame time without
+REM ControlNet, -12 percent with depth ControlNet on every step; N=4 is faster but flatter).
+REM First run builds two extra UNet engines. Not combined with the sparse token update yet.
+REM Off by default. Keep the set lines alone.
+REM set STREAMDIFFUSION_STEP_CACHE=2
 REM Diagnostics: [PERF] log line every 60 frames (GPU breakdown, frame-time spread, wait for Smode).
 REM set STREAMDIFFUSION_PROFILING=1
  set STREAMDIFFUSION_V2V_ATTN_POOL=2

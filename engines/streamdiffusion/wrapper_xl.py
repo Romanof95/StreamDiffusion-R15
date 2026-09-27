@@ -722,7 +722,10 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             from pipeline.sparse_tokens import sparse_engine_paths
             _d_path, _s_path = sparse_engine_paths(unet_path, sp_cfg[0])
             unet_targets = [(_d_path, "dense"), (_s_path, "sparse")]
-        batch = self.batch_size if self.mode == "txt2img" else stream.frame_bff_size
+        from pipeline.step_cache import step_cache_config
+        if step_cache_config():
+            logging.warning("[StepCache] Off: SD 1.5 only")
+        batch =self.batch_size if self.mode == "txt2img" else stream.frame_bff_size
         # VAE engines are keyed by the tiny VAE they were exported from (see _vae_engine_suffix).
         vae_sfx = _vae_engine_suffix(use_tiny_vae, getattr(self, "_tiny_vae_id", None))
         vae_encoder_path = os.path.join(

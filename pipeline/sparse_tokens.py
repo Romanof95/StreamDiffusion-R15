@@ -448,7 +448,7 @@ class TokenSelector:
 
 
 class _SparseIO:
-    """Engine hook (UNet2DConditionModelEngine.sparse_io): external port names, shapes and
+    """Engine hook (UNet2DConditionModelEngine.extra_io): external port names, shapes and
     per-step binding of the caches; cache write-back after a sparse run."""
     def __init__(self, rt, mode):
         self.rt, self.mode = rt, mode
@@ -528,8 +528,8 @@ class SparseUNetPair:
         # One StreamV2V history for both engines: share the ring dicts (never reassigned).
         sparse._rings = dense._rings
         sparse._ring_phases = dense._ring_phases
-        dense.sparse_io = _SparseIO(self, "dense")
-        sparse.sparse_io = _SparseIO(self, "sparse")
+        dense.extra_io = _SparseIO(self, "dense")
+        sparse.extra_io = _SparseIO(self, "sparse")
 
     # -- cache storage
     def caches(self, step):
@@ -570,6 +570,11 @@ class SparseUNetPair:
     @property
     def engine(self):
         return (self.sparse if self.frame_sparse else self.dense).engine
+
+    @property
+    def stream(self):
+        # CUDA stream of both engines (the TensorRT ControlNets are built/run on it)
+        return self.dense.stream
 
     @property
     def _is_v2v(self):

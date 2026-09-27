@@ -451,7 +451,10 @@ def compile_unet(
     use_simple_wrapper: bool = False,
     kvo_processors=None,
     kvo_ring_frames=None,
+    sparse=None,
 ):
+    """``sparse``: (SparseTokenSpec, SparseTokenContext) of pipeline/sparse_tokens.py — the
+    wrapper below is wrapped to export the sparse-token ports (``model_data`` is the spec)."""
     if kvo_processors is not None:
         if is_sdxl and kvo_ring_frames:
             unet_wrapper = TorchUNetXLV2VRingWrapper(unet, kvo_processors, kvo_ring_frames).to(
@@ -475,6 +478,9 @@ def compile_unet(
         unet_wrapper = TorchUNetXLControlNetWrapper(unet).to(torch.device("cuda"), dtype=torch.float16)
     else:
         unet_wrapper = TorchUNetWrapper(unet, is_sdxl=is_sdxl).to(torch.device("cuda"), dtype=torch.float16)
+    if sparse is not None:
+        from ...sparse_tokens import TorchSparseWrapper
+        unet_wrapper = TorchSparseWrapper(unet_wrapper, sparse[0], sparse[1])
 
     builder = EngineBuilder(model_data, unet_wrapper, device=torch.device("cuda"))
     builder.build(
@@ -561,6 +567,7 @@ def compile_unet_quantized(
     precision: str,
     kvo_processors=None,
     kvo_ring_frames=None,
+    sparse=None,
 ):
     """SDXL UNet (already quantized in place by quantization.quantize_model) -> static
     ONNX with TensorRT block-scaled quant ops -> strongly-typed engine. Same I/O as the
@@ -581,12 +588,18 @@ def compile_unet_quantized(
             wrapper = TorchUNetXLV2VWrapper(unet, kvo_processors)
         else:
             wrapper = TorchUNetXLControlNetWrapper(unet)
+        if sparse is not None:
+            from ...sparse_tokens import TorchSparseWrapper
+            wrapper = TorchSparseWrapper(wrapper, sparse[0], sparse[1])
         # The UNetXL spec emits 2*batch rows ("2B" axis: dim 0; dim 1 for the ring cache
-        # (3, 2B, seq, dim); dim 2 for the legacy 5-D cache); the static graph is built at batch.
+        # (3, 2B, seq, dim) and the sparse-token caches; dim 2 for the legacy 5-D cache); the
+        # static graph is built at batch. Sparse token index lists have no batch axis.
         def _at_batch(name, t):
+            if name.startswith(("sp_idx_", "sp_inv_", "sp_order_")):
+                return t
             if t.dim() == 5:
                 return t[:, :, :opt_batch_size]
-            if name.startswith("kvo_in"):
+            if name.startswith(("kvo_in", "sp_")):
                 return t[:, :opt_batch_size]
             return t[:opt_batch_size]
         inputs = tuple(

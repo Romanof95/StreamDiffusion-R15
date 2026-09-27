@@ -442,6 +442,25 @@ class BaseStreamDiffusionWrapper(ABC):
         except Exception as e:
             logging.warning(f"[Warning] warning_callback failed: {e}")
 
+    def _sparse_settings(self, steps: int, use_denoising_batch: bool):
+        """(budget, threshold, refresh) of STREAMDIFFUSION_SPARSE_TOKENS when it can apply to
+        this stream, else None (see pipeline/sparse_tokens.py)."""
+        from pipeline.sparse_tokens import sparse_tokens_config
+        budget, thr, refresh = sparse_tokens_config()
+        if budget <= 0.0:
+            return None
+        reason = None
+        if self.mode != "img2img":
+            reason = "img2img only"
+        elif use_denoising_batch and steps > 1:
+            reason = "multi-step needs STREAMDIFFUSION_SEQUENTIAL=1 (stream batch mixes frames)"
+        elif self.height != self.width:
+            reason = "square resolutions only"
+        if reason:
+            logging.warning(f"[SparseTokens] Off: {reason}")
+            return None
+        return budget, thr, refresh
+
     def setup_torch_compile(self, stream, acceleration: str, cache_subdir: str):
         """Apply torch.compile() to UNet and VAE (shared SD/SDXL logic)."""
         if not self.torch_compile_enabled:

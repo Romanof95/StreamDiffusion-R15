@@ -199,6 +199,8 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                 gate_reason = "FaceID enabled (forces torch.compile fallback)"
             elif v2v_on:
                 gate_reason = "StreamV2V enabled (kvo processor install needs PyTorch UNet)"
+            elif self._sparse_settings(len(t_index_list), self.use_denoising_batch) is not None:
+                gate_reason = "sparse token update (dense + sparse engine pair)"
             elif lora_dict:
                 gate_reason = "custom lora_dict set"
             elif not use_tiny_vae:
@@ -500,6 +502,13 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
             create_prefix(model_id_or_path, stream.trt_unet_batch_size, stream.trt_unet_batch_size),
             unet_filename,
         )
+        # Sparse token update: a dense engine (writes the token caches) + a sparse one.
+        sp_cfg = self._sparse_settings(stream.denoising_steps_num, stream.use_denoising_batch)
+        unet_targets = [(unet_path, None)]
+        if sp_cfg is not None:
+            from pipeline.sparse_tokens import sparse_engine_paths
+            _d_path, _s_path = sparse_engine_paths(unet_path, sp_cfg[0])
+            unet_targets = [(_d_path, "dense"), (_s_path, "sparse")]
         vae_encoder_path = os.path.join(
             engine_dir,
             create_prefix(model_id_or_path,
@@ -516,13 +525,14 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         )
 
         needs_build = not (
-            engine_ready(unet_path) and engine_ready(vae_decoder_path)
+            all(engine_ready(p) for p, _ in unet_targets) and engine_ready(vae_decoder_path)
             and engine_ready(vae_encoder_path)
         )
 
-        if not engine_ready(unet_path):
+        if not all(engine_ready(p) for p, _ in unet_targets):
             self._emit_warning(True, "Building TensorRT engine (UNet) - first run can take several minutes")
             os.makedirs(os.path.dirname(unet_path), exist_ok=True)
+            kvo_procs = None
             if v2v_on:
                 # Install kvo passthrough processors BEFORE export so the ONNX
                 # trace captures the modified attention behavior.
@@ -555,16 +565,6 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                     embedding_dim=stream.text_encoder.config.hidden_size,
                     unet_dim=stream.unet.config.in_channels,
                 )
-                compile_unet(stream.unet, unet_model, unet_path + ".onnx",
-                             unet_path + ".opt.onnx", unet_path,
-                             opt_batch_size=stream.trt_unet_batch_size,
-                             opt_image_height=self.height, opt_image_width=self.width,
-                             kvo_processors=kvo_procs, kvo_ring_frames=v2v_maxframes)
-                # The cache tensors captured during the export trace are plain attributes
-                # on the processors: unet.to("cpu") does not move them.
-                for _p in kvo_procs:
-                    _p._cache_in = None
-                    _p._cache_out = None
             else:
                 unet_model = UNet(
                     fp16=True, device=stream.device,
@@ -573,10 +573,38 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
                     embedding_dim=stream.text_encoder.config.hidden_size,
                     unet_dim=stream.unet.config.in_channels,
                 )
-                compile_unet(stream.unet, unet_model, unet_path + ".onnx",
-                             unet_path + ".opt.onnx", unet_path,
+            sp_ctx = sp_groups = None
+            if sp_cfg is not None:
+                from pipeline.sparse_tokens import (
+                    SparseTokenContext, SparseTokenSpec, default_sides, install_sparse_transformers,
+                )
+                sp_ctx = SparseTokenContext()
+                sp_groups = install_sparse_transformers(
+                    stream.unet, self.height, self.width, default_sides(False, self.height, self.width),
+                    sp_ctx, has_v2v=v2v_on,
+                )
+                logging.info(
+                    f"[SparseTokens] Export: levels "
+                    + ", ".join(f"{g['side']}x{g['side']} ({g['L']} layers)" for g in sp_groups)
+                    + f", budget {sp_cfg[0]:.0%}"
+                )
+            for _path, _mode in unet_targets:
+                if engine_ready(_path):
+                    continue
+                _sp = None if _mode is None else (SparseTokenSpec(unet_model, sp_groups, _mode, sp_cfg[0]), sp_ctx)
+                compile_unet(stream.unet, _sp[0] if _sp else unet_model, _path + ".onnx",
+                             _path + ".opt.onnx", _path,
                              opt_batch_size=stream.trt_unet_batch_size,
-                             opt_image_height=self.height, opt_image_width=self.width)
+                             opt_image_height=self.height, opt_image_width=self.width,
+                             kvo_processors=kvo_procs,
+                             kvo_ring_frames=v2v_maxframes if kvo_procs is not None else None,
+                             sparse=_sp)
+            if kvo_procs is not None:
+                # The cache tensors captured during the export trace are plain attributes
+                # on the processors: unet.to("cpu") does not move them.
+                for _p in kvo_procs:
+                    _p._cache_in = None
+                    _p._cache_out = None
             # Move PyTorch UNet off-GPU as soon as TRT engine is built so the
             # VAE builds don't pay the ~1.7 GB peak.
             try:
@@ -641,10 +669,33 @@ class StreamDiffusionWrapper(BaseStreamDiffusionWrapper):
         # CUDA Graph capture saves ~1-2 ms per UNet call on stable shapes. The StreamV2V
         # ring engine gets one graph per (step, ring phase), with the cache addresses baked.
         unet_use_cuda_graph = True
-        stream.unet = UNet2DConditionModelEngine(
-            unet_path, cuda_stream, use_cuda_graph=unet_use_cuda_graph,
-            v2v_cache_maxframes=v2v_maxframes,
-        )
+        if sp_cfg is not None:
+            from pipeline.sparse_tokens import SparseUNetPair, groups_from_engine
+            dense_eng, sparse_eng = (
+                UNet2DConditionModelEngine(
+                    _p, cuda_stream, use_cuda_graph=unet_use_cuda_graph,
+                    v2v_cache_maxframes=v2v_maxframes,
+                )
+                for _p, _ in unet_targets
+            )
+            sp_groups = groups_from_engine(dense_eng.engine.engine)
+            stream.unet = SparseUNetPair(
+                dense_eng, sparse_eng, sp_groups, sp_cfg[0], sp_cfg[1], sp_cfg[2],
+                device=stream.device, dtype=stream.dtype,
+                warmup=v2v_maxframes + 1 if v2v_on else 1,
+            )
+            stream.sparse_tokens = stream.unet
+            logging.info(
+                f"[SparseTokens] On: budget {sp_cfg[0]:.0%} "
+                + ", ".join(f"{g['side']}x{g['side']}: {stream.unet.K[g['side']]}/{g['T']} tokens, {g['L']} layers"
+                            for g in sp_groups)
+                + f", dense above {sp_cfg[1]} motion, refresh every {sp_cfg[2] or 'never'} frames"
+            )
+        else:
+            stream.unet = UNet2DConditionModelEngine(
+                unet_path, cuda_stream, use_cuda_graph=unet_use_cuda_graph,
+                v2v_cache_maxframes=v2v_maxframes,
+            )
         stream.vae = AutoencoderKLEngine(
             vae_encoder_path, vae_decoder_path, cuda_stream,
             vae_scale_factor, use_cuda_graph=True,

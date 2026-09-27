@@ -47,6 +47,19 @@ REM set STREAMDIFFUSION_STATIC_FREEZE=0.2
 REM Input luma difference (0-1 scale) from still to moving, default 0.02,0.06 (raise it if
 REM sensor noise keeps still regions updating).
 REM set STREAMDIFFUSION_STATIC_FREEZE_THRESH=0.02,0.06
+REM Sparse token update (SD 1.5 and SDXL, img2img, square): in the largest attention layers only
+REM the part of the image that moved (plus a rotating share of the rest) is recomputed, the other
+REM tokens reuse their last result: faster and steadier on a fixed camera (webcam test: SD 1.5 4 steps
+REM -13 percent frame time and -27 percent flicker, SDXL nvfp4 -9 percent). Value = share of tokens
+REM recomputed per frame (0.25 = 25 percent); a frame with more motion than that is computed in full.
+REM First run builds two extra UNet engines (a few minutes). Multi-step needs
+REM STREAMDIFFUSION_SEQUENTIAL=1. Off by default. Keep the set lines alone.
+REM set STREAMDIFFUSION_SPARSE_TOKENS=0.25
+REM Motion (0-1 scale) above which a token must be recomputed: more such tokens than the budget
+REM = full frame (default 0.15; raise it if a noisy webcam keeps forcing full frames).
+REM set STREAMDIFFUSION_SPARSE_THRESH=0.15
+REM Full frame every N frames (default 0 = only when needed).
+REM set STREAMDIFFUSION_SPARSE_REFRESH=0
 REM Diagnostics: [PERF] log line every 60 frames (GPU breakdown, frame-time spread, wait for Smode).
 REM set STREAMDIFFUSION_PROFILING=1
  set STREAMDIFFUSION_V2V_ATTN_POOL=2

@@ -130,6 +130,9 @@ class StreamDiffusionXL:
         self.similar_image_filter = True
         self.similar_filter = SimilarImageFilter(threshold=0.98, max_skip_frame=3)
         self.prev_image_result = None
+        # Sparse token update runtime (pipeline/sparse_tokens.SparseUNetPair), set by the
+        # wrapper when STREAMDIFFUSION_SPARSE_TOKENS is on and the engines are loaded.
+        self.sparse_tokens = None
 
         # Static-region stabilizer (STREAMDIFFUSION_STATIC_FREEZE), see pipeline.StreamDiffusion.
         _sf_weight, _sf_low, _sf_high = static_freeze_config()
@@ -623,6 +626,8 @@ class StreamDiffusionXL:
         if getattr(self, '_static_freeze', None) is not None:
             self._static_freeze.reset()
             self._static_freeze_inputs = []
+        if getattr(self, 'sparse_tokens', None) is not None:
+            self.sparse_tokens.reset()     # new prompt: the token caches are stale
 
     def add_noise(
         self,
@@ -1222,6 +1227,10 @@ class StreamDiffusionXL:
             if self.enable_profiling:
                 events['preprocess_end'].record()
                 events['vae_encode_end'].record()
+
+        # Sparse token update: pick this frame's moving tokens (or a dense frame).
+        if self.sparse_tokens is not None:
+            self.sparse_tokens.begin_frame(x)
 
         x_0_pred_out = self.predict_x0_batch(
             x_t_latent,

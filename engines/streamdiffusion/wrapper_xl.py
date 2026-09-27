@@ -291,7 +291,13 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                     streamv2v_variant=_v2v_variant_suffix(getattr(self, "streamv2v_options", None)),
                     vae_id=vae_id,
                 )
-                if (engine_ready(unet_path) and engine_ready(vae_enc_path)
+                sp_cfg = self._sparse_settings(len(t_index_list), self.use_denoising_batch)
+                if sp_cfg is not None:
+                    from pipeline.sparse_tokens import sparse_engine_paths
+                    unet_ready = all(engine_ready(p) for p in sparse_engine_paths(unet_path, sp_cfg[0]))
+                else:
+                    unet_ready = engine_ready(unet_path)
+                if (unet_ready and engine_ready(vae_enc_path)
                         and engine_ready(vae_dec_path)):
                     try:
                         logging.info(
@@ -709,6 +715,13 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             create_prefix(model_id_or_path, stream.trt_unet_batch_size, stream.trt_unet_batch_size),
             unet_filename,
         )
+        # Sparse token update: a dense engine (writes the token caches) + a sparse one.
+        sp_cfg = self._sparse_settings(stream.denoising_steps_num, stream.use_denoising_batch)
+        unet_targets = [(unet_path, None)]
+        if sp_cfg is not None:
+            from pipeline.sparse_tokens import sparse_engine_paths
+            _d_path, _s_path = sparse_engine_paths(unet_path, sp_cfg[0])
+            unet_targets = [(_d_path, "dense"), (_s_path, "sparse")]
         batch = self.batch_size if self.mode == "txt2img" else stream.frame_bff_size
         # VAE engines are keyed by the tiny VAE they were exported from (see _vae_engine_suffix).
         vae_sfx = _vae_engine_suffix(use_tiny_vae, getattr(self, "_tiny_vae_id", None))
@@ -720,11 +733,11 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         )
 
         needs_build = not (
-            engine_ready(unet_path) and engine_ready(vae_decoder_path)
+            all(engine_ready(p) for p, _ in unet_targets) and engine_ready(vae_decoder_path)
             and engine_ready(vae_encoder_path)
         )
 
-        if not engine_ready(unet_path):
+        if not all(engine_ready(p) for p, _ in unet_targets):
             self._emit_warning(True, "Building TensorRT engine (UNet) - first run can take several minutes")
             os.makedirs(os.path.dirname(unet_path), exist_ok=True)
             if precision != "fp16":
@@ -778,13 +791,36 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                     unet_dim=stream.unet.config.in_channels,
                 )
 
-            def _compile_fp16_unet(path):
+            sp_ctx = sp_groups = None
+            if sp_cfg is not None:
+                from pipeline.sparse_tokens import (
+                    SparseTokenContext, SparseTokenSpec, default_sides, install_sparse_transformers,
+                )
+                sp_ctx = SparseTokenContext()
+                sp_groups = install_sparse_transformers(
+                    stream.unet, self.height, self.width, default_sides(True, self.height, self.width),
+                    sp_ctx, has_v2v=v2v_on,
+                )
+                logging.info(
+                    f"[SparseTokens] Export: levels "
+                    + ", ".join(f"{g['side']}x{g['side']} ({g['L']} layers)" for g in sp_groups)
+                    + f", budget {sp_cfg[0]:.0%}"
+                )
+
+            def _sparse_arg(mode):
+                if mode is None:
+                    return None
+                return (SparseTokenSpec(unet_model, sp_groups, mode, sp_cfg[0]), sp_ctx)
+
+            def _compile_fp16_unet(path, mode=None):
+                sp = _sparse_arg(mode)
                 compile_unet(
-                    stream.unet, unet_model, path + ".onnx", path + ".opt.onnx", path,
+                    stream.unet, sp[0] if sp else unet_model, path + ".onnx", path + ".opt.onnx", path,
                     opt_batch_size=stream.trt_unet_batch_size,
                     opt_image_height=self.height, opt_image_width=self.width,
                     is_sdxl=True, use_simple_wrapper=False, kvo_processors=kvo_procs,
                     kvo_ring_frames=v2v_maxframes if kvo_procs is not None else None,
+                    sparse=sp,
                 )
 
             if precision != "fp16":
@@ -800,13 +836,19 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                 try:
                     calib = make_stream_calibration_loop(stream) if precision == "nvfp4" else None
                     quantize_model(stream.unet, precision, calib)
-                    compile_unet_quantized(
-                        stream.unet, unet_model, unet_path + ".onnx", unet_path,
-                        opt_batch_size=stream.trt_unet_batch_size,
-                        opt_image_height=self.height, opt_image_width=self.width,
-                        precision=precision, kvo_processors=kvo_procs,
-                        kvo_ring_frames=v2v_maxframes if kvo_procs is not None else None,
-                    )
+                    for _path, _mode in unet_targets:
+                        if engine_ready(_path):
+                            continue
+                        _sp = _sparse_arg(_mode)
+                        stream.unet.to(stream.device)   # each export ends with the UNet on the CPU
+                        compile_unet_quantized(
+                            stream.unet, _sp[0] if _sp else unet_model, _path + ".onnx", _path,
+                            opt_batch_size=stream.trt_unet_batch_size,
+                            opt_image_height=self.height, opt_image_width=self.width,
+                            precision=precision, kvo_processors=kvo_procs,
+                            kvo_ring_frames=v2v_maxframes if kvo_procs is not None else None,
+                            sparse=_sp,
+                        )
                 except Exception as e:
                     # Fall back to the fp16 engine: neutralize the quantizers (identity),
                     # bring the UNet back on the GPU, build/load the plain fp16 engine.
@@ -823,10 +865,16 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                         os.path.dirname(unet_path),
                         f"unet_v2vr_xl_mf{v2v_maxframes}{v2v_variant}.engine" if v2v_on else "unet_cn.engine",
                     )
+                    if sp_cfg is not None:
+                        logging.warning("[SparseTokens] Off after the quantization failure (fp16 fallback)")
+                        sp_cfg = None
+                        unet_targets = [(unet_path, None)]
                     if not engine_ready(unet_path):
                         _compile_fp16_unet(unet_path)
             else:
-                _compile_fp16_unet(unet_path)
+                for _path, _mode in unet_targets:
+                    if not engine_ready(_path):
+                        _compile_fp16_unet(_path, _mode)
             if kvo_procs is not None:
                 # The cache tensors captured during the export trace live on the GPU and are
                 # plain attributes: unet.to("cpu") does not move them (~2.5 GB at 1024).
@@ -898,10 +946,34 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         # make V2V graph-capturable. Engine.infer falls back gracefully on
         # capture failure.
         unet_use_cuda_graph = True
-        stream.unet = UNet2DConditionModelEngine(
-            unet_path, cuda_stream, use_cuda_graph=unet_use_cuda_graph,
-            v2v_cache_maxframes=v2v_maxframes,
-        )
+        if sp_cfg is not None:
+            from pipeline.sparse_tokens import SparseUNetPair, groups_from_engine
+            dense_eng = UNet2DConditionModelEngine(
+                unet_targets[0][0], cuda_stream, use_cuda_graph=unet_use_cuda_graph,
+                v2v_cache_maxframes=v2v_maxframes,
+            )
+            sparse_eng = UNet2DConditionModelEngine(
+                unet_targets[1][0], cuda_stream, use_cuda_graph=unet_use_cuda_graph,
+                v2v_cache_maxframes=v2v_maxframes,
+            )
+            sp_groups = groups_from_engine(dense_eng.engine.engine)
+            stream.unet = SparseUNetPair(
+                dense_eng, sparse_eng, sp_groups, sp_cfg[0], sp_cfg[1], sp_cfg[2],
+                device=stream.device, dtype=stream.dtype,
+                warmup=v2v_maxframes + 1 if v2v_on else 1,
+            )
+            stream.sparse_tokens = stream.unet
+            logging.info(
+                f"[SparseTokens] On: budget {sp_cfg[0]:.0%} "
+                + ", ".join(f"{g['side']}x{g['side']}: {stream.unet.K[g['side']]}/{g['T']} tokens, {g['L']} layers"
+                            for g in sp_groups)
+                + f", dense above {sp_cfg[1]} motion, refresh every {sp_cfg[2] or 'never'} frames"
+            )
+        else:
+            stream.unet = UNet2DConditionModelEngine(
+                unet_path, cuda_stream, use_cuda_graph=unet_use_cuda_graph,
+                v2v_cache_maxframes=v2v_maxframes,
+            )
         stream.vae = AutoencoderKLEngine(
             vae_encoder_path, vae_decoder_path, cuda_stream,
             vae_scale_factor, use_cuda_graph=True,

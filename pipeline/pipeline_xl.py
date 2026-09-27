@@ -20,6 +20,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 )
 
 from .image_filter import SimilarImageFilter
+from .static_freeze import StaticRegionStabilizer, static_freeze_config
 from .attention_processors import update_cache_after_unet, select_attention_cache_slot, prune_attention_cache_slots
 
 
@@ -129,6 +130,15 @@ class StreamDiffusionXL:
         self.similar_image_filter = True
         self.similar_filter = SimilarImageFilter(threshold=0.98, max_skip_frame=3)
         self.prev_image_result = None
+
+        # Static-region stabilizer (STREAMDIFFUSION_STATIC_FREEZE), see pipeline.StreamDiffusion.
+        _sf_weight, _sf_low, _sf_high = static_freeze_config()
+        self._static_freeze = (StaticRegionStabilizer(_sf_weight, _sf_low, _sf_high)
+                               if _sf_weight > 0.0 else None)
+        self._static_freeze_inputs: List[torch.Tensor] = []
+        if self._static_freeze is not None:
+            logging.info(f"[StaticFreeze] Still regions keep {1 - _sf_weight:.0%} of the previous output "
+                         f"(motion threshold {_sf_low}-{_sf_high})")
 
         self._ssf_frames_processed = 0
         self._ssf_frames_skipped = 0
@@ -610,6 +620,9 @@ class StreamDiffusionXL:
         if hasattr(self, 'prev_image_result'):
             self.prev_image_result = None
         self._cn_cond_ring_needs_init = True
+        if getattr(self, '_static_freeze', None) is not None:
+            self._static_freeze.reset()
+            self._static_freeze_inputs = []
 
     def add_noise(
         self,
@@ -1228,6 +1241,12 @@ class StreamDiffusionXL:
             self._prev_latent = x_0_pred_out.detach()
 
         x_output = self.decode_image(x_0_pred_out).detach()
+
+        if self._static_freeze is not None and x is not None:
+            lag = self.denoising_steps_num - 1 if self.use_denoising_batch else 0
+            self._static_freeze_inputs.append(x)
+            del self._static_freeze_inputs[:-(lag + 1)]
+            x_output = self._static_freeze(self._static_freeze_inputs[0], x_output)
 
         if self.enable_profiling:
             events['vae_decode_end'].record()

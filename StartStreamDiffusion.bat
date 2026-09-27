@@ -39,6 +39,14 @@ REM Overlap with Smode: when the next input arrives, Smode gets the previous res
 REM generation runs while Smode renders (frame time max(Smode, generation) instead of their sum,
 REM +1 frame of latency). 0 = off (default), 1 = on.
 if not defined STREAMDIFFUSION_OVERLAP_SMODE set STREAMDIFFUSION_OVERLAP_SMODE=0
+REM Static regions: where the input does not move, the output keeps (1 - weight) of the previous
+REM frame (0.2 = 80 percent), so the regenerated background stops flickering (SD 1.5 still regions
+REM 0.019 to 0.010, SDXL whole frame -27 percent); moving regions and scene cuts update at once.
+REM Off by default. Keep the set lines alone: text after = becomes part of the value.
+REM set STREAMDIFFUSION_STATIC_FREEZE=0.2
+REM Input luma difference (0-1 scale) from still to moving, default 0.02,0.06 (raise it if
+REM sensor noise keeps still regions updating).
+REM set STREAMDIFFUSION_STATIC_FREEZE_THRESH=0.02,0.06
 REM Diagnostics: [PERF] log line every 60 frames (GPU breakdown, frame-time spread, wait for Smode).
 REM set STREAMDIFFUSION_PROFILING=1
  set STREAMDIFFUSION_V2V_ATTN_POOL=2

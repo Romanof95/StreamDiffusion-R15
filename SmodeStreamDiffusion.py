@@ -151,6 +151,10 @@ class App:
             logging.info("[Smode] Overlap mode: previous result handed over at each input, "
                          "generation runs while Smode renders (+1 frame of latency)")
 
+        # Frames that came out with NaN/Inf (see _guard_output).
+        self._non_finite_frames = 0
+        self._non_finite_last_log = 0.0
+
         self.similar_image_filter = SimilarImageFilterConfig()
 
         self.controlnet_config = ControlNetConfig(
@@ -766,8 +770,7 @@ class App:
                     if getattr(self, '_streamv2v_active', False):
                         prev_prompt = getattr(self, '_streamv2v_last_prompt', None)
                         if prev_prompt != self.current_prompt:
-                            from pipeline.attention_processors import reset_attention_cache
-                            reset_attention_cache(self.stream.stream.unet)
+                            self._reset_v2v_caches()
                             self._streamv2v_last_prompt = self.current_prompt
                             logging.info("[StreamV2V] Attention cache reset (prompt changed)")
 
@@ -1099,7 +1102,42 @@ class App:
 
         if x_output is not None:
             x_output = x_output.squeeze(0) if x_output.shape[0] == 1 else x_output
-        return x_output
+        return self._guard_output(x_output)
+
+    def _guard_output(self, x_output: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Drop a frame that came out with NaN/Inf, and clear what it poisoned.
+
+        Such a frame displays black, and every state carried to the next frame (StreamV2V
+        caches, stream-batch latents, RCFG noise, static-freeze / sparse-token memory) may
+        now hold it: every later frame would then be black too, until a prompt change, and
+        on TensorRT not even then (the kvo ring lives in the engine). Reset them all and
+        hand Smode nothing, so it keeps showing the previous image."""
+        if x_output is None or bool(torch.isfinite(x_output).all()):
+            return x_output
+        self._non_finite_frames += 1
+        now = time.time()
+        if now - self._non_finite_last_log >= 1.0:
+            self._non_finite_last_log = now
+            logging.warning(
+                f"[NaN guard] non-finite generation output ({self._non_finite_frames} "
+                f"frame(s) since start): generation state reset, previous image kept")
+        stream = self.stream.stream
+        stream.update_prompt(self.current_prompt)
+        stream._prev_latent = None
+        self._reset_v2v_caches()
+        return None
+
+    def _reset_v2v_caches(self) -> None:
+        """Zero the StreamV2V attention caches, on PyTorch and TensorRT UNets alike."""
+        from pipeline.attention_processors import reset_attention_cache
+        unet = self.stream.stream.unet
+        reset_attention_cache(unet)  # PyTorch UNet; no-op on a TensorRT engine
+        # A TensorRT UNet is either the engine itself or a pair of engines (step cache:
+        # full + shallow, sparse tokens: dense + sparse), each holding its own caches.
+        engines = [unet] if "_rings" in vars(unet) else [
+            e for e in vars(unet).values() if "_rings" in getattr(e, "__dict__", {})]
+        for engine in engines:
+            engine.reset_v2v_cache()
 
     def _process_frame(self, timings: dict) -> None:
         """Per-frame compute: input -> preprocess -> inference -> output -> signal."""

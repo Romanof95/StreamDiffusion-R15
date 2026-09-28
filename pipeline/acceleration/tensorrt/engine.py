@@ -348,6 +348,19 @@ class UNet2DConditionModelEngine:
 
         return UNet2DConditionOutput(sample=noise_pred)
 
+    def reset_v2v_cache(self) -> None:
+        """Zero every StreamV2V cache (ring and legacy layouts) in place. In place, never
+        reallocated: the ring addresses are baked into the captured CUDA graphs, which would
+        otherwise keep reading the old buffers. Zero is also their initial state, so this is
+        a fresh start. reset_attention_cache() only covers PyTorch UNets."""
+        for ring in self._rings.values():
+            for slot in ring:
+                for buf in slot:
+                    buf.zero_()
+        for cache in self._kvo_caches.values():
+            for buf in cache:
+                buf.zero_()
+
     def prune_v2v_slots(self, n_slots: int) -> None:
         """Keep the StreamV2V caches (and their CUDA graphs) of steps < n_slots only: a
         sequential run that goes from N steps to fewer would otherwise keep every extra

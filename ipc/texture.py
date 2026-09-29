@@ -39,14 +39,35 @@ class StreamDiffusionSmodeTexture:
         self._vflip_row_idx = torch.arange(
             self.height - 1, -1, -1, device=self.device, dtype=torch.long
         )
+        # Non-finite input values since the last pop_nonfinite_stats(): counted on the GPU
+        # (no per-frame sync), read back by the caller every few seconds.
+        self._nonfinite = torch.zeros(3, dtype=torch.int64, device=self.device)
 
     def copy_smode_to_stream_diffusion(self):
         """Copy smode_tensor into stream_diffusion_tensor with implicit dtype cast, clamped to
         [0, 1]: Smode can deliver HDR values above 1, which the VAE encoder and the ControlNet
         preprocessors would otherwise receive out of range (blown highlights, edge/depth
-        artifacts)."""
+        artifacts).
+
+        Non-finite values are replaced first (NaN -> 0, +Inf -> 1, -Inf -> 0): clamp_ keeps
+        NaN, and a single NaN pixel makes the whole generated frame NaN, since the VAE encoder
+        and every UNet self-attention mix all positions (sd-turbo fp16: 1 NaN pixel -> 100 %
+        NaN latent and UNet output). Smode colour modifiers can emit them on out-of-range
+        input, such as the negative values of a limited-range YUV camera."""
+        bad = self.smode_tensor.isfinite().logical_not_().sum()
+        self._nonfinite[0] += bad > 0                  # frames
+        self._nonfinite[1] += bad                      # values
+        self._nonfinite[2] = torch.maximum(self._nonfinite[2], bad)  # worst frame
         self.stream_diffusion_tensor.copy_(self.smode_tensor)
+        torch.nan_to_num_(self.stream_diffusion_tensor, nan=0.0, posinf=1.0, neginf=0.0)
         self.stream_diffusion_tensor.clamp_(0.0, 1.0)
+
+    def pop_nonfinite_stats(self) -> tuple:
+        """(frames, values, values in the worst frame) with non-finite input since the last
+        call. One sync: call it every few seconds, not per frame."""
+        stats = tuple(self._nonfinite.tolist())
+        self._nonfinite.zero_()
+        return stats
 
     def get_permuted_input_tensor(self) -> torch.Tensor:
         """Return CHW + vertically flipped input in a single GPU copy."""

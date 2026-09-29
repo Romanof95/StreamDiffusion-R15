@@ -18,6 +18,7 @@ from . import nan_trace
 from .static_freeze import StaticRegionStabilizer, static_freeze_config
 from .attention_processors import update_cache_after_unet, select_attention_cache_slot, prune_attention_cache_slots
 from functools import lru_cache
+from utils.hub import local_first
 
 
 @lru_cache(maxsize=32)
@@ -332,14 +333,14 @@ class StreamDiffusion:
         # file explicitly (falling back to diffusers auto-resolution for other repo layouts).
         if "weight_name" not in kwargs and isinstance(pretrained_model_name_or_path_or_dict, str):
             try:
-                self.pipe.load_lora_weights(
+                local_first(self.pipe.load_lora_weights,
                     pretrained_model_name_or_path_or_dict, adapter_name,
                     weight_name="pytorch_lora_weights.safetensors", **kwargs
                 )
                 return
             except Exception:
                 pass
-        self.pipe.load_lora_weights(
+        local_first(self.pipe.load_lora_weights,
             pretrained_model_name_or_path_or_dict, adapter_name, **kwargs
         )
 
@@ -349,7 +350,7 @@ class StreamDiffusion:
         adapter_name: Optional[Any] = None,
         **kwargs,
     ) -> None:
-        self.pipe.load_lora_weights(
+        local_first(self.pipe.load_lora_weights,
             pretrained_lora_model_name_or_path_or_dict, adapter_name, **kwargs
         )
 

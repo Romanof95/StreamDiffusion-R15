@@ -17,6 +17,7 @@ from diffusers import ControlNetModel
 
 from ipc import Acceleration
 from pipeline.acceleration.engine_cache import engine_ready
+from utils.hub import local_first
 from pipeline.acceleration.quantization import (
     normalize_precision, precision_suffix, quantization_available, hardware_precision,
 )
@@ -1153,7 +1154,7 @@ class ControlNetManager:
                 # xinsir uses underscore in promax filename + separate
                 # config_promax.json, so diffusers can't auto-load variant="promax".
                 # Standard variant covers the 8 control types we need.
-                self._union_model = ControlNetUnionModel.from_pretrained(
+                self._union_model = local_first(ControlNetUnionModel.from_pretrained,
                     "xinsir/controlnet-union-sdxl-1.0",
                     torch_dtype=app.torch_dtype,
                 ).to(app.device)
@@ -1256,13 +1257,13 @@ class ControlNetManager:
             self._emit_warning(True, f"Loading Canny ControlNet model ({cn_label})...")
             if canny_filename:
                 from huggingface_hub import hf_hub_download
-                canny_path = hf_hub_download(repo_id=canny_repo, filename=canny_filename)
+                canny_path = local_first(hf_hub_download, repo_id=canny_repo, filename=canny_filename)
                 kwargs = {"torch_dtype": app.torch_dtype}
                 if canny_config:
                     kwargs["config"] = canny_config
-                model = ControlNetModel.from_single_file(canny_path, **kwargs).to(app.device)
+                model = local_first(ControlNetModel.from_single_file, canny_path, **kwargs).to(app.device)
             else:
-                model = ControlNetModel.from_pretrained(
+                model = local_first(ControlNetModel.from_pretrained,
                     canny_repo, torch_dtype=app.torch_dtype
                 ).to(app.device)
 
@@ -1310,13 +1311,13 @@ class ControlNetManager:
             self._emit_warning(True, f"Loading Depth ControlNet model ({cn_label})...")
             if depth_filename:
                 from huggingface_hub import hf_hub_download
-                depth_path = hf_hub_download(repo_id=depth_repo, filename=depth_filename)
+                depth_path = local_first(hf_hub_download, repo_id=depth_repo, filename=depth_filename)
                 kwargs = {"torch_dtype": app.torch_dtype}
                 if depth_config:
                     kwargs["config"] = depth_config
-                model = ControlNetModel.from_single_file(depth_path, **kwargs).to(app.device)
+                model = local_first(ControlNetModel.from_single_file, depth_path, **kwargs).to(app.device)
             else:
-                model = ControlNetModel.from_pretrained(
+                model = local_first(ControlNetModel.from_pretrained,
                     depth_repo, torch_dtype=app.torch_dtype
                 ).to(app.device)
 
@@ -1362,13 +1363,13 @@ class ControlNetManager:
             self._emit_warning(True, f"Loading OpenPose ControlNet model ({cn_label})...")
             if openpose_filename:
                 from huggingface_hub import hf_hub_download
-                openpose_path = hf_hub_download(repo_id=openpose_repo, filename=openpose_filename)
+                openpose_path = local_first(hf_hub_download, repo_id=openpose_repo, filename=openpose_filename)
                 kwargs = {"torch_dtype": app.torch_dtype}
                 if openpose_config:
                     kwargs["config"] = openpose_config
-                model = ControlNetModel.from_single_file(openpose_path, **kwargs).to(app.device)
+                model = local_first(ControlNetModel.from_single_file, openpose_path, **kwargs).to(app.device)
             else:
-                model = ControlNetModel.from_pretrained(
+                model = local_first(ControlNetModel.from_pretrained,
                     openpose_repo, torch_dtype=app.torch_dtype
                 ).to(app.device)
 

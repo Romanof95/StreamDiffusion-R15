@@ -18,6 +18,7 @@ from pipeline.acceleration.quantization import (
 from PIL import Image
 
 from pipeline.pipeline_xl import StreamDiffusionXL
+from utils.hub import local_first
 from .base_wrapper import (
     BaseStreamDiffusionWrapper, PACKAGE_DIR, from_pretrained_any_variant, fuse_lora_adapters,
     lcm_lora_fused, lora_signature, user_lcm_lora,
@@ -53,7 +54,7 @@ def _loras_touch_text_encoders(lora_dict) -> Optional[bool]:
             if "::" in lora_name:
                 from huggingface_hub import hf_hub_download
                 repo_id, weight_name = lora_name.split("::", 1)
-                path = hf_hub_download(repo_id, weight_name)
+                path = local_first(hf_hub_download, repo_id, weight_name)
             elif os.path.isfile(lora_name):
                 path = lora_name
             else:
@@ -159,25 +160,25 @@ def _build_stub_pipe_sdxl(model_id_or_path, cache_dir, device, dtype):
     can't be skipped because ``encode_prompt`` needs them.
     """
     from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
-    tokenizer = CLIPTokenizer.from_pretrained(
+    tokenizer = local_first(CLIPTokenizer.from_pretrained,
         model_id_or_path, subfolder="tokenizer",
         cache_dir=cache_dir if cache_dir else None,
     )
-    tokenizer_2 = CLIPTokenizer.from_pretrained(
+    tokenizer_2 = local_first(CLIPTokenizer.from_pretrained,
         model_id_or_path, subfolder="tokenizer_2",
         cache_dir=cache_dir if cache_dir else None,
     )
-    text_encoder = from_pretrained_any_variant(
+    text_encoder = local_first(from_pretrained_any_variant,
         CLIPTextModel.from_pretrained, model_id_or_path, subfolder="text_encoder",
         cache_dir=cache_dir if cache_dir else None,
         torch_dtype=dtype,
     ).to(device)
-    text_encoder_2 = from_pretrained_any_variant(
+    text_encoder_2 = local_first(from_pretrained_any_variant,
         CLIPTextModelWithProjection.from_pretrained, model_id_or_path, subfolder="text_encoder_2",
         cache_dir=cache_dir if cache_dir else None,
         torch_dtype=dtype,
     ).to(device)
-    scheduler = LCMScheduler.from_pretrained(
+    scheduler = local_first(LCMScheduler.from_pretrained,
         model_id_or_path, subfolder="scheduler",
         cache_dir=cache_dir if cache_dir else None,
     )
@@ -210,7 +211,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         tiny VAE, which lives on the stream and not on the pipe, has to be restored."""
         tiny_vae_id = getattr(self, "_tiny_vae_id", None)
         if tiny_vae_id and not isinstance(self.stream.vae, AutoencoderTiny):
-            self.stream.vae = AutoencoderTiny.from_pretrained(tiny_vae_id).to(
+            self.stream.vae = local_first(AutoencoderTiny.from_pretrained, tiny_vae_id).to(
                 device=self.stream.pipe.device, dtype=self.stream.pipe.dtype
             )
 
@@ -335,12 +336,12 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                             vae_id if vae_id is not None else SDXL_TINY_VAE_DEFAULT
                         )
                         try:
-                            stream.vae = AutoencoderTiny.from_pretrained(tiny_vae_id).to(
+                            stream.vae = local_first(AutoencoderTiny.from_pretrained, tiny_vae_id).to(
                                 device=self.device, dtype=self.dtype
                             )
                         except Exception:
                             tiny_vae_id = SDXL_TINY_VAE_DEFAULT
-                            stream.vae = AutoencoderTiny.from_pretrained(tiny_vae_id).to(
+                            stream.vae = local_first(AutoencoderTiny.from_pretrained, tiny_vae_id).to(
                                 device=self.device, dtype=self.dtype
                             )
                         self._tiny_vae_id = tiny_vae_id
@@ -369,11 +370,11 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                         if self.use_safety_checker:
                             from transformers import CLIPFeatureExtractor
                             from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-                            self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
+                            self.safety_checker = local_first(StableDiffusionSafetyChecker.from_pretrained,
                                 "CompVis/stable-diffusion-safety-checker",
                                 torch_dtype=self.dtype,
                             ).to(self.device)
-                            self.feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32")
+                            self.feature_extractor = local_first(CLIPFeatureExtractor.from_pretrained, "openai/clip-vit-base-patch32")
                             self.nsfw_fallback_img = Image.new("RGB", (512, 512), (0, 0, 0))
 
                         return stream
@@ -403,20 +404,20 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                 logging.info(f"[Cache hit detected but fast path gated off: {gate_reason}]")
 
         try:
-            try:
-                pipe = from_pretrained_any_variant(
-                    StableDiffusionXLPipeline.from_pretrained, base_model_path, torch_dtype=self.dtype,
+            if os.path.isfile(base_model_path):
+                # A single checkpoint file: from_pretrained can only fail on it.
+                pipe = local_first(StableDiffusionXLPipeline.from_single_file,
+                    base_model_path, torch_dtype=self.dtype,
                     cache_dir=cache_dir if cache_dir else None
-                ).to(device=self.device, dtype=self.dtype)
-            except Exception:
+                ).to(device=self.device)
+            else:
                 try:
-                    pipe = from_pretrained_any_variant(
-                        StableDiffusionXLPipeline.from_pretrained, base_model_path, local_files_only=True,
-                        torch_dtype=self.dtype,
+                    pipe = local_first(from_pretrained_any_variant,
+                        StableDiffusionXLPipeline.from_pretrained, base_model_path, torch_dtype=self.dtype,
                         cache_dir=cache_dir if cache_dir else None
                     ).to(device=self.device, dtype=self.dtype)
                 except Exception:
-                    pipe = StableDiffusionXLPipeline.from_single_file(
+                    pipe = local_first(StableDiffusionXLPipeline.from_single_file,
                         base_model_path, torch_dtype=self.dtype,
                         cache_dir=cache_dir if cache_dir else None
                     ).to(device=self.device)
@@ -529,11 +530,11 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         if self.use_safety_checker:
             from transformers import CLIPFeatureExtractor
             from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-            self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
+            self.safety_checker = local_first(StableDiffusionSafetyChecker.from_pretrained,
                 "CompVis/stable-diffusion-safety-checker",
                 torch_dtype=self.dtype,
             ).to(pipe.device)
-            self.feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32")
+            self.feature_extractor = local_first(CLIPFeatureExtractor.from_pretrained, "openai/clip-vit-base-patch32")
             self.nsfw_fallback_img = Image.new("RGB", (512, 512), (0, 0, 0))
 
         return stream
@@ -543,7 +544,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
         from huggingface_hub import hf_hub_download
         from safetensors.torch import load_file
 
-        unet_path = hf_hub_download(
+        unet_path = local_first(hf_hub_download,
             repo_id="ByteDance/Hyper-SD",
             filename="Hyper-SDXL-1step-Unet.safetensors",
             cache_dir=cache_dir if cache_dir else None
@@ -569,7 +570,7 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
             if "::" in lora_name:
                 repo_id, weight_name = lora_name.split("::", 1)
                 if "hyper" in lora_name.lower() and "sdxl" in lora_name.lower():
-                    adapters.append((lora_name, stream.load_lora, (hf_hub_download(repo_id, weight_name),), {}, lora_scale))
+                    adapters.append((lora_name, stream.load_lora, (local_first(hf_hub_download, repo_id, weight_name),), {}, lora_scale))
                 else:
                     adapters.append((lora_name, stream.load_lora, (repo_id,), {"weight_name": weight_name}, lora_scale))
             else:
@@ -586,13 +587,13 @@ class StreamDiffusionWrapperXL(BaseStreamDiffusionWrapper):
                 vae_model_name = SDXL_TINY_VAE_DEFAULT
 
             try:
-                stream.vae = AutoencoderTiny.from_pretrained(vae_model_name).to(
+                stream.vae = local_first(AutoencoderTiny.from_pretrained, vae_model_name).to(
                     device=pipe.device, dtype=pipe.dtype
                 )
             except Exception as e:
                 logging.warning(f"[TinyVAE] Failed to load {vae_model_name}: {e}, falling back to {SDXL_TINY_VAE_DEFAULT}")
                 vae_model_name = SDXL_TINY_VAE_DEFAULT
-                stream.vae = AutoencoderTiny.from_pretrained(vae_model_name).to(
+                stream.vae = local_first(AutoencoderTiny.from_pretrained, vae_model_name).to(
                     device=pipe.device, dtype=pipe.dtype
                 )
             self._tiny_vae_id = vae_model_name

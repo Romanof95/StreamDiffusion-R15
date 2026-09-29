@@ -22,6 +22,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 from .image_filter import SimilarImageFilter
 from .static_freeze import StaticRegionStabilizer, static_freeze_config
 from .attention_processors import update_cache_after_unet, select_attention_cache_slot, prune_attention_cache_slots
+from utils.hub import local_first
 
 
 _SHAPE_CACHE = {}  # (height, width, scale_factor) -> (latent_h, latent_w)
@@ -335,7 +336,7 @@ class StreamDiffusionXL:
         adapter_name: Optional[Any] = None,
         **kwargs,
     ) -> None:
-        self.pipe.load_lora_weights(
+        local_first(self.pipe.load_lora_weights,
             pretrained_model_name_or_path_or_dict, adapter_name, **kwargs
         )
 
@@ -345,7 +346,7 @@ class StreamDiffusionXL:
         adapter_name: Optional[Any] = None,
         **kwargs,
     ) -> None:
-        self.pipe.load_lora_weights(
+        local_first(self.pipe.load_lora_weights,
             pretrained_lora_model_name_or_path_or_dict, adapter_name, **kwargs
         )
 

@@ -9,6 +9,7 @@ import torch
 from pipeline import nan_trace
 
 from ..base import BasePreprocessor
+from utils.hub import local_first
 
 
 class DepthProcessor(BasePreprocessor):
@@ -99,7 +100,7 @@ class DepthProcessor(BasePreprocessor):
             model_id = self.MODEL_MAP.get(model_size, self.MODEL_MAP['small'])
 
             # AutoImageProcessor is CPU-only — safe before the cache probe.
-            self._processor = AutoImageProcessor.from_pretrained(model_id)
+            self._processor = local_first(AutoImageProcessor.from_pretrained, model_id)
 
             self._depth_mean = torch.tensor(
                 [0.485, 0.456, 0.406], device=self.device, dtype=self.torch_dtype
@@ -118,7 +119,7 @@ class DepthProcessor(BasePreprocessor):
                     return
 
             logging.info(f"Loading Depth-Anything V2 {model_size.upper()} model...")
-            self._model = AutoModelForDepthEstimation.from_pretrained(
+            self._model = local_first(AutoModelForDepthEstimation.from_pretrained,
                 model_id, torch_dtype=self.torch_dtype
             ).to(self.device)
             self._model.eval()

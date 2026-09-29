@@ -6,6 +6,8 @@ import cv2
 import numpy as np
 import torch
 
+from pipeline import nan_trace
+
 from ..base import BasePreprocessor
 
 
@@ -234,6 +236,8 @@ class DepthProcessor(BasePreprocessor):
         depth_gpu = prediction.detach()
         depth_min = depth_gpu.min()
         depth_max = depth_gpu.max()
+        nan_trace.record("depth_pred", depth_gpu)
+        nan_trace.record("depth_range", depth_max - depth_min)
         depth_gpu = ((depth_gpu - depth_min) / (depth_max - depth_min) * 255.0)
 
         if blur_kernel > 1 and self._gaussian_kernel is not None:

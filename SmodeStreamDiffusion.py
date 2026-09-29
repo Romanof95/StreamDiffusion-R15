@@ -50,6 +50,7 @@ from preprocessors.orchestrator import PreprocessorOrchestrator
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 from pipeline import StreamDiffusion
+from pipeline import nan_trace
 from diffusers import ControlNetModel
 from controlnet import ControlNetManager
 import win32event
@@ -958,6 +959,10 @@ class App:
 
             if self.input_tensors.stream_diffusion_tensor is not None:
                 permuted_input_texture = self.input_tensors.get_permuted_input_tensor()
+                # Before any preprocessor: a non-finite input must be blamed on the input,
+                # not on the depth map computed from it.
+                nan_trace.record("input", permuted_input_texture)
+                nan_trace.keep("input", permuted_input_texture)
 
             if profiling_enabled:
                 torch.cuda.synchronize()

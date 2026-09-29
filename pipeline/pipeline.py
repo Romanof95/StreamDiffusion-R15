@@ -14,6 +14,7 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 )
 
 from .image_filter import SimilarImageFilter
+from . import nan_trace
 from .static_freeze import StaticRegionStabilizer, static_freeze_config
 from .attention_processors import update_cache_after_unet, select_attention_cache_slot, prune_attention_cache_slots
 from functools import lru_cache
@@ -744,6 +745,11 @@ class StreamDiffusion:
         if down_block_res_samples is None and self._cn_step_residuals is not None:
             down_block_res_samples, mid_block_res_sample = self._cn_step_residuals
 
+        step_tag = "" if idx is None else f"[{idx}]"
+        if down_block_res_samples is not None:
+            nan_trace.record(f"cn_res{step_tag}",
+                             list(down_block_res_samples) + [mid_block_res_sample])
+
         try:
             unet_kwargs = {
                 "encoder_hidden_states": self.prompt_embeds,
@@ -783,6 +789,7 @@ class StreamDiffusion:
                 t_list,
                 **unet_kwargs,
             )[0]
+            nan_trace.record(f"unet{step_tag}", model_pred)
 
             # StreamV2V cache update runs outside the CUDA graph.
             update_cache_after_unet(self.unet)
@@ -973,6 +980,7 @@ class StreamDiffusion:
                 ip_adapter_image_embeds=ip_adapter_image_embeds,
             )
 
+            nan_trace.record("x0", x_0_pred_batch)
             if self.denoising_steps_num > 1:
                 x_0_pred_out = x_0_pred_batch[-1].unsqueeze(0)
                 # In-place update of the prepare()-time buffer keeps its pointer
@@ -1043,6 +1051,7 @@ class StreamDiffusion:
                 finally:
                     self._set_v2v_slot(0)
                     self._cn_step_residuals = None
+                nan_trace.record(f"x0[{idx}]", x_0_pred)
                 if not last:
                     x_t_latent = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
                     if self.do_add_noise:
@@ -1068,6 +1077,15 @@ class StreamDiffusion:
             self._cn_residual_cache = None
         internal_timings = {}
 
+        if controlnet_image is not None:
+            nan_trace.record("control_map", controlnet_image)
+            first_map = controlnet_image
+            while isinstance(first_map, (list, tuple)) and first_map:
+                first_map = first_map[0]
+            nan_trace.keep("control_map", first_map)
+        # A cache already non-finite when the frame starts was poisoned by an earlier one.
+        nan_trace.record_v2v_rings("v2v@start", self.unet)
+
         if x is not None:
             if x.dim() == 3:
                 x = x.unsqueeze(0)
@@ -1090,6 +1108,7 @@ class StreamDiffusion:
                 internal_timings['vae_encode'] = (time.time() - vae_encode_start) * 1000
             else:
                 x_t_latent = self.encode_image(x)
+            nan_trace.record("latent_in", x_t_latent)
         else:
             x_t_latent = torch.randn((1, 4, self.latent_height, self.latent_width)).to(
                 device=self.device, dtype=self.dtype
@@ -1140,6 +1159,9 @@ class StreamDiffusion:
             self._static_freeze_inputs.append(x)
             del self._static_freeze_inputs[:-(lag + 1)]
             x_output = self._static_freeze(self._static_freeze_inputs[0], x_output)
+
+        nan_trace.record("output", x_output)
+        nan_trace.end_frame()
 
         self.prev_image_result = x_output
 

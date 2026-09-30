@@ -1216,7 +1216,6 @@ class App:
         frames_processed = 0
         last_diagnostic_time = time.time()
         last_input_check_time = time.time()
-        input_check_frames = 0
 
         # The frame trigger is the Win32 event; the socket carries rare control
         # messages. is_socket_connected does a MSG_PEEK syscall - throttle it.
@@ -1278,17 +1277,15 @@ class App:
 
                     # Non-finite pixels coming from Smode (replaced in the input copy): report
                     # them, they come from the Smode side (e.g. a colour modifier on a camera).
-                    input_check_frames += 1
                     if current_time - last_input_check_time >= 10.0 and self.input_tensors is not None:
-                        frames, values, worst = self.input_tensors.pop_nonfinite_stats()
+                        frames, checked, values, worst = self.input_tensors.pop_nonfinite_stats()
                         if frames:
                             logging.warning(
-                                f"[Input] {frames}/{input_check_frames} frames from Smode had "
+                                f"[Input] {frames}/{checked} checked frames from Smode had "
                                 f"non-finite pixels in the last {current_time - last_input_check_time:.0f}s "
                                 f"({values} values, up to {worst} in one frame); replaced before "
                                 f"generation. Check the modifiers upstream of this node.")
                         last_input_check_time = current_time
-                        input_check_frames = 0
 
                     if profiling_enabled:
                         timings['total_frame'] = (
